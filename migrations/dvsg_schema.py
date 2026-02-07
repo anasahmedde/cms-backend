@@ -40,7 +40,7 @@ def ensure_dvsg_schema(conn):
     CREATE TABLE IF NOT EXISTS public.video (
         id BIGSERIAL PRIMARY KEY,
         video_name TEXT NOT NULL UNIQUE,
-        s3_link TEXT,
+        s3_link TEXT NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
