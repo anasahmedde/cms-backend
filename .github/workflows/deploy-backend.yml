@@ -4,10 +4,6 @@ name: Deploy Backend
 on:
   push:
     branches: [staging, main]
-    paths:
-      - 'backend/**'
-      - 'docker/Dockerfile'
-      - '.github/workflows/deploy-backend.yml'
 
 env:
   AWS_REGION: us-east-2
