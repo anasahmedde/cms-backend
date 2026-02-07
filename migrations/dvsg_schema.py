@@ -39,8 +39,8 @@ def ensure_dvsg_schema(conn):
     ddl_base_video = """
     CREATE TABLE IF NOT EXISTS public.video (
         id BIGSERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        s3key TEXT,
+        video_name TEXT NOT NULL UNIQUE,
+        s3_link TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
@@ -49,7 +49,7 @@ def ensure_dvsg_schema(conn):
     ddl_base_shop = """
     CREATE TABLE IF NOT EXISTS public.shop (
         id BIGSERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
+        shop_name TEXT NOT NULL UNIQUE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
@@ -58,7 +58,7 @@ def ensure_dvsg_schema(conn):
     ddl_base_group = """
     CREATE TABLE IF NOT EXISTS public."group" (
         id BIGSERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
+        gname TEXT NOT NULL UNIQUE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
@@ -177,6 +177,29 @@ def ensure_dvsg_schema(conn):
     DO $$
     DECLARE t text;
     BEGIN
+      -- Rename legacy column names if they exist
+      SELECT 1 INTO t FROM information_schema.columns
+       WHERE table_schema='public' AND table_name='video' AND column_name='name';
+      IF FOUND THEN
+        ALTER TABLE public.video RENAME COLUMN name TO video_name;
+      END IF;
+
+      SELECT 1 INTO t FROM information_schema.columns
+       WHERE table_schema='public' AND table_name='video' AND column_name='s3key';
+      IF FOUND THEN
+        ALTER TABLE public.video RENAME COLUMN s3key TO s3_link;
+      END IF;
+
+      -- Add UNIQUE constraint on video_name if not exists
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'video_video_name_key'
+      ) THEN
+        BEGIN
+          ALTER TABLE public.video ADD CONSTRAINT video_video_name_key UNIQUE (video_name);
+        EXCEPTION WHEN duplicate_table THEN NULL;
+        END;
+      END IF;
+
       -- rotation (0, 90, 180, 270)
       SELECT 1 INTO t FROM information_schema.columns
        WHERE table_schema='public' AND table_name='video' AND column_name='rotation';
@@ -210,6 +233,46 @@ def ensure_dvsg_schema(conn):
        WHERE table_schema='public' AND table_name='video' AND column_name='resolution';
       IF NOT FOUND THEN
         ALTER TABLE public.video ADD COLUMN resolution TEXT DEFAULT NULL;
+      END IF;
+    END $$;
+    """
+
+    ddl_shop_cols = """
+    DO $$
+    DECLARE t text;
+    BEGIN
+      -- Rename legacy column name if it exists (shop)
+      SELECT 1 INTO t FROM information_schema.columns
+       WHERE table_schema='public' AND table_name='shop' AND column_name='name';
+      IF FOUND THEN
+        ALTER TABLE public.shop RENAME COLUMN name TO shop_name;
+      END IF;
+
+      -- Add UNIQUE constraint on shop_name if not exists
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'shop_shop_name_key'
+      ) THEN
+        BEGIN
+          ALTER TABLE public.shop ADD CONSTRAINT shop_shop_name_key UNIQUE (shop_name);
+        EXCEPTION WHEN duplicate_table THEN NULL;
+        END;
+      END IF;
+
+      -- Rename legacy column name if it exists (group)
+      SELECT 1 INTO t FROM information_schema.columns
+       WHERE table_schema='public' AND table_name='group' AND column_name='name';
+      IF FOUND THEN
+        ALTER TABLE public."group" RENAME COLUMN name TO gname;
+      END IF;
+
+      -- Add UNIQUE constraint on gname if not exists
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'group_gname_key'
+      ) THEN
+        BEGIN
+          ALTER TABLE public."group" ADD CONSTRAINT group_gname_key UNIQUE (gname);
+        EXCEPTION WHEN duplicate_table THEN NULL;
+        END;
       END IF;
     END $$;
     """
@@ -619,6 +682,7 @@ def ensure_dvsg_schema(conn):
         # Then run ALTER TABLE migrations
         cur.execute(ddl_device_cols)
         cur.execute(ddl_video_cols)
+        cur.execute(ddl_shop_cols)
         cur.execute(ddl_link_table)
         cur.execute(ddl_link_cols)
         cur.execute(ddl_logs_table)
