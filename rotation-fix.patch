@@ -1,0 +1,75 @@
+diff --git a/.video_service.py.swp b/.video_service.py.swp
+deleted file mode 100644
+index e9eb26f..0000000
+Binary files a/.video_service.py.swp and /dev/null differ
+diff --git a/device_video_shop_group.py b/device_video_shop_group.py
+index bd0df47..e4e0a02 100644
+--- a/device_video_shop_group.py
++++ b/device_video_shop_group.py
+@@ -1294,26 +1294,39 @@ def set_device_download_flag(mobile_id: str, body: DeviceDownloadStatusSetIn):
+ @app.get("/device/{mobile_id}/online", response_model=DeviceOnlineStatusOut)
+ def get_device_online_status(mobile_id: str):
+     with pg_conn() as conn:
+-        with conn.cursor() as cur:
+-            cur.execute("""
+-                SELECT is_online, last_online_at,
+-                       EXTRACT(EPOCH FROM (NOW() - last_online_at)) as seconds_ago
+-                FROM public.device WHERE mobile_id = %s LIMIT 1;
+-            """, (mobile_id,))
+-            row = cur.fetchone()
+-            if not row:
+-                raise HTTPException(status_code=404, detail="Device not found")
+-            
+-            is_online = row[0]
+-            seconds_ago = row[2]
+-            
+-            # If last heartbeat was more than threshold seconds ago, mark offline
+-            if seconds_ago is not None and seconds_ago > ONLINE_THRESHOLD_SECONDS:
+-                is_online = False
+-                cur.execute("UPDATE public.device SET is_online = FALSE WHERE mobile_id = %s;", (mobile_id,))
+-                conn.commit()
+-            
+-            return DeviceOnlineStatusOut(mobile_id=mobile_id, is_online=bool(is_online))
++        try:
++            with conn.cursor() as cur:
++                cur.execute("""
++                    SELECT id, is_online, last_online_at,
++                           EXTRACT(EPOCH FROM (NOW() - last_online_at)) as seconds_ago
++                    FROM public.device WHERE mobile_id = %s LIMIT 1;
++                """, (mobile_id,))
++                row = cur.fetchone()
++                if not row:
++                    raise HTTPException(status_code=404, detail="Device not found")
++                
++                did = row[0]
++                is_online = row[1]
++                seconds_ago = row[3]
++                
++                # If last heartbeat was more than threshold seconds ago, mark offline
++                if seconds_ago is not None and seconds_ago > ONLINE_THRESHOLD_SECONDS:
++                    # Only log offline event if device was previously online
++                    if is_online:
++                        cur.execute("""
++                            INSERT INTO public.device_online_history (did, event_type, event_at)
++                            VALUES (%s, 'offline', NOW());
++                        """, (did,))
++                    is_online = False
++                    cur.execute("UPDATE public.device SET is_online = FALSE, updated_at = NOW() WHERE mobile_id = %s;", (mobile_id,))
++                    conn.commit()
++                
++                return DeviceOnlineStatusOut(mobile_id=mobile_id, is_online=bool(is_online))
++        except HTTPException:
++            raise
++        except:
++            conn.rollback()
++            raise
+ 
+ 
+ @app.post("/device/{mobile_id}/online_update")
+diff --git a/migrations/.dvsg_schema.py.swp b/migrations/.dvsg_schema.py.swp
+deleted file mode 100644
+index 8fd32ca..0000000
+Binary files a/migrations/.dvsg_schema.py.swp and /dev/null differ
+diff --git a/rotation-fix.patch b/rotation-fix.patch
+new file mode 100644
+index 0000000..e69de29
