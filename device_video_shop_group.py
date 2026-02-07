@@ -5088,6 +5088,454 @@ def unassign_device_from_group(mobile_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# MERGED CRUD ENDPOINTS — device, group, shop, video basic CRUD
+# These were previously in separate services (device.py, group.py,
+# shop_service.py, video_service.py). Merged here for single-container deploy.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# --- Models for standalone CRUD ---
+class StandaloneDeviceRequest(BaseModel):
+    mobile_id: str
+    download_status: bool = False
+
+class StandaloneDeviceUpdate(BaseModel):
+    mobile_id: Optional[str] = None
+    download_status: Optional[bool] = None
+
+class StandaloneGroupCreate(BaseModel):
+    gname: str
+
+class StandaloneGroupUpdate(BaseModel):
+    gname: Optional[str] = None
+
+class StandaloneShopCreate(BaseModel):
+    shop_name: str
+
+class StandaloneShopUpdate(BaseModel):
+    shop_name: Optional[str] = None
+
+class StandaloneVideoUpdate(BaseModel):
+    video_name: Optional[str] = None
+    s3_link: Optional[str] = None
+    rotation: Optional[int] = None
+    content_type: Optional[str] = None
+    fit_mode: Optional[str] = None
+    display_duration: Optional[int] = None
+
+class StandaloneRotationUpdate(BaseModel):
+    rotation: int
+
+class StandaloneFitModeUpdate(BaseModel):
+    fit_mode: str
+
+# --- S3 config for video uploads ---
+S3_VIDEO_PREFIX = os.getenv("S3_PREFIX", "myvideos").strip("/")
+S3_VIDEO_FORCED_EXT = ".mp4"
+
+def _video_slug(s: str) -> str:
+    import re as _re
+    s = s.strip()
+    s = _re.sub(r"[^\w\-.]+", "-", s, flags=_re.UNICODE)
+    return _re.sub(r"-{2,}", "-", s).strip("-").lower()
+
+def _make_video_s3_key(video_name: str) -> str:
+    base = _video_slug(video_name)
+    filename = f"{base}{S3_VIDEO_FORCED_EXT}"
+    return f"{S3_VIDEO_PREFIX}/{filename}".strip("/") if S3_VIDEO_PREFIX else filename
+
+def _to_video_s3_uri(key: str) -> str:
+    return f"s3://{S3_BUCKET}/{key}"
+
+def _detect_video_content_type(filename: str) -> str:
+    from pathlib import Path as _P
+    ext = _P(filename).suffix.lower()
+    video_exts = {'.mp4', '.webm', '.mov', '.avi', '.mkv'}
+    image_exts = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
+    if ext in video_exts: return "video"
+    if ext in image_exts: return "image"
+    if ext in {'.html', '.htm'}: return "html"
+    if ext == '.pdf': return "pdf"
+    return "video"
+
+def _video_s3_key_exists(key: str, bucket: str = None) -> bool:
+    s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else boto3.client("s3")
+    b = bucket or S3_BUCKET
+    try:
+        s3.head_object(Bucket=b, Key=key)
+        return True
+    except Exception:
+        return False
+
+def _video_presign(bucket: str, key: str, expires: int = 3600) -> str:
+    s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else boto3.client("s3")
+    return s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires)
+
+def _parse_video_s3_link(s3_link: str):
+    s3_link = (s3_link or "").strip()
+    if not s3_link:
+        return (S3_BUCKET, "")
+    if s3_link.startswith("s3://"):
+        rest = s3_link[len("s3://"):]
+        parts = rest.split("/", 1)
+        return (parts[0], parts[1]) if len(parts) == 2 else (parts[0], "")
+    return (S3_BUCKET, s3_link)
+
+
+# ═══════════════ DEVICE CRUD ═══════════════
+
+@app.post("/insert_device")
+def standalone_insert_device(req: StandaloneDeviceRequest):
+    mobile = (req.mobile_id or "").strip()
+    if not mobile:
+        raise HTTPException(status_code=400, detail="mobile_id is required")
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO public.device (mobile_id, download_status) VALUES (%s, %s) RETURNING id;",
+                        (mobile, bool(req.download_status)))
+            new_id = cur.fetchone()[0]
+        conn.commit()
+    return {"id": new_id, "message": "Device inserted successfully"}
+
+@app.get("/device/{mobile_id}")
+def standalone_get_device(mobile_id: str = Path(...)):
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, mobile_id, download_status, created_at, updated_at FROM public.device WHERE mobile_id = %s ORDER BY id DESC LIMIT 1;", (mobile_id,))
+            row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Device not found")
+    return {"id": row[0], "mobile_id": row[1], "download_status": row[2], "created_at": row[3], "updated_at": row[4]}
+
+@app.get("/devices")
+def standalone_list_devices(
+    q: Optional[str] = Query(None, description="Search mobile_id or device_name (ILIKE)"),
+    limit: int = Query(50, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            if q:
+                cur.execute("SELECT COUNT(*) FROM public.device WHERE mobile_id ILIKE %s OR device_name ILIKE %s;", (f"%{q}%", f"%{q}%"))
+            else:
+                cur.execute("SELECT COUNT(*) FROM public.device;")
+            total = int(cur.fetchone()[0])
+
+            base_sql = """
+                SELECT d.id, d.mobile_id, d.download_status, d.created_at, d.updated_at,
+                       d.resolution, d.device_name,
+                       COALESCE(g1.gname, g2.gname) as group_name, d.is_active
+                FROM public.device d
+                LEFT JOIN public.device_assignment da ON da.did = d.id
+                LEFT JOIN public."group" g1 ON g1.id = da.gid
+                LEFT JOIN (
+                    SELECT DISTINCT ON (dvsg.did) dvsg.did, g.gname
+                    FROM public.device_video_shop_group dvsg
+                    JOIN public."group" g ON g.id = dvsg.gid
+                    WHERE dvsg.gid IS NOT NULL
+                ) g2 ON g2.did = d.id AND g1.gname IS NULL
+            """
+            if q:
+                cur.execute(base_sql + " WHERE d.mobile_id ILIKE %s OR d.device_name ILIKE %s ORDER BY d.id DESC LIMIT %s OFFSET %s;",
+                            (f"%{q}%", f"%{q}%", limit, offset))
+            else:
+                cur.execute(base_sql + " ORDER BY d.id DESC LIMIT %s OFFSET %s;", (limit, offset))
+            rows = cur.fetchall()
+
+    items = [
+        {"id": r[0], "mobile_id": r[1], "download_status": r[2], "created_at": r[3], "updated_at": r[4],
+         "resolution": r[5] if len(r) > 5 else None, "device_name": r[6] if len(r) > 6 else None,
+         "group_name": r[7] if len(r) > 7 else None,
+         "is_active": r[8] if len(r) > 8 and r[8] is not None else True}
+        for r in rows
+    ]
+    return {"items": items, "total": total, "count": len(items), "limit": limit, "offset": offset, "query": q}
+
+@app.put("/device/{mobile_id}")
+def standalone_update_device(mobile_id: str, patch: StandaloneDeviceUpdate):
+    sets, params = [], []
+    if patch.mobile_id is not None:
+        sets.append("mobile_id = %s"); params.append(patch.mobile_id)
+    if patch.download_status is not None:
+        sets.append("download_status = %s"); params.append(patch.download_status)
+    if not sets:
+        return standalone_get_device(mobile_id)
+    params.append(mobile_id)
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE public.device SET {', '.join(sets)} WHERE mobile_id = %s RETURNING id, mobile_id, download_status, created_at, updated_at;", params)
+            row = cur.fetchone()
+        conn.commit()
+    if not row:
+        raise HTTPException(status_code=404, detail="Device not found or no changes")
+    return {"message": "Device updated", "item": {"id": row[0], "mobile_id": row[1], "download_status": row[2], "created_at": row[3], "updated_at": row[4]}}
+
+@app.delete("/device/{mobile_id}")
+def standalone_delete_device(mobile_id: str):
+    # Check for links first
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.device WHERE mobile_id = %s ORDER BY id DESC;", (mobile_id,))
+            device_ids = [r[0] for r in cur.fetchall()]
+            if not device_ids:
+                raise HTTPException(status_code=404, detail="Device not found")
+            cur.execute("SELECT COUNT(*) FROM public.device_video_shop_group WHERE did = ANY(%s::bigint[]);", (device_ids,))
+            linked_count = int(cur.fetchone()[0])
+            if linked_count > 0:
+                raise HTTPException(status_code=409, detail=f"Device '{mobile_id}' has {linked_count} link(s). Remove links first.")
+            cur.execute("DELETE FROM public.device WHERE mobile_id = %s RETURNING id;", (mobile_id,))
+            deleted = cur.fetchall()
+        conn.commit()
+    return {"deleted_count": len(deleted)}
+
+
+# ═══════════════ GROUP CRUD ═══════════════
+
+@app.post("/insert_group")
+def standalone_insert_group(req: StandaloneGroupCreate):
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('INSERT INTO public."group" (gname) VALUES (%s) RETURNING id;', (req.gname,))
+            new_id = cur.fetchone()[0]
+        conn.commit()
+    return {"id": new_id, "message": "Group inserted successfully"}
+
+@app.get("/group/{gname}")
+def standalone_get_group(gname: str = Path(...)):
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT id, gname, created_at, updated_at FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (gname,))
+            row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Group not found")
+    return {"id": row[0], "gname": row[1], "created_at": row[2], "updated_at": row[3]}
+
+@app.get("/groups")
+def standalone_list_groups(
+    q: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            if q:
+                cur.execute('SELECT id, gname, created_at, updated_at FROM public."group" WHERE gname ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s;',
+                            (f"%{q}%", limit, offset))
+            else:
+                cur.execute('SELECT id, gname, created_at, updated_at FROM public."group" ORDER BY id DESC LIMIT %s OFFSET %s;', (limit, offset))
+            rows = cur.fetchall()
+    items = [{"id": r[0], "gname": r[1], "created_at": r[2], "updated_at": r[3]} for r in rows]
+    return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
+
+@app.put("/group/{gname}")
+def standalone_update_group(gname: str, patch: StandaloneGroupUpdate):
+    if not patch.gname:
+        return standalone_get_group(gname)
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('UPDATE public."group" SET gname = %s WHERE gname = %s RETURNING id, gname, created_at, updated_at;', (patch.gname, gname))
+            row = cur.fetchone()
+        conn.commit()
+    if not row:
+        raise HTTPException(status_code=404, detail="Group not found or no changes")
+    return {"message": "Group updated", "item": {"id": row[0], "gname": row[1], "created_at": row[2], "updated_at": row[3]}}
+
+@app.delete("/group/{gname}")
+def standalone_delete_group(gname: str, force: bool = Query(False)):
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (gname,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Group not found")
+            gid = row[0]
+            # Check device attachments
+            cur.execute("SELECT COUNT(*) FROM public.device_assignment WHERE gid = %s;", (gid,))
+            dev_count = int(cur.fetchone()[0])
+            if dev_count > 0 and not force:
+                raise HTTPException(status_code=409, detail=f"Group has {dev_count} device(s) attached. Use ?force=true to delete.")
+            if force:
+                cur.execute("DELETE FROM public.device_assignment WHERE gid = %s;", (gid,))
+                cur.execute("DELETE FROM public.device_video_shop_group WHERE gid = %s;", (gid,))
+                cur.execute("DELETE FROM public.group_video WHERE gid = %s;", (gid,))
+                cur.execute("DELETE FROM public.group_advertisement WHERE gid = %s;", (gid,))
+            cur.execute("DELETE FROM public.group_video WHERE gid = %s;", (gid,))
+            cur.execute('DELETE FROM public."group" WHERE gname = %s RETURNING id;', (gname,))
+            deleted = cur.fetchall()
+        conn.commit()
+    return {"deleted_count": len(deleted), "devices_unassigned": dev_count if force else 0}
+
+@app.post("/group/{gname}/unassign-devices")
+def standalone_unassign_group_devices(gname: str):
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (gname,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Group not found")
+            gid = row[0]
+            cur.execute("DELETE FROM public.device_assignment WHERE gid = %s;", (gid,))
+            a_count = cur.rowcount
+            cur.execute("DELETE FROM public.device_video_shop_group WHERE gid = %s;", (gid,))
+            l_count = cur.rowcount
+        conn.commit()
+    return {"unassigned_count": a_count + l_count, "message": f"Unassigned {a_count + l_count} device(s) from group '{gname}'"}
+
+
+# ═══════════════ SHOP CRUD ═══════════════
+
+@app.post("/insert_shop")
+def standalone_insert_shop(req: StandaloneShopCreate):
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO public.shop (shop_name) VALUES (%s) RETURNING id;", (req.shop_name,))
+            new_id = cur.fetchone()[0]
+        conn.commit()
+    return {"id": new_id, "message": "Shop inserted successfully"}
+
+@app.get("/shop/{shop_name}")
+def standalone_get_shop(shop_name: str = Path(...)):
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop WHERE shop_name = %s ORDER BY id DESC LIMIT 1;", (shop_name,))
+            row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Shop not found")
+    return {"id": row[0], "shop_name": row[1], "created_at": row[2], "updated_at": row[3]}
+
+@app.get("/shops")
+def standalone_list_shops(
+    q: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            if q:
+                cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop WHERE shop_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s;",
+                            (f"%{q}%", limit, offset))
+            else:
+                cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop ORDER BY id DESC LIMIT %s OFFSET %s;", (limit, offset))
+            rows = cur.fetchall()
+    items = [{"id": r[0], "shop_name": r[1], "created_at": r[2], "updated_at": r[3]} for r in rows]
+    return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
+
+@app.put("/shop/{shop_name}")
+def standalone_update_shop(shop_name: str, patch: StandaloneShopUpdate):
+    if not patch.shop_name:
+        return standalone_get_shop(shop_name)
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE public.shop SET shop_name = %s WHERE shop_name = %s RETURNING id, shop_name, created_at, updated_at;",
+                        (patch.shop_name, shop_name))
+            row = cur.fetchone()
+        conn.commit()
+    if not row:
+        raise HTTPException(status_code=404, detail="Shop not found or no changes")
+    return {"message": "Shop updated", "item": {"id": row[0], "shop_name": row[1], "created_at": row[2], "updated_at": row[3]}}
+
+@app.delete("/shop/{shop_name}")
+def standalone_delete_shop(shop_name: str):
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM public.shop WHERE shop_name = %s RETURNING id;", (shop_name,))
+            deleted = cur.fetchall()
+        conn.commit()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Shop not found")
+    return {"deleted_count": len(deleted)}
+
+
+# ═══════════════ VIDEO CRUD ═══════════════
+
+@app.post("/upload_video")
+async def standalone_upload_video(
+    file: UploadFile = File(...),
+    video_name: str = Form(...),
+    overwrite: bool = Form(False),
+    rotation: int = Form(0),
+    fit_mode: str = Form("cover"),
+    display_duration: int = Form(10),
+):
+    key = _make_video_s3_key(video_name)
+    if not overwrite and _video_s3_key_exists(key):
+        raise HTTPException(status_code=409, detail="Video exists. Use overwrite=true.")
+    content_type = _detect_video_content_type(file.filename or video_name)
+    s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else boto3.client("s3")
+    from boto3.s3.transfer import TransferConfig
+    cfg = TransferConfig(multipart_threshold=8*1024*1024, multipart_chunksize=16*1024*1024, max_concurrency=8, use_threads=True)
+    s3.upload_fileobj(file.file, S3_BUCKET, key, ExtraArgs={"ACL": "private", "ServerSideEncryption": "AES256", "ContentType": "video/mp4"}, Config=cfg)
+    s3_uri = _to_video_s3_uri(key)
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO public.video (video_name, s3_link, rotation, content_type, fit_mode, display_duration)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (video_name)
+                DO UPDATE SET s3_link = EXCLUDED.s3_link, rotation = EXCLUDED.rotation,
+                    content_type = EXCLUDED.content_type, fit_mode = EXCLUDED.fit_mode,
+                    display_duration = EXCLUDED.display_duration, updated_at = NOW()
+                RETURNING id;
+            """, (video_name, s3_uri, rotation, content_type, fit_mode, display_duration))
+            new_id = cur.fetchone()[0]
+        conn.commit()
+    return {"id": new_id, "video_name": video_name, "s3_link": s3_uri, "key": key,
+            "rotation": rotation, "content_type": content_type, "fit_mode": fit_mode,
+            "display_duration": display_duration, "overwrote": overwrite}
+
+@app.get("/videos")
+def standalone_list_videos(
+    q: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            sql = "SELECT id, video_name, s3_link, rotation, content_type, fit_mode, display_duration, created_at, updated_at FROM public.video"
+            if q:
+                cur.execute(sql + " WHERE video_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s", (f"%{q}%", limit, offset))
+            else:
+                cur.execute(sql + " ORDER BY id DESC LIMIT %s OFFSET %s", (limit, offset))
+            rows = cur.fetchall()
+    items = [{"id": r[0], "video_name": r[1], "s3_link": r[2], "rotation": r[3],
+              "content_type": r[4], "fit_mode": r[5], "display_duration": r[6],
+              "created_at": r[7], "updated_at": r[8]} for r in rows]
+    return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
+
+@app.put("/video/{video_name}")
+def standalone_update_video(video_name: str, patch: StandaloneVideoUpdate):
+    sets, params = [], []
+    if patch.video_name is not None: sets.append("video_name = %s"); params.append(patch.video_name)
+    if patch.s3_link is not None: sets.append("s3_link = %s"); params.append(patch.s3_link)
+    if patch.rotation is not None: sets.append("rotation = %s"); params.append(patch.rotation)
+    if patch.content_type is not None: sets.append("content_type = %s"); params.append(patch.content_type)
+    if patch.fit_mode is not None: sets.append("fit_mode = %s"); params.append(patch.fit_mode)
+    if patch.display_duration is not None: sets.append("display_duration = %s"); params.append(patch.display_duration)
+    if not sets:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    params.append(video_name)
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE public.video SET {', '.join(sets)}, updated_at = NOW() WHERE video_name = %s RETURNING id, video_name, s3_link, rotation, content_type, fit_mode, display_duration, created_at, updated_at;", params)
+            row = cur.fetchone()
+        conn.commit()
+    if not row:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return {"message": "Updated", "item": {"id": row[0], "video_name": row[1], "s3_link": row[2], "rotation": row[3],
+            "content_type": row[4], "fit_mode": row[5], "display_duration": row[6], "created_at": row[7], "updated_at": row[8]}}
+
+@app.delete("/video/{video_name}")
+def standalone_delete_video(video_name: str):
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM public.video WHERE video_name = %s RETURNING id;", (video_name,))
+            deleted = cur.fetchall()
+        conn.commit()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return {"deleted_count": len(deleted)}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
