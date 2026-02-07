@@ -5,7 +5,6 @@
 import os
 import io
 import csv
-import json
 import hashlib
 import secrets
 from contextlib import contextmanager
@@ -44,10 +43,6 @@ ONLINE_THRESHOLD_SECONDS = 120
 # Session tokens (in-memory)
 active_sessions: Dict[str, Dict] = {}
 
-# Download progress tracking (in-memory) - stores real-time download progress per device
-# Format: { "mobile_id": { "current_file": 1, "total_files": 3, "file_name": "video.mp4", "progress": 65, "downloaded_bytes": 5242880, "total_bytes": 8388608, "updated_at": datetime } }
-download_progress_store: Dict[str, Dict] = {}
-
 # Treat any of these as "no group"
 NO_GROUP_SENTINELS = {"_none", "none", "null", "(none)", ""}
 
@@ -63,9 +58,15 @@ else:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 
@@ -267,28 +268,6 @@ class DeviceDownloadStatusOut(BaseModel):
     downloaded_count: int
 
 
-class DeviceDownloadProgressIn(BaseModel):
-    current_file: int = 0
-    total_files: int = 0
-    file_name: Optional[str] = None
-    progress: int = 0  # 0-100 percentage
-    downloaded_bytes: int = 0
-    total_bytes: int = 0
-    is_downloading: bool = False
-
-
-class DeviceDownloadProgressOut(BaseModel):
-    mobile_id: str
-    current_file: int = 0
-    total_files: int = 0
-    file_name: Optional[str] = None
-    progress: int = 0
-    downloaded_bytes: int = 0
-    total_bytes: int = 0
-    is_downloading: bool = False
-    updated_at: Optional[str] = None
-
-
 class DeviceDownloadStatusSetIn(BaseModel):
     status: bool
 
@@ -330,11 +309,6 @@ class DeviceOnlineStatusOut(BaseModel):
 
 class DeviceOnlineUpdateIn(BaseModel):
     is_online: bool = True
-
-
-class DeviceActiveStatusIn(BaseModel):
-    """Request body for setting device active status"""
-    is_active: bool
 
 
 class DeviceCreateIn(BaseModel):
@@ -585,7 +559,7 @@ SELECT l.id, l.did, l.vid, l.sid, l.gid, l.created_at, l.updated_at,
        v.rotation, v.content_type, v.fit_mode, v.display_duration,
        l.display_order, v.resolution,
        l.device_rotation, l.device_resolution, l.grid_position, l.grid_size,
-       d.device_name, d.is_active
+       d.device_name
 FROM public.device_video_shop_group l
 JOIN public.device d ON d.id = l.did
 JOIN public.video  v ON v.id = l.vid
@@ -626,7 +600,6 @@ def _row_to_link_dict(row) -> Dict[str, Any]:
         "grid_position": row[24] if len(row) > 24 else 0,
         "grid_size": row[25] if len(row) > 25 else None,
         "device_name": row[26] if len(row) > 26 else None,
-        "is_active": row[27] if len(row) > 27 else True,
     }
 
 
@@ -748,7 +721,7 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
                            0 as rotation, 'video' as content_type, 'cover' as fit_mode, 10 as display_duration,
                            0 as display_order, NULL as resolution,
                            NULL as device_rotation, NULL as device_resolution, 0 as grid_position, NULL as grid_size,
-                           d.device_name, d.is_active
+                           d.device_name
                     FROM public.device_assignment da
                     JOIN public.device d ON d.id = da.did
                     LEFT JOIN public.shop s ON s.id = da.sid
@@ -794,7 +767,7 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
                            0 as rotation, 'video' as content_type, 'cover' as fit_mode, 10 as display_duration,
                            0 as display_order, NULL as resolution,
                            NULL as device_rotation, NULL as device_resolution, 0 as grid_position, NULL as grid_size,
-                           d.device_name, d.is_active
+                           d.device_name
                     FROM public.device d
                     WHERE NOT EXISTS (
                         SELECT 1 FROM public.device_video_shop_group l WHERE l.did = d.id
@@ -1034,38 +1007,28 @@ def _set_group_videos(conn, gid: int, vids: List[int]):
     Also updates device_video_shop_group for any devices already in this group
     (checking both device_video_shop_group and device_assignment tables).
     """
-    vids = list(dict.fromkeys(vids))  # Remove duplicates while preserving order
-    
+    vids = list(dict.fromkeys(vids))
     with conn.cursor() as cur:
-        inserted = 0
-        deleted = 0
-        updated = 0
-        
-        if vids:
-            # First, update the group_video table (group-level association)
-            cur.execute("""
-            WITH ins AS (
-                INSERT INTO public.group_video (gid, vid, display_order)
-                SELECT %s, v, row_number() OVER () - 1
-                FROM UNNEST(%s::bigint[]) AS v
-                ON CONFLICT (gid, vid) DO UPDATE SET updated_at = NOW()
-                RETURNING id, (xmax = 0) AS was_inserted
-            ),
-            del AS (
-                DELETE FROM public.group_video 
-                WHERE gid = %s AND NOT (vid = ANY(%s::bigint[]))
-                RETURNING id
-            )
-            SELECT 
-                (SELECT COUNT(*) FILTER (WHERE was_inserted) FROM ins)::int,
-                (SELECT COUNT(*) FROM del)::int,
-                (SELECT COUNT(*) FILTER (WHERE NOT was_inserted) FROM ins)::int;
-            """, (gid, vids, gid, vids))
-            inserted, deleted, updated = cur.fetchone()
-        else:
-            # If no videos, just delete all group_video entries for this group
-            cur.execute("DELETE FROM public.group_video WHERE gid = %s RETURNING id;", (gid,))
-            deleted = cur.rowcount or 0
+        # First, update the group_video table (group-level association)
+        cur.execute("""
+        WITH ins AS (
+            INSERT INTO public.group_video (gid, vid, display_order)
+            SELECT %s, v, row_number() OVER () - 1
+            FROM UNNEST(%s::bigint[]) AS v
+            ON CONFLICT (gid, vid) DO UPDATE SET updated_at = NOW()
+            RETURNING id, (xmax = 0) AS was_inserted
+        ),
+        del AS (
+            DELETE FROM public.group_video 
+            WHERE gid = %s AND NOT (vid = ANY(%s::bigint[]))
+            RETURNING id
+        )
+        SELECT 
+            (SELECT COUNT(*) FILTER (WHERE was_inserted) FROM ins)::int,
+            (SELECT COUNT(*) FROM del)::int,
+            (SELECT COUNT(*) FILTER (WHERE NOT was_inserted) FROM ins)::int;
+        """, (gid, vids, gid, vids))
+        inserted, deleted, updated = cur.fetchone()
         
         # Get devices assigned to this group from device_assignment table
         cur.execute("SELECT did, sid FROM public.device_assignment WHERE gid = %s;", (gid,))
@@ -1085,32 +1048,25 @@ def _set_group_videos(conn, gid: int, vids: List[int]):
         dev_links = [(did, sid) for did, sid in all_devices.items()]
         
         if dev_links:
-            if vids:
-                # Remove videos no longer in the group from device links
-                cur.execute("""
-                    DELETE FROM public.device_video_shop_group 
-                    WHERE gid = %s AND NOT (vid = ANY(%s::bigint[]));
-                """, (gid, vids))
-                
-                # Add new videos to all devices in this group
-                for did, sid in dev_links:
-                    for vid in vids:
-                        cur.execute("""
-                            INSERT INTO public.device_video_shop_group (did, vid, sid, gid)
-                            VALUES (%s, %s, %s, %s)
-                            ON CONFLICT DO NOTHING;
-                        """, (did, vid, sid, gid))
-            else:
-                # No videos - remove all device_video_shop_group entries for this group
-                cur.execute("DELETE FROM public.device_video_shop_group WHERE gid = %s;", (gid,))
+            # Remove videos no longer in the group from device links
+            cur.execute("""
+                DELETE FROM public.device_video_shop_group 
+                WHERE gid = %s AND NOT (vid = ANY(%s::bigint[]));
+            """, (gid, vids))
+            
+            # Add new videos to all devices in this group
+            for did, sid in dev_links:
+                for vid in vids:
+                    cur.execute("""
+                        INSERT INTO public.device_video_shop_group (did, vid, sid, gid)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT DO NOTHING;
+                    """, (did, vid, sid, gid))
         
         cur.execute('SELECT gname FROM public."group" WHERE id = %s;', (gid,))
         gname = cur.fetchone()[0]
-        
-        video_names = []
-        if vids:
-            cur.execute("SELECT video_name FROM public.video WHERE id = ANY(%s::bigint[]) ORDER BY video_name;", (vids,))
-            video_names = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT video_name FROM public.video WHERE id = ANY(%s::bigint[]) ORDER BY video_name;", (vids,))
+        video_names = [r[0] for r in cur.fetchall()]
         
         # Mark existing devices for re-download
         devices_marked = 0
@@ -1219,14 +1175,6 @@ def create_link_by_names(conn, payload: LinkCreate) -> Dict[str, Any]:
                 DO UPDATE SET updated_at = NOW(), display_order = EXCLUDED.display_order
                 RETURNING id;
             """, (did, vid, sid, gid, payload.display_order))
-            
-            # Also add to group_video table to ensure group-level association exists
-            # This ensures future device assignments will get this video
-            cur.execute("""
-                INSERT INTO public.group_video (gid, vid, display_order)
-                VALUES (%s, %s, COALESCE(%s, 0))
-                ON CONFLICT (gid, vid) DO NOTHING;
-            """, (gid, vid, payload.display_order))
         
         lrow = cur.fetchone()
         cur.execute(READ_JOIN_SQL + " WHERE l.id = %s;", (lrow[0],))
@@ -1253,80 +1201,6 @@ def on_shutdown():
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-
-@app.get("/debug/group/{gname}/videos")
-def debug_group_videos(gname: str):
-    """Debug endpoint to check what videos are linked to a group."""
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            # Get group ID
-            cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (gname,))
-            grow = cur.fetchone()
-            if not grow:
-                return {"error": f"Group not found: {gname}"}
-            gid = int(grow[0])
-            
-            # Check group_video table
-            cur.execute("""
-                SELECT gv.id, gv.vid, v.video_name, gv.display_order
-                FROM public.group_video gv
-                JOIN public.video v ON v.id = gv.vid
-                WHERE gv.gid = %s
-                ORDER BY gv.display_order;
-            """, (gid,))
-            group_videos = [{"id": r[0], "vid": r[1], "video_name": r[2], "display_order": r[3]} for r in cur.fetchall()]
-            
-            # Check device_video_shop_group for this group
-            cur.execute("""
-                SELECT DISTINCT dvsg.vid, v.video_name
-                FROM public.device_video_shop_group dvsg
-                JOIN public.video v ON v.id = dvsg.vid
-                WHERE dvsg.gid = %s;
-            """, (gid,))
-            dvsg_videos = [{"vid": r[0], "video_name": r[1]} for r in cur.fetchall()]
-            
-            # Check device_assignment for this group
-            cur.execute("""
-                SELECT da.did, d.mobile_id, d.device_name, da.sid, s.shop_name
-                FROM public.device_assignment da
-                JOIN public.device d ON d.id = da.did
-                LEFT JOIN public.shop s ON s.id = da.sid
-                WHERE da.gid = %s;
-            """, (gid,))
-            assigned_devices = [{"did": r[0], "mobile_id": r[1], "device_name": r[2], "sid": r[3], "shop_name": r[4]} for r in cur.fetchall()]
-            
-            # Check device_video_shop_group links for devices in this group
-            cur.execute("""
-                SELECT dvsg.did, d.mobile_id, dvsg.vid, v.video_name
-                FROM public.device_video_shop_group dvsg
-                JOIN public.device d ON d.id = dvsg.did
-                JOIN public.video v ON v.id = dvsg.vid
-                WHERE dvsg.gid = %s
-                ORDER BY dvsg.did, dvsg.display_order;
-            """, (gid,))
-            device_links = [{"did": r[0], "mobile_id": r[1], "vid": r[2], "video_name": r[3]} for r in cur.fetchall()]
-            
-            return {
-                "group_name": gname,
-                "gid": gid,
-                "group_video_table": {
-                    "count": len(group_videos),
-                    "videos": group_videos
-                },
-                "device_video_shop_group_videos": {
-                    "count": len(dvsg_videos),
-                    "videos": dvsg_videos
-                },
-                "assigned_devices": {
-                    "count": len(assigned_devices),
-                    "devices": assigned_devices
-                },
-                "device_links": {
-                    "count": len(device_links),
-                    "links": device_links
-                }
-            }
 
 
 @app.get("/db_health")
@@ -1962,7 +1836,7 @@ def link_device_to_group(body: DeviceToGroupIn):
                 """, (gid,))
                 group_videos = cur.fetchall() or []
                 
-                # If no videos in group_video table, check device_video_shop_group (legacy/other devices)
+                # If no videos in group_video table, also check device_video_shop_group (legacy)
                 if not group_videos:
                     cur.execute("""
                         SELECT DISTINCT v.id, v.video_name
@@ -1971,31 +1845,18 @@ def link_device_to_group(body: DeviceToGroupIn):
                         WHERE l.gid = %s;
                     """, (gid,))
                     group_videos = cur.fetchall() or []
-                    
-                    # If we found videos from device_video_shop_group, also add them to group_video 
-                    # so future device assignments will find them
-                    if group_videos:
-                        for idx, (vid, vname) in enumerate(group_videos):
-                            cur.execute("""
-                                INSERT INTO public.group_video (gid, vid, display_order)
-                                VALUES (%s, %s, %s)
-                                ON CONFLICT (gid, vid) DO NOTHING;
-                            """, (gid, vid, idx))
                 
                 # Remove any old links for this device
                 cur.execute("DELETE FROM public.device_video_shop_group WHERE did = %s;", (did,))
-                deleted_count = cur.rowcount or 0
                 
                 # Create links for each video in the group (if any)
                 created_links = []
                 if group_videos:
                     for vid, video_name in group_videos:
-                        # Use explicit conflict target for clarity
                         cur.execute("""
                             INSERT INTO public.device_video_shop_group (did, vid, sid, gid)
                             VALUES (%s, %s, %s, %s)
-                            ON CONFLICT (did, vid, sid, gid) WHERE gid IS NOT NULL
-                            DO UPDATE SET updated_at = NOW()
+                            ON CONFLICT DO NOTHING
                             RETURNING id;
                         """, (did, vid, sid, gid))
                         link_row = cur.fetchone()
@@ -2020,8 +1881,6 @@ def link_device_to_group(body: DeviceToGroupIn):
                     "shop": body.shop_name,
                     "old_group": old_group_name,
                     "links_created": len(created_links),
-                    "links_deleted": deleted_count,
-                    "videos_in_group": len(group_videos),
                     "videos": [l["video_name"] for l in created_links]
                 }
     except HTTPException:
@@ -2200,21 +2059,16 @@ def list_download_urls_for_device(mobile_id: str, limit: int = Query(200, ge=1, 
                 layout_mode = layout_row[0] or "single"
                 layout_config = layout_row[1]
         
-        # Parse layout_config to get content slots (both videos and images)
-        # json imported at top
-        config_slots = []
-        video_slots = {}  # video_name -> slot_info
-        ad_slots = {}     # ad_name -> slot_info
+        # Parse layout_config to get advertisement slots
+        ad_slots = {}
         if layout_config:
             try:
+                import json
                 config = json.loads(layout_config) if isinstance(layout_config, str) else layout_config
                 if isinstance(config, list):
-                    config_slots = config
                     for slot in config:
                         if slot.get("ad_name") and slot.get("content_type") == "image":
                             ad_slots[slot["ad_name"]] = slot
-                        elif slot.get("video_name"):
-                            video_slots[slot["video_name"]] = slot
             except:
                 pass
         
@@ -2241,7 +2095,7 @@ def list_download_urls_for_device(mobile_id: str, limit: int = Query(200, ge=1, 
                             filename=filename,
                             rotation=slot_info.get("rotation") or ad_row[3] or 0,
                             content_type="image",
-                            fit_mode=slot_info.get("fit_mode") or ad_row[4] or "cover",
+                            fit_mode=ad_row[4] or "cover",
                             display_duration=ad_row[5] or 10,
                             display_order=0,
                             resolution=None,
@@ -2255,20 +2109,11 @@ def list_download_urls_for_device(mobile_id: str, limit: int = Query(200, ge=1, 
     for r in rows:
         if not r.get("s3_link"):
             continue
-        
-        video_name = r["video_name"]
-        slot_info = video_slots.get(video_name, {})
-        
         url, filename = presign_get_object(r["s3_link"], PRESIGN_EXPIRES)
         
-        # Use slot rotation from layout_config if available, then device-specific, then video defaults
-        effective_rotation = slot_info.get("rotation") if slot_info.get("rotation") is not None else (
-            r.get("device_rotation") if r.get("device_rotation") is not None else r.get("rotation", 0)
-        )
+        # Use device-specific rotation/resolution if set, otherwise use video defaults
+        effective_rotation = r.get("device_rotation") if r.get("device_rotation") is not None else r.get("rotation", 0)
         effective_resolution = r.get("device_resolution") if r.get("device_resolution") else r.get("resolution")
-        
-        # Use grid_position from layout_config if available
-        grid_position = slot_info.get("position", r.get("grid_position", 0))
         
         items.append(PresignedURLItem(
             link_id=r["id"],
@@ -2284,52 +2129,12 @@ def list_download_urls_for_device(mobile_id: str, limit: int = Query(200, ge=1, 
             resolution=effective_resolution,
             device_rotation=r.get("device_rotation"),
             device_resolution=r.get("device_resolution"),
-            grid_position=grid_position,
+            grid_position=r.get("grid_position", 0),
             grid_size=r.get("grid_size"),
         ))
     
     # Combine video and advertisement items
     all_items = items + ad_items
-    
-    # If we have a layout_config, filter and order items according to it
-    if config_slots and layout_mode != "single":
-        # Build ordered list based on layout_config positions
-        ordered_items = []
-        for slot in sorted(config_slots, key=lambda s: s.get("position", 0)):
-            slot_video_name = slot.get("video_name")
-            slot_ad_name = slot.get("ad_name")
-            slot_content_type = slot.get("content_type", "video")
-            
-            if slot_content_type == "image" and slot_ad_name:
-                # Find matching advertisement
-                matching = [item for item in all_items if item.content_type == "image" and item.video_name == slot_ad_name]
-                if matching:
-                    ordered_items.append(matching[0])
-            elif slot_video_name:
-                # Find matching video
-                matching = [item for item in all_items if item.video_name == slot_video_name]
-                if matching:
-                    ordered_items.append(matching[0])
-        
-        # Use ordered items if we found any, otherwise fall back to all_items sorted
-        if ordered_items:
-            all_items = ordered_items
-        else:
-            # Sort by grid_position to maintain layout order
-            all_items.sort(key=lambda x: (x.grid_position or 0, x.link_id or 0))
-    else:
-        # Sort by grid_position to maintain layout order
-        all_items.sort(key=lambda x: (x.grid_position or 0, x.link_id or 0))
-    
-    # For single mode: if layout_config specifies content, return only that content
-    if layout_mode == "single" and config_slots:
-        first_slot = config_slots[0] if config_slots else {}
-        if first_slot.get("content_type") == "image" and first_slot.get("ad_name"):
-            # Single mode with image - return only the image
-            all_items = [item for item in all_items if item.content_type == "image" and item.video_name == first_slot.get("ad_name")]
-        elif first_slot.get("video_name"):
-            # Single mode with specific video - return only that video
-            all_items = [item for item in all_items if item.video_name == first_slot.get("video_name")]
     
     if not all_items:
         raise HTTPException(status_code=404, detail="No content linked to this device")
@@ -2360,104 +2165,6 @@ def get_device_download_status(mobile_id: str):
             did, dev_flag = int(drow[0]), bool(drow[1])
         total, done, _ = _aggregate_from_links(conn, did)
         return DeviceDownloadStatusOut(mobile_id=mobile_id, download_status=dev_flag, total_links=total, downloaded_count=done)
-
-
-@app.post("/device/{mobile_id}/download_update", response_model=DeviceDownloadStatusOut)
-def set_device_download_flag(mobile_id: str, body: DeviceDownloadStatusSetIn):
-    with pg_conn() as conn:
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM public.device WHERE mobile_id = %s LIMIT 1;", (mobile_id,))
-                drow = cur.fetchone()
-                if not drow:
-                    raise HTTPException(status_code=404, detail="Device not found")
-                did = int(drow[0])
-            _write_device_flag(conn, did, bool(body.status))
-            total, done, _ = _aggregate_from_links(conn, did)
-            conn.commit()
-            return DeviceDownloadStatusOut(mobile_id=mobile_id, download_status=bool(body.status), total_links=total, downloaded_count=done)
-        except HTTPException:
-            conn.rollback()
-            raise
-        except:
-            conn.rollback()
-            raise
-
-
-# ---------- Download Progress (Real-time) ----------
-@app.post("/device/{mobile_id}/download_progress", response_model=DeviceDownloadProgressOut)
-def update_device_download_progress(mobile_id: str, body: DeviceDownloadProgressIn):
-    """Update real-time download progress for a device. Called by Android app during downloads."""
-    # Store in memory for real-time access
-    download_progress_store[mobile_id] = {
-        "current_file": body.current_file,
-        "total_files": body.total_files,
-        "file_name": body.file_name,
-        "progress": body.progress,
-        "downloaded_bytes": body.downloaded_bytes,
-        "total_bytes": body.total_bytes,
-        "is_downloading": body.is_downloading,
-        "updated_at": datetime.now()
-    }
-    
-    return DeviceDownloadProgressOut(
-        mobile_id=mobile_id,
-        current_file=body.current_file,
-        total_files=body.total_files,
-        file_name=body.file_name,
-        progress=body.progress,
-        downloaded_bytes=body.downloaded_bytes,
-        total_bytes=body.total_bytes,
-        is_downloading=body.is_downloading,
-        updated_at=datetime.now().isoformat()
-    )
-
-
-@app.get("/device/{mobile_id}/download_progress", response_model=DeviceDownloadProgressOut)
-def get_device_download_progress(mobile_id: str):
-    """Get real-time download progress for a device. Called by web frontend to display progress."""
-    progress = download_progress_store.get(mobile_id)
-    
-    if not progress:
-        # No progress data - device might not be downloading
-        return DeviceDownloadProgressOut(
-            mobile_id=mobile_id,
-            current_file=0,
-            total_files=0,
-            file_name=None,
-            progress=0,
-            downloaded_bytes=0,
-            total_bytes=0,
-            is_downloading=False,
-            updated_at=None
-        )
-    
-    # Check if the progress is stale (older than 30 seconds means download likely finished or failed)
-    updated_at = progress.get("updated_at")
-    is_stale = False
-    if updated_at:
-        age_seconds = (datetime.now() - updated_at).total_seconds()
-        is_stale = age_seconds > 30
-    
-    return DeviceDownloadProgressOut(
-        mobile_id=mobile_id,
-        current_file=progress.get("current_file", 0),
-        total_files=progress.get("total_files", 0),
-        file_name=progress.get("file_name"),
-        progress=progress.get("progress", 0),
-        downloaded_bytes=progress.get("downloaded_bytes", 0),
-        total_bytes=progress.get("total_bytes", 0),
-        is_downloading=progress.get("is_downloading", False) and not is_stale,
-        updated_at=updated_at.isoformat() if updated_at else None
-    )
-
-
-@app.delete("/device/{mobile_id}/download_progress")
-def clear_device_download_progress(mobile_id: str):
-    """Clear download progress for a device. Called when download completes or is cancelled."""
-    if mobile_id in download_progress_store:
-        del download_progress_store[mobile_id]
-    return {"status": "cleared", "mobile_id": mobile_id}
 
 
 @app.post("/device/{mobile_id}/download_update", response_model=DeviceDownloadStatusOut)
@@ -2605,7 +2312,7 @@ def update_link_settings(link_id: int, body: LinkUpdateIn):
 @app.get("/device/{mobile_id}/rotation")
 def get_device_rotation_settings(mobile_id: str):
     """
-    Get rotation and grid settings for all videos/images on a device.
+    Get rotation and grid settings for all videos on a device.
     Called by Android app to poll for rotation/layout changes.
     Returns format: { rotations: [...], layout_mode: "..." }
     """
@@ -2627,35 +2334,10 @@ def get_device_rotation_settings(mobile_id: str):
                 layout_mode = layout_row[0] or "single"
                 layout_config = layout_row[1]
         
-        # Parse layout_config to get slot information
-        # json imported at top
-        config_slots = []
-        video_slots = {}  # video_name -> slot_info
-        ad_slots = {}     # ad_name -> slot_info
-        if layout_config:
-            try:
-                config = json.loads(layout_config) if isinstance(layout_config, str) else layout_config
-                if isinstance(config, list):
-                    config_slots = config
-                    for slot in config:
-                        if slot.get("ad_name") and slot.get("content_type") == "image":
-                            ad_slots[slot["ad_name"]] = slot
-                        elif slot.get("video_name"):
-                            video_slots[slot["video_name"]] = slot
-            except:
-                pass
-        
         rotations = []
-        
-        # Add video rotations
         for r in rows:
-            video_name = r.get("video_name")
-            slot_info = video_slots.get(video_name, {})
-            
-            # Use slot rotation from layout_config if available, then device_rotation, then video rotation
-            effective_rotation = slot_info.get("rotation") if slot_info.get("rotation") is not None else (
-                r.get("device_rotation") if r.get("device_rotation") is not None else r.get("rotation", 0)
-            )
+            # Use device_rotation if set, else fall back to video rotation
+            effective_rotation = r.get("device_rotation") if r.get("device_rotation") is not None else r.get("rotation", 0)
             
             # Parse grid_size if it's a JSON string
             grid_size = r.get("grid_size")
@@ -2664,6 +2346,7 @@ def get_device_rotation_settings(mobile_id: str):
             if grid_size:
                 try:
                     if isinstance(grid_size, str):
+                        import json
                         gs = json.loads(grid_size)
                         grid_width = gs.get("w", 100)
                         grid_height = gs.get("h", 100)
@@ -2677,57 +2360,15 @@ def get_device_rotation_settings(mobile_id: str):
             s3_link = r.get("s3_link", "")
             filename = s3_link.split("/")[-1] if s3_link else r.get("video_name", "")
             
-            # Use grid_position from layout_config if available
-            grid_position = slot_info.get("position", r.get("grid_position", 1))
-            
             rotations.append({
                 "filename": filename,
-                "video_name": video_name,
+                "video_name": r.get("video_name"),
                 "rotation": effective_rotation,
                 "fit_mode": r.get("fit_mode", "cover"),
-                "grid_position": grid_position,
+                "grid_position": r.get("grid_position", 1),
                 "grid_width": grid_width,
                 "grid_height": grid_height,
-                "content_type": r.get("content_type", "video"),
             })
-        
-        # Add image/advertisement rotations from layout_config
-        if ad_slots:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id, ad_name, s3_link, rotation, fit_mode
-                    FROM public.advertisement
-                    WHERE ad_name = ANY(%s);
-                """, (list(ad_slots.keys()),))
-                for ad_row in cur.fetchall():
-                    ad_name = ad_row[1]
-                    slot_info = ad_slots.get(ad_name, {})
-                    s3_link = ad_row[2] or ""
-                    filename = s3_link.split("/")[-1] if s3_link else ad_name
-                    
-                    rotations.append({
-                        "filename": filename,
-                        "video_name": ad_name,
-                        "rotation": slot_info.get("rotation") or ad_row[3] or 0,
-                        "fit_mode": slot_info.get("fit_mode") or ad_row[4] or "cover",
-                        "grid_position": slot_info.get("position", 0),
-                        "grid_width": 100,
-                        "grid_height": 100,
-                        "content_type": "image",
-                    })
-        
-        # Sort by grid_position
-        rotations.sort(key=lambda x: (x.get("grid_position", 0), x.get("video_name", "")))
-        
-        # For single mode: if layout_config specifies content, return only that content
-        if layout_mode == "single" and config_slots:
-            first_slot = config_slots[0] if config_slots else {}
-            if first_slot.get("content_type") == "image" and first_slot.get("ad_name"):
-                # Single mode with image - return only the image
-                rotations = [r for r in rotations if r.get("content_type") == "image" and r.get("video_name") == first_slot.get("ad_name")]
-            elif first_slot.get("video_name"):
-                # Single mode with specific video - return only that video
-                rotations = [r for r in rotations if r.get("video_name") == first_slot.get("video_name")]
         
         return {
             "mobile_id": mobile_id,
@@ -2867,7 +2508,7 @@ def set_device_grid_layout(mobile_id: str, body: Dict[str, Any]):
                     device_resolution = item.get("device_resolution")
                     
                     if link_id:
-                        # json imported at top
+                        import json
                         grid_size_str = json.dumps(grid_size) if grid_size else None
                         cur.execute("""
                             UPDATE public.device_video_shop_group
@@ -2895,8 +2536,7 @@ def get_device_online_status(mobile_id: str):
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT id, is_online, last_online_at,
-                       EXTRACT(EPOCH FROM (NOW() - last_online_at)) as seconds_ago,
-                       is_active
+                       EXTRACT(EPOCH FROM (NOW() - last_online_at)) as seconds_ago
                 FROM public.device WHERE mobile_id = %s LIMIT 1;
             """, (mobile_id,))
             row = cur.fetchone()
@@ -2906,11 +2546,6 @@ def get_device_online_status(mobile_id: str):
             did = row[0]
             is_online = row[1]
             seconds_ago = row[3]
-            is_active = row[4] if row[4] is not None else True
-            
-            # If device is inactive, return 404 to show "not enrolled" screen on device
-            if not is_active:
-                raise HTTPException(status_code=404, detail="Device is deactivated")
             
             # If last heartbeat was more than threshold seconds ago, mark offline
             if seconds_ago is not None and seconds_ago > ONLINE_THRESHOLD_SECONDS and is_online:
@@ -2931,46 +2566,19 @@ def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                # Get current status first, including is_active and needs_refresh
-                cur.execute("""
-                    SELECT id, is_online, is_active, 
-                           COALESCE(needs_refresh, FALSE) as needs_refresh,
-                           download_status
-                    FROM public.device WHERE mobile_id = %s LIMIT 1;
-                """, (mobile_id,))
+                # Get current status first
+                cur.execute("SELECT id, is_online FROM public.device WHERE mobile_id = %s LIMIT 1;", (mobile_id,))
                 device_row = cur.fetchone()
                 if not device_row:
                     raise HTTPException(status_code=404, detail="Device not found")
                 
                 did = device_row[0]
                 previous_status = device_row[1]
-                is_active = device_row[2] if device_row[2] is not None else True
-                needs_refresh = device_row[3] if device_row[3] is not None else False
-                download_status = device_row[4] if device_row[4] is not None else False
                 
-                # If device is deactivated, return response with is_active=false and force_refresh=true
-                # This tells the app to show enrollment screen
-                if not is_active:
-                    # Clear the needs_refresh flag since we're handling it
-                    cur.execute("""
-                        UPDATE public.device 
-                        SET needs_refresh = FALSE, updated_at = NOW()
-                        WHERE mobile_id = %s;
-                    """, (mobile_id,))
-                    conn.commit()
-                    return {
-                        "mobile_id": mobile_id,
-                        "is_online": False,
-                        "is_active": False,
-                        "force_refresh": True,
-                        "download_status": download_status
-                    }
-                
-                # Update the device status and clear needs_refresh flag
+                # Update the device status
                 cur.execute("""
                     UPDATE public.device 
-                    SET is_online = %s, last_online_at = NOW(), updated_at = NOW(),
-                        needs_refresh = FALSE
+                    SET is_online = %s, last_online_at = NOW(), updated_at = NOW()
                     WHERE mobile_id = %s
                     RETURNING is_online;
                 """, (body.is_online, mobile_id))
@@ -2985,13 +2593,7 @@ def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                     """, (did, event_type))
                 
             conn.commit()
-            return {
-                "mobile_id": mobile_id, 
-                "is_online": bool(row[0]),
-                "is_active": True,
-                "force_refresh": needs_refresh,
-                "download_status": download_status
-            }
+            return {"mobile_id": mobile_id, "is_online": bool(row[0])}
         except HTTPException:
             conn.rollback()
             raise
@@ -3092,10 +2694,9 @@ def create_device_with_linking(body: DeviceCreateIn):
                     "gname": None,
                     "shop_name": None,
                     "resolution": body.resolution,
-                    "videos_linked": 0,
                 }
                 
-                # If group and shop provided, create links for ALL videos in the group
+                # If group and shop provided, create a link
                 if body.group_name and body.shop_name:
                     cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (body.group_name,))
                     grow = cur.fetchone()
@@ -3111,48 +2712,18 @@ def create_device_with_linking(body: DeviceCreateIn):
                         raise HTTPException(status_code=404, detail=f"Shop not found: {body.shop_name}")
                     sid = srow[0]
                     
-                    # Create device_assignment record
+                    # Get first video from group (if any)
                     cur.execute("""
-                        INSERT INTO public.device_assignment (did, gid, sid)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (did) DO UPDATE SET gid = %s, sid = %s, updated_at = NOW();
-                    """, (did, gid, sid, gid, sid))
-                    
-                    # Get ALL videos from group_video table (primary source)
-                    cur.execute("""
-                        SELECT v.id, v.video_name
-                        FROM public.group_video gv
-                        JOIN public.video v ON v.id = gv.vid
-                        WHERE gv.gid = %s
-                        ORDER BY gv.display_order;
+                        SELECT DISTINCT v.id 
+                        FROM public.device_video_shop_group dvsg
+                        JOIN public.video v ON v.id = dvsg.vid
+                        WHERE dvsg.gid = %s
+                        LIMIT 1;
                     """, (gid,))
-                    group_videos = cur.fetchall() or []
+                    vrow = cur.fetchone()
                     
-                    # If no videos in group_video, check device_video_shop_group (legacy)
-                    if not group_videos:
-                        cur.execute("""
-                            SELECT DISTINCT v.id, v.video_name
-                            FROM public.device_video_shop_group dvsg
-                            JOIN public.video v ON v.id = dvsg.vid
-                            WHERE dvsg.gid = %s;
-                        """, (gid,))
-                        group_videos = cur.fetchall() or []
-                        
-                        # Backfill to group_video table
-                        if group_videos:
-                            for idx, (vid, vname) in enumerate(group_videos):
-                                cur.execute("""
-                                    INSERT INTO public.group_video (gid, vid, display_order)
-                                    VALUES (%s, %s, %s)
-                                    ON CONFLICT (gid, vid) DO NOTHING;
-                                """, (gid, vid, idx))
-                    
-                    # Remove any existing links for this device (in case of update)
-                    cur.execute("DELETE FROM public.device_video_shop_group WHERE did = %s;", (did,))
-                    
-                    # Create links for ALL videos in the group
-                    videos_linked = 0
-                    for vid, video_name in group_videos:
+                    if vrow:
+                        vid = vrow[0]
                         cur.execute("""
                             INSERT INTO public.device_video_shop_group (did, vid, sid, gid)
                             VALUES (%s, %s, %s, %s)
@@ -3160,17 +2731,11 @@ def create_device_with_linking(body: DeviceCreateIn):
                             DO UPDATE SET updated_at = NOW()
                             RETURNING id;
                         """, (did, vid, sid, gid))
-                        if cur.fetchone():
-                            videos_linked += 1
-                    
-                    # Mark device for download
-                    cur.execute("UPDATE public.device SET download_status = FALSE, updated_at = NOW() WHERE id = %s;", (did,))
                     
                     result["linked_to_group"] = True
                     result["linked_to_shop"] = True
                     result["gname"] = body.group_name
                     result["shop_name"] = body.shop_name
-                    result["videos_linked"] = videos_linked
             
             conn.commit()
             return result
@@ -4904,636 +4469,6 @@ def list_group_advertisements_by_name(gname: str):
                     })
             
             return {"gname": gname, "ad_names": [a["ad_name"] for a in ads], "advertisements": ads}
-
-
-# ---------- Device Active Status Endpoints ----------
-@app.get("/device/{mobile_id}/active-status")
-def get_device_active_status(mobile_id: str):
-    """
-    Get the active status of a device.
-    Returns is_active = True/False
-    """
-    try:
-        with pg_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT is_active FROM public.device 
-                    WHERE mobile_id = %s 
-                    ORDER BY id DESC LIMIT 1;
-                """, (mobile_id,))
-                row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail=f"Device not found: {mobile_id}")
-                return {"mobile_id": mobile_id, "is_active": row[0] if row[0] is not None else True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/device/{mobile_id}/active-status")
-def set_device_active_status(mobile_id: str, body: DeviceActiveStatusIn):
-    """
-    Set the active status of a device.
-    - When is_active = False: Device will show "Not Enrolled" screen
-    - When is_active = True: Device works normally
-    """
-    try:
-        with pg_conn() as conn:
-            with conn.cursor() as cur:
-                # Check device exists
-                cur.execute("""
-                    SELECT id FROM public.device 
-                    WHERE mobile_id = %s 
-                    ORDER BY id DESC LIMIT 1;
-                """, (mobile_id,))
-                row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail=f"Device not found: {mobile_id}")
-                
-                did = row[0]
-                
-                # Update is_active status and set needs_refresh to trigger app restart
-                cur.execute("""
-                    UPDATE public.device 
-                    SET is_active = %s, needs_refresh = TRUE, updated_at = NOW() 
-                    WHERE id = %s;
-                """, (body.is_active, did))
-                
-                conn.commit()
-                
-                status_text = "activated" if body.is_active else "deactivated"
-                return {
-                    "mobile_id": mobile_id,
-                    "is_active": body.is_active,
-                    "message": f"Device {status_text} successfully"
-                }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/device/{mobile_id}/refresh")
-def trigger_device_refresh(mobile_id: str):
-    """
-    Trigger a refresh/restart of the device app.
-    The device will restart on next heartbeat.
-    """
-    try:
-        with pg_conn() as conn:
-            with conn.cursor() as cur:
-                # Check device exists
-                cur.execute("""
-                    SELECT id FROM public.device 
-                    WHERE mobile_id = %s 
-                    ORDER BY id DESC LIMIT 1;
-                """, (mobile_id,))
-                row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail=f"Device not found: {mobile_id}")
-                
-                did = row[0]
-                
-                # Set needs_refresh flag
-                cur.execute("""
-                    UPDATE public.device 
-                    SET needs_refresh = TRUE, updated_at = NOW() 
-                    WHERE id = %s;
-                """, (did,))
-                
-                conn.commit()
-                
-                return {
-                    "mobile_id": mobile_id,
-                    "message": "Refresh signal sent. Device will restart on next heartbeat (within 10 seconds)."
-                }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/device/{mobile_id}/unassign-from-group")
-def unassign_device_from_group(mobile_id: str):
-    """
-    Unassign a device from its current group.
-    This will:
-    1. Remove the device from device_assignment table
-    2. Remove all video links from device_video_shop_group table
-    3. Clear the device_layout config
-    4. Mark device for re-download (download_status = FALSE)
-    """
-    try:
-        with pg_conn() as conn:
-            with conn.cursor() as cur:
-                # Get device ID
-                cur.execute("""
-                    SELECT id FROM public.device 
-                    WHERE mobile_id = %s 
-                    ORDER BY id DESC LIMIT 1;
-                """, (mobile_id,))
-                row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail=f"Device not found: {mobile_id}")
-                
-                did = row[0]
-                
-                # Get current group info before unassigning
-                cur.execute("""
-                    SELECT g.gname 
-                    FROM public.device_assignment da
-                    JOIN public."group" g ON g.id = da.gid
-                    WHERE da.did = %s;
-                """, (did,))
-                group_row = cur.fetchone()
-                old_group = group_row[0] if group_row else None
-                
-                # Delete from device_assignment
-                cur.execute("DELETE FROM public.device_assignment WHERE did = %s;", (did,))
-                deleted_assignment = cur.rowcount
-                
-                # Delete from device_video_shop_group (video links)
-                cur.execute("DELETE FROM public.device_video_shop_group WHERE did = %s;", (did,))
-                deleted_links = cur.rowcount
-                
-                # Clear device_layout config
-                cur.execute("DELETE FROM public.device_layout WHERE did = %s;", (did,))
-                deleted_layout = cur.rowcount
-                
-                # Mark device for re-download
-                cur.execute("""
-                    UPDATE public.device 
-                    SET download_status = FALSE, updated_at = NOW() 
-                    WHERE id = %s;
-                """, (did,))
-                
-                conn.commit()
-                
-                message = f"Device unassigned"
-                if old_group:
-                    message = f"Device unassigned from group '{old_group}'"
-                
-                return {
-                    "mobile_id": mobile_id,
-                    "message": message,
-                    "deleted_assignment": deleted_assignment > 0,
-                    "deleted_video_links": deleted_links,
-                    "deleted_layout": deleted_layout > 0,
-                    "old_group": old_group
-                }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# MERGED CRUD ENDPOINTS — device, group, shop, video basic CRUD
-# These were previously in separate services (device.py, group.py,
-# shop_service.py, video_service.py). Merged here for single-container deploy.
-# ═══════════════════════════════════════════════════════════════════════════
-
-# --- Models for standalone CRUD ---
-class StandaloneDeviceRequest(BaseModel):
-    mobile_id: str
-    download_status: bool = False
-
-class StandaloneDeviceUpdate(BaseModel):
-    mobile_id: Optional[str] = None
-    download_status: Optional[bool] = None
-
-class StandaloneGroupCreate(BaseModel):
-    gname: str
-
-class StandaloneGroupUpdate(BaseModel):
-    gname: Optional[str] = None
-
-class StandaloneShopCreate(BaseModel):
-    shop_name: str
-
-class StandaloneShopUpdate(BaseModel):
-    shop_name: Optional[str] = None
-
-class StandaloneVideoUpdate(BaseModel):
-    video_name: Optional[str] = None
-    s3_link: Optional[str] = None
-    rotation: Optional[int] = None
-    content_type: Optional[str] = None
-    fit_mode: Optional[str] = None
-    display_duration: Optional[int] = None
-
-class StandaloneRotationUpdate(BaseModel):
-    rotation: int
-
-class StandaloneFitModeUpdate(BaseModel):
-    fit_mode: str
-
-# --- S3 config for video uploads ---
-S3_VIDEO_PREFIX = os.getenv("S3_PREFIX", "myvideos").strip("/")
-S3_VIDEO_FORCED_EXT = ".mp4"
-
-def _video_slug(s: str) -> str:
-    import re as _re
-    s = s.strip()
-    s = _re.sub(r"[^\w\-.]+", "-", s, flags=_re.UNICODE)
-    return _re.sub(r"-{2,}", "-", s).strip("-").lower()
-
-def _make_video_s3_key(video_name: str) -> str:
-    base = _video_slug(video_name)
-    filename = f"{base}{S3_VIDEO_FORCED_EXT}"
-    return f"{S3_VIDEO_PREFIX}/{filename}".strip("/") if S3_VIDEO_PREFIX else filename
-
-def _to_video_s3_uri(key: str) -> str:
-    return f"s3://{S3_BUCKET}/{key}"
-
-def _detect_video_content_type(filename: str) -> str:
-    from pathlib import Path as _P
-    ext = _P(filename).suffix.lower()
-    video_exts = {'.mp4', '.webm', '.mov', '.avi', '.mkv'}
-    image_exts = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
-    if ext in video_exts: return "video"
-    if ext in image_exts: return "image"
-    if ext in {'.html', '.htm'}: return "html"
-    if ext == '.pdf': return "pdf"
-    return "video"
-
-def _video_s3_key_exists(key: str, bucket: str = None) -> bool:
-    s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else boto3.client("s3")
-    b = bucket or S3_BUCKET
-    try:
-        s3.head_object(Bucket=b, Key=key)
-        return True
-    except Exception:
-        return False
-
-def _video_presign(bucket: str, key: str, expires: int = 3600) -> str:
-    s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else boto3.client("s3")
-    return s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires)
-
-def _parse_video_s3_link(s3_link: str):
-    s3_link = (s3_link or "").strip()
-    if not s3_link:
-        return (S3_BUCKET, "")
-    if s3_link.startswith("s3://"):
-        rest = s3_link[len("s3://"):]
-        parts = rest.split("/", 1)
-        return (parts[0], parts[1]) if len(parts) == 2 else (parts[0], "")
-    return (S3_BUCKET, s3_link)
-
-
-# ═══════════════ DEVICE CRUD ═══════════════
-
-@app.post("/insert_device")
-def standalone_insert_device(req: StandaloneDeviceRequest):
-    mobile = (req.mobile_id or "").strip()
-    if not mobile:
-        raise HTTPException(status_code=400, detail="mobile_id is required")
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO public.device (mobile_id, download_status) VALUES (%s, %s) RETURNING id;",
-                        (mobile, bool(req.download_status)))
-            new_id = cur.fetchone()[0]
-        conn.commit()
-    return {"id": new_id, "message": "Device inserted successfully"}
-
-@app.get("/device/{mobile_id}")
-def standalone_get_device(mobile_id: str = Path(...)):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, mobile_id, download_status, created_at, updated_at FROM public.device WHERE mobile_id = %s ORDER BY id DESC LIMIT 1;", (mobile_id,))
-            row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="Device not found")
-    return {"id": row[0], "mobile_id": row[1], "download_status": row[2], "created_at": row[3], "updated_at": row[4]}
-
-@app.get("/devices")
-def standalone_list_devices(
-    q: Optional[str] = Query(None, description="Search mobile_id or device_name (ILIKE)"),
-    limit: int = Query(50, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            if q:
-                cur.execute("SELECT COUNT(*) FROM public.device WHERE mobile_id ILIKE %s OR device_name ILIKE %s;", (f"%{q}%", f"%{q}%"))
-            else:
-                cur.execute("SELECT COUNT(*) FROM public.device;")
-            total = int(cur.fetchone()[0])
-
-            base_sql = """
-                SELECT d.id, d.mobile_id, d.download_status, d.created_at, d.updated_at,
-                       d.resolution, d.device_name,
-                       COALESCE(g1.gname, g2.gname) as group_name, d.is_active
-                FROM public.device d
-                LEFT JOIN public.device_assignment da ON da.did = d.id
-                LEFT JOIN public."group" g1 ON g1.id = da.gid
-                LEFT JOIN (
-                    SELECT DISTINCT ON (dvsg.did) dvsg.did, g.gname
-                    FROM public.device_video_shop_group dvsg
-                    JOIN public."group" g ON g.id = dvsg.gid
-                    WHERE dvsg.gid IS NOT NULL
-                ) g2 ON g2.did = d.id AND g1.gname IS NULL
-            """
-            if q:
-                cur.execute(base_sql + " WHERE d.mobile_id ILIKE %s OR d.device_name ILIKE %s ORDER BY d.id DESC LIMIT %s OFFSET %s;",
-                            (f"%{q}%", f"%{q}%", limit, offset))
-            else:
-                cur.execute(base_sql + " ORDER BY d.id DESC LIMIT %s OFFSET %s;", (limit, offset))
-            rows = cur.fetchall()
-
-    items = [
-        {"id": r[0], "mobile_id": r[1], "download_status": r[2], "created_at": r[3], "updated_at": r[4],
-         "resolution": r[5] if len(r) > 5 else None, "device_name": r[6] if len(r) > 6 else None,
-         "group_name": r[7] if len(r) > 7 else None,
-         "is_active": r[8] if len(r) > 8 and r[8] is not None else True}
-        for r in rows
-    ]
-    return {"items": items, "total": total, "count": len(items), "limit": limit, "offset": offset, "query": q}
-
-@app.put("/device/{mobile_id}")
-def standalone_update_device(mobile_id: str, patch: StandaloneDeviceUpdate):
-    sets, params = [], []
-    if patch.mobile_id is not None:
-        sets.append("mobile_id = %s"); params.append(patch.mobile_id)
-    if patch.download_status is not None:
-        sets.append("download_status = %s"); params.append(patch.download_status)
-    if not sets:
-        return standalone_get_device(mobile_id)
-    params.append(mobile_id)
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"UPDATE public.device SET {', '.join(sets)} WHERE mobile_id = %s RETURNING id, mobile_id, download_status, created_at, updated_at;", params)
-            row = cur.fetchone()
-        conn.commit()
-    if not row:
-        raise HTTPException(status_code=404, detail="Device not found or no changes")
-    return {"message": "Device updated", "item": {"id": row[0], "mobile_id": row[1], "download_status": row[2], "created_at": row[3], "updated_at": row[4]}}
-
-@app.delete("/device/{mobile_id}")
-def standalone_delete_device(mobile_id: str):
-    # Check for links first
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id FROM public.device WHERE mobile_id = %s ORDER BY id DESC;", (mobile_id,))
-            device_ids = [r[0] for r in cur.fetchall()]
-            if not device_ids:
-                raise HTTPException(status_code=404, detail="Device not found")
-            cur.execute("SELECT COUNT(*) FROM public.device_video_shop_group WHERE did = ANY(%s::bigint[]);", (device_ids,))
-            linked_count = int(cur.fetchone()[0])
-            if linked_count > 0:
-                raise HTTPException(status_code=409, detail=f"Device '{mobile_id}' has {linked_count} link(s). Remove links first.")
-            cur.execute("DELETE FROM public.device WHERE mobile_id = %s RETURNING id;", (mobile_id,))
-            deleted = cur.fetchall()
-        conn.commit()
-    return {"deleted_count": len(deleted)}
-
-
-# ═══════════════ GROUP CRUD ═══════════════
-
-@app.post("/insert_group")
-def standalone_insert_group(req: StandaloneGroupCreate):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute('INSERT INTO public."group" (gname) VALUES (%s) RETURNING id;', (req.gname,))
-            new_id = cur.fetchone()[0]
-        conn.commit()
-    return {"id": new_id, "message": "Group inserted successfully"}
-
-@app.get("/group/{gname}")
-def standalone_get_group(gname: str = Path(...)):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute('SELECT id, gname, created_at, updated_at FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (gname,))
-            row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="Group not found")
-    return {"id": row[0], "gname": row[1], "created_at": row[2], "updated_at": row[3]}
-
-@app.get("/groups")
-def standalone_list_groups(
-    q: Optional[str] = Query(None),
-    limit: int = Query(50, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            if q:
-                cur.execute('SELECT id, gname, created_at, updated_at FROM public."group" WHERE gname ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s;',
-                            (f"%{q}%", limit, offset))
-            else:
-                cur.execute('SELECT id, gname, created_at, updated_at FROM public."group" ORDER BY id DESC LIMIT %s OFFSET %s;', (limit, offset))
-            rows = cur.fetchall()
-    items = [{"id": r[0], "gname": r[1], "created_at": r[2], "updated_at": r[3]} for r in rows]
-    return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
-
-@app.put("/group/{gname}")
-def standalone_update_group(gname: str, patch: StandaloneGroupUpdate):
-    if not patch.gname:
-        return standalone_get_group(gname)
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute('UPDATE public."group" SET gname = %s WHERE gname = %s RETURNING id, gname, created_at, updated_at;', (patch.gname, gname))
-            row = cur.fetchone()
-        conn.commit()
-    if not row:
-        raise HTTPException(status_code=404, detail="Group not found or no changes")
-    return {"message": "Group updated", "item": {"id": row[0], "gname": row[1], "created_at": row[2], "updated_at": row[3]}}
-
-@app.delete("/group/{gname}")
-def standalone_delete_group(gname: str, force: bool = Query(False)):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (gname,))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Group not found")
-            gid = row[0]
-            # Check device attachments
-            cur.execute("SELECT COUNT(*) FROM public.device_assignment WHERE gid = %s;", (gid,))
-            dev_count = int(cur.fetchone()[0])
-            if dev_count > 0 and not force:
-                raise HTTPException(status_code=409, detail=f"Group has {dev_count} device(s) attached. Use ?force=true to delete.")
-            if force:
-                cur.execute("DELETE FROM public.device_assignment WHERE gid = %s;", (gid,))
-                cur.execute("DELETE FROM public.device_video_shop_group WHERE gid = %s;", (gid,))
-                cur.execute("DELETE FROM public.group_video WHERE gid = %s;", (gid,))
-                cur.execute("DELETE FROM public.group_advertisement WHERE gid = %s;", (gid,))
-            cur.execute("DELETE FROM public.group_video WHERE gid = %s;", (gid,))
-            cur.execute('DELETE FROM public."group" WHERE gname = %s RETURNING id;', (gname,))
-            deleted = cur.fetchall()
-        conn.commit()
-    return {"deleted_count": len(deleted), "devices_unassigned": dev_count if force else 0}
-
-@app.post("/group/{gname}/unassign-devices")
-def standalone_unassign_group_devices(gname: str):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (gname,))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Group not found")
-            gid = row[0]
-            cur.execute("DELETE FROM public.device_assignment WHERE gid = %s;", (gid,))
-            a_count = cur.rowcount
-            cur.execute("DELETE FROM public.device_video_shop_group WHERE gid = %s;", (gid,))
-            l_count = cur.rowcount
-        conn.commit()
-    return {"unassigned_count": a_count + l_count, "message": f"Unassigned {a_count + l_count} device(s) from group '{gname}'"}
-
-
-# ═══════════════ SHOP CRUD ═══════════════
-
-@app.post("/insert_shop")
-def standalone_insert_shop(req: StandaloneShopCreate):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO public.shop (shop_name) VALUES (%s) RETURNING id;", (req.shop_name,))
-            new_id = cur.fetchone()[0]
-        conn.commit()
-    return {"id": new_id, "message": "Shop inserted successfully"}
-
-@app.get("/shop/{shop_name}")
-def standalone_get_shop(shop_name: str = Path(...)):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop WHERE shop_name = %s ORDER BY id DESC LIMIT 1;", (shop_name,))
-            row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="Shop not found")
-    return {"id": row[0], "shop_name": row[1], "created_at": row[2], "updated_at": row[3]}
-
-@app.get("/shops")
-def standalone_list_shops(
-    q: Optional[str] = Query(None),
-    limit: int = Query(50, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            if q:
-                cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop WHERE shop_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s;",
-                            (f"%{q}%", limit, offset))
-            else:
-                cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop ORDER BY id DESC LIMIT %s OFFSET %s;", (limit, offset))
-            rows = cur.fetchall()
-    items = [{"id": r[0], "shop_name": r[1], "created_at": r[2], "updated_at": r[3]} for r in rows]
-    return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
-
-@app.put("/shop/{shop_name}")
-def standalone_update_shop(shop_name: str, patch: StandaloneShopUpdate):
-    if not patch.shop_name:
-        return standalone_get_shop(shop_name)
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE public.shop SET shop_name = %s WHERE shop_name = %s RETURNING id, shop_name, created_at, updated_at;",
-                        (patch.shop_name, shop_name))
-            row = cur.fetchone()
-        conn.commit()
-    if not row:
-        raise HTTPException(status_code=404, detail="Shop not found or no changes")
-    return {"message": "Shop updated", "item": {"id": row[0], "shop_name": row[1], "created_at": row[2], "updated_at": row[3]}}
-
-@app.delete("/shop/{shop_name}")
-def standalone_delete_shop(shop_name: str):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM public.shop WHERE shop_name = %s RETURNING id;", (shop_name,))
-            deleted = cur.fetchall()
-        conn.commit()
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Shop not found")
-    return {"deleted_count": len(deleted)}
-
-
-# ═══════════════ VIDEO CRUD ═══════════════
-
-@app.post("/upload_video")
-async def standalone_upload_video(
-    file: UploadFile = File(...),
-    video_name: str = Form(...),
-    overwrite: bool = Form(False),
-    rotation: int = Form(0),
-    fit_mode: str = Form("cover"),
-    display_duration: int = Form(10),
-):
-    key = _make_video_s3_key(video_name)
-    if not overwrite and _video_s3_key_exists(key):
-        raise HTTPException(status_code=409, detail="Video exists. Use overwrite=true.")
-    content_type = _detect_video_content_type(file.filename or video_name)
-    s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else boto3.client("s3")
-    from boto3.s3.transfer import TransferConfig
-    cfg = TransferConfig(multipart_threshold=8*1024*1024, multipart_chunksize=16*1024*1024, max_concurrency=8, use_threads=True)
-    s3.upload_fileobj(file.file, S3_BUCKET, key, ExtraArgs={"ACL": "private", "ServerSideEncryption": "AES256", "ContentType": "video/mp4"}, Config=cfg)
-    s3_uri = _to_video_s3_uri(key)
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO public.video (video_name, s3_link, rotation, content_type, fit_mode, display_duration)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (video_name)
-                DO UPDATE SET s3_link = EXCLUDED.s3_link, rotation = EXCLUDED.rotation,
-                    content_type = EXCLUDED.content_type, fit_mode = EXCLUDED.fit_mode,
-                    display_duration = EXCLUDED.display_duration, updated_at = NOW()
-                RETURNING id;
-            """, (video_name, s3_uri, rotation, content_type, fit_mode, display_duration))
-            new_id = cur.fetchone()[0]
-        conn.commit()
-    return {"id": new_id, "video_name": video_name, "s3_link": s3_uri, "key": key,
-            "rotation": rotation, "content_type": content_type, "fit_mode": fit_mode,
-            "display_duration": display_duration, "overwrote": overwrite}
-
-@app.get("/videos")
-def standalone_list_videos(
-    q: Optional[str] = Query(None),
-    limit: int = Query(50, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            sql = "SELECT id, video_name, s3_link, rotation, content_type, fit_mode, display_duration, created_at, updated_at FROM public.video"
-            if q:
-                cur.execute(sql + " WHERE video_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s", (f"%{q}%", limit, offset))
-            else:
-                cur.execute(sql + " ORDER BY id DESC LIMIT %s OFFSET %s", (limit, offset))
-            rows = cur.fetchall()
-    items = [{"id": r[0], "video_name": r[1], "s3_link": r[2], "rotation": r[3],
-              "content_type": r[4], "fit_mode": r[5], "display_duration": r[6],
-              "created_at": r[7], "updated_at": r[8]} for r in rows]
-    return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
-
-@app.put("/video/{video_name}")
-def standalone_update_video(video_name: str, patch: StandaloneVideoUpdate):
-    sets, params = [], []
-    if patch.video_name is not None: sets.append("video_name = %s"); params.append(patch.video_name)
-    if patch.s3_link is not None: sets.append("s3_link = %s"); params.append(patch.s3_link)
-    if patch.rotation is not None: sets.append("rotation = %s"); params.append(patch.rotation)
-    if patch.content_type is not None: sets.append("content_type = %s"); params.append(patch.content_type)
-    if patch.fit_mode is not None: sets.append("fit_mode = %s"); params.append(patch.fit_mode)
-    if patch.display_duration is not None: sets.append("display_duration = %s"); params.append(patch.display_duration)
-    if not sets:
-        raise HTTPException(status_code=400, detail="No fields to update")
-    params.append(video_name)
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"UPDATE public.video SET {', '.join(sets)}, updated_at = NOW() WHERE video_name = %s RETURNING id, video_name, s3_link, rotation, content_type, fit_mode, display_duration, created_at, updated_at;", params)
-            row = cur.fetchone()
-        conn.commit()
-    if not row:
-        raise HTTPException(status_code=404, detail="Video not found")
-    return {"message": "Updated", "item": {"id": row[0], "video_name": row[1], "s3_link": row[2], "rotation": row[3],
-            "content_type": row[4], "fit_mode": row[5], "display_duration": row[6], "created_at": row[7], "updated_at": row[8]}}
-
-@app.delete("/video/{video_name}")
-def standalone_delete_video(video_name: str):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM public.video WHERE video_name = %s RETURNING id;", (video_name,))
-            deleted = cur.fetchall()
-        conn.commit()
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Video not found")
-    return {"deleted_count": len(deleted)}
 
 
 if __name__ == "__main__":

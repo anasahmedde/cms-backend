@@ -4,10 +4,6 @@ name: Deploy Backend
 on:
   push:
     branches: [staging, main]
-    paths:
-      - 'backend/**'
-      - 'docker/Dockerfile'
-      - '.github/workflows/deploy-backend.yml'
 
 env:
   AWS_REGION: us-east-2
@@ -49,12 +45,12 @@ jobs:
           ECR_REPOSITORY: dgx-${{ steps.env.outputs.environment }}-backend
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          cd backend
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f ../docker/Dockerfile .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          SHORT_SHA=${IMAGE_TAG:0:7}
+          docker build --platform linux/amd64 -t $ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_SHA -f Dockerfile .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_SHA $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_SHA
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_SHA" >> $GITHUB_OUTPUT
 
       - name: Download task definition
         env:
@@ -79,4 +75,4 @@ jobs:
           service: dgx-${{ steps.env.outputs.environment }}-backend
           cluster: dgx-${{ steps.env.outputs.environment }}-cluster
           wait-for-service-stability: true
-          wait-for-minutes: 5
+          wait-for-minutes: 10
