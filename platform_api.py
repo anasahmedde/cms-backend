@@ -356,8 +356,14 @@ def delete_company(slug: str, ctx: TenantContext = Depends(require_platform_user
                 ]
                 counts = {}
                 for tbl in tenant_tables:
-                    cur.execute(f"DELETE FROM public.{tbl} WHERE tenant_id=%s", (cid,))
-                    counts[tbl.strip('"')] = cur.rowcount
+                    try:
+                        cur.execute("SAVEPOINT sp_del")
+                        cur.execute(f"DELETE FROM public.{tbl} WHERE tenant_id=%s", (cid,))
+                        counts[tbl.strip('"')] = cur.rowcount
+                        cur.execute("RELEASE SAVEPOINT sp_del")
+                    except Exception:
+                        cur.execute("ROLLBACK TO SAVEPOINT sp_del")
+                        counts[tbl.strip('"')] = 0
 
                 # Delete users belonging to this company
                 cur.execute("DELETE FROM public.users WHERE tenant_id=%s", (cid,))
