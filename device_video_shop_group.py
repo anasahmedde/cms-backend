@@ -168,6 +168,7 @@ class UserCreateIn(BaseModel):
     full_name: Optional[str] = None
     role: str = "viewer"
     permissions: List[str] = []
+    company_slug: Optional[str] = None  # Platform admins can assign user to a specific company
 
 class UserUpdateIn(BaseModel):
     email: Optional[str] = None
@@ -190,6 +191,10 @@ class UserOut(BaseModel):
     created_at: datetime
     last_login: Optional[datetime]
     permissions: List[str] = []
+    user_type: Optional[str] = None
+    tenant_id: Optional[int] = None
+    company_slug: Optional[str] = None
+    company_name: Optional[str] = None
 
 class UserListOut(BaseModel):
     items: List[UserOut]
@@ -4362,32 +4367,52 @@ def list_users(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0
     with pg_conn() as conn:
         with conn.cursor() as cur:
             if user.get("user_type") == "platform" and tenant_id is None:
-                # Platform admin without impersonation: show all users
+                # Platform admin without impersonation: show all users with company info
                 cur.execute("SELECT COUNT(*) FROM public.users;")
                 total = cur.fetchone()[0]
                 cur.execute("""SELECT u.id, u.username, u.email, u.full_name, u.role, u.is_active, u.created_at, u.last_login,
-                    ARRAY_AGG(up.permission) FILTER (WHERE up.permission IS NOT NULL) as permissions
+                    ARRAY_AGG(up.permission) FILTER (WHERE up.permission IS NOT NULL) as permissions,
+                    u.user_type, u.tenant_id, c.slug as company_slug, c.name as company_name
                     FROM public.users u LEFT JOIN public.user_permissions up ON u.id = up.user_id
-                    GROUP BY u.id ORDER BY u.created_at DESC LIMIT %s OFFSET %s;""", (limit, offset))
+                    LEFT JOIN public.company c ON u.tenant_id = c.id
+                    GROUP BY u.id, c.slug, c.name ORDER BY u.created_at DESC LIMIT %s OFFSET %s;""", (limit, offset))
             else:
                 # Scoped to tenant
                 cur.execute("SELECT COUNT(*) FROM public.users WHERE tenant_id = %s;", (tenant_id,))
                 total = cur.fetchone()[0]
                 cur.execute("""SELECT u.id, u.username, u.email, u.full_name, u.role, u.is_active, u.created_at, u.last_login,
-                    ARRAY_AGG(up.permission) FILTER (WHERE up.permission IS NOT NULL) as permissions
+                    ARRAY_AGG(up.permission) FILTER (WHERE up.permission IS NOT NULL) as permissions,
+                    u.user_type, u.tenant_id, c.slug as company_slug, c.name as company_name
                     FROM public.users u LEFT JOIN public.user_permissions up ON u.id = up.user_id
+                    LEFT JOIN public.company c ON u.tenant_id = c.id
                     WHERE u.tenant_id = %s
-                    GROUP BY u.id ORDER BY u.created_at DESC LIMIT %s OFFSET %s;""", (tenant_id, limit, offset))
+                    GROUP BY u.id, c.slug, c.name ORDER BY u.created_at DESC LIMIT %s OFFSET %s;""", (tenant_id, limit, offset))
             items = []
             for row in cur.fetchall():
                 permissions = row[8] if row[8] else []
                 all_perms = list(set(ROLE_PERMISSIONS.get(row[4], []) + permissions))
-                items.append(UserOut(id=row[0], username=row[1], email=row[2], full_name=row[3], role=row[4], is_active=row[5], created_at=row[6], last_login=row[7], permissions=all_perms))
+                items.append(UserOut(id=row[0], username=row[1], email=row[2], full_name=row[3], role=row[4], is_active=row[5], created_at=row[6], last_login=row[7], permissions=all_perms,
+                    user_type=row[9], tenant_id=row[10], company_slug=row[11], company_name=row[12]))
             return UserListOut(items=items, total=total)
 
 @app.post("/users", response_model=UserOut)
 def create_user(body: UserCreateIn, user: Dict = Depends(require_permission("manage_users"))):
     tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
+
+    # Platform admin can assign user to a specific company via company_slug
+    target_company_slug = None
+    target_company_name = None
+    if body.company_slug and user.get("user_type") == "platform":
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, slug, name FROM public.company WHERE slug = %s", (body.company_slug,))
+                c = cur.fetchone()
+                if not c:
+                    raise HTTPException(status_code=404, detail=f"Company '{body.company_slug}' not found")
+                tenant_id = c[0]
+                target_company_slug = c[1]
+                target_company_name = c[2]
+
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
@@ -4397,14 +4422,14 @@ def create_user(body: UserCreateIn, user: Dict = Depends(require_permission("man
                 else:
                     cur.execute("SELECT id FROM public.users WHERE username = %s AND tenant_id IS NULL;", (body.username.lower(),))
                 if cur.fetchone():
-                    raise HTTPException(status_code=400, detail="Username already exists")
+                    raise HTTPException(status_code=400, detail="Username already exists in this company")
                 if body.email:
                     if tenant_id:
                         cur.execute("SELECT id FROM public.users WHERE email = %s AND tenant_id = %s;", (body.email.lower(), tenant_id))
                     else:
                         cur.execute("SELECT id FROM public.users WHERE email = %s AND tenant_id IS NULL;", (body.email.lower(),))
                     if cur.fetchone():
-                        raise HTTPException(status_code=400, detail="Email already exists")
+                        raise HTTPException(status_code=400, detail="Email already exists in this company")
                 if body.role not in ROLE_PERMISSIONS:
                     raise HTTPException(status_code=400, detail=f"Invalid role")
 
@@ -4426,9 +4451,19 @@ def create_user(body: UserCreateIn, user: Dict = Depends(require_permission("man
                 new_user_id, created_at = cur.fetchone()
                 for perm in body.permissions:
                     cur.execute("INSERT INTO public.user_permissions (user_id, permission) VALUES (%s, %s) ON CONFLICT DO NOTHING;", (new_user_id, perm))
+
+                # Fetch company info if we don't have it yet
+                if tenant_id and not target_company_slug:
+                    cur.execute("SELECT slug, name FROM public.company WHERE id = %s", (tenant_id,))
+                    cr = cur.fetchone()
+                    if cr:
+                        target_company_slug = cr[0]
+                        target_company_name = cr[1]
+
                 conn.commit()
                 all_perms = list(set(ROLE_PERMISSIONS.get(body.role, []) + body.permissions))
-                return UserOut(id=new_user_id, username=body.username.lower(), email=body.email, full_name=body.full_name, role=body.role, is_active=True, created_at=created_at, last_login=None, permissions=all_perms)
+                return UserOut(id=new_user_id, username=body.username.lower(), email=body.email, full_name=body.full_name, role=body.role, is_active=True, created_at=created_at, last_login=None, permissions=all_perms,
+                    user_type=user_type, tenant_id=tenant_id, company_slug=target_company_slug, company_name=target_company_name)
         except HTTPException:
             conn.rollback()
             raise
