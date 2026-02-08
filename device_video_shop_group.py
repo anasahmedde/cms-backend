@@ -3034,13 +3034,14 @@ def get_shop_devices(shop_name: str):
 
 # ---------- Device creation with group/shop linking ----------
 @app.post("/device/create")
-def create_device_with_linking(body: DeviceCreateIn):
+def create_device_with_linking(body: DeviceCreateIn, user: Dict = Depends(get_current_user)):
     """Create a new device and optionally link to group and shop."""
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                # Check if device exists
-                cur.execute("SELECT id FROM public.device WHERE mobile_id = %s ORDER BY id DESC LIMIT 1;", (body.mobile_id,))
+                # Check if device exists within tenant
+                cur.execute("SELECT id FROM public.device WHERE mobile_id = %s AND tenant_id = %s ORDER BY id DESC LIMIT 1;", (body.mobile_id, tenant_id))
                 existing = cur.fetchone()
                 
                 if existing:
@@ -3060,10 +3061,10 @@ def create_device_with_linking(body: DeviceCreateIn):
                 else:
                     # Create new device with resolution and device_name
                     cur.execute("""
-                        INSERT INTO public.device (mobile_id, download_status, is_online, last_online_at, resolution, device_name)
-                        VALUES (%s, FALSE, FALSE, NOW(), %s, %s)
+                        INSERT INTO public.device (mobile_id, download_status, is_online, last_online_at, resolution, device_name, tenant_id)
+                        VALUES (%s, FALSE, FALSE, NOW(), %s, %s, %s)
                         RETURNING id;
-                    """, (body.mobile_id, body.resolution, body.device_name))
+                    """, (body.mobile_id, body.resolution, body.device_name, tenant_id))
                     did = cur.fetchone()[0]
                 
                 result = {
@@ -5310,14 +5311,15 @@ def _parse_video_s3_link(s3_link: str):
 # ═══════════════ DEVICE CRUD ═══════════════
 
 @app.post("/insert_device")
-def standalone_insert_device(req: StandaloneDeviceRequest):
+def standalone_insert_device(req: StandaloneDeviceRequest, user: Dict = Depends(get_current_user)):
     mobile = (req.mobile_id or "").strip()
     if not mobile:
         raise HTTPException(status_code=400, detail="mobile_id is required")
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO public.device (mobile_id, download_status) VALUES (%s, %s) RETURNING id;",
-                        (mobile, bool(req.download_status)))
+            cur.execute("INSERT INTO public.device (mobile_id, download_status, tenant_id) VALUES (%s, %s, %s) RETURNING id;",
+                        (mobile, bool(req.download_status), tenant_id))
             new_id = cur.fetchone()[0]
         conn.commit()
     return {"id": new_id, "message": "Device inserted successfully"}
@@ -5425,10 +5427,11 @@ def standalone_delete_device(mobile_id: str):
 # ═══════════════ GROUP CRUD ═══════════════
 
 @app.post("/insert_group")
-def standalone_insert_group(req: StandaloneGroupCreate):
+def standalone_insert_group(req: StandaloneGroupCreate, user: Dict = Depends(get_current_user)):
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute('INSERT INTO public."group" (gname) VALUES (%s) RETURNING id;', (req.gname,))
+            cur.execute('INSERT INTO public."group" (gname, tenant_id) VALUES (%s, %s) RETURNING id;', (req.gname, tenant_id))
             new_id = cur.fetchone()[0]
         conn.commit()
     return {"id": new_id, "message": "Group inserted successfully"}
@@ -5526,10 +5529,11 @@ def standalone_unassign_group_devices(gname: str):
 # ═══════════════ SHOP CRUD ═══════════════
 
 @app.post("/insert_shop")
-def standalone_insert_shop(req: StandaloneShopCreate):
+def standalone_insert_shop(req: StandaloneShopCreate, user: Dict = Depends(get_current_user)):
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO public.shop (shop_name) VALUES (%s) RETURNING id;", (req.shop_name,))
+            cur.execute("INSERT INTO public.shop (shop_name, tenant_id) VALUES (%s, %s) RETURNING id;", (req.shop_name, tenant_id))
             new_id = cur.fetchone()[0]
         conn.commit()
     return {"id": new_id, "message": "Shop inserted successfully"}

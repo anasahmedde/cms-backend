@@ -175,7 +175,7 @@ def ensure_multitenant_schema(conn):
         ALTER TABLE public.device ADD COLUMN tenant_id BIGINT;
       END IF;
       UPDATE public.device SET tenant_id = 1 WHERE tenant_id IS NULL;
-      ALTER TABLE public.device ALTER COLUMN tenant_id SET NOT NULL;
+      ALTER TABLE public.device ALTER COLUMN tenant_id SET DEFAULT 1;
 
       -- ─── video ───
       SELECT 1 INTO t FROM information_schema.columns
@@ -184,7 +184,7 @@ def ensure_multitenant_schema(conn):
         ALTER TABLE public.video ADD COLUMN tenant_id BIGINT;
       END IF;
       UPDATE public.video SET tenant_id = 1 WHERE tenant_id IS NULL;
-      ALTER TABLE public.video ALTER COLUMN tenant_id SET NOT NULL;
+      ALTER TABLE public.video ALTER COLUMN tenant_id SET DEFAULT 1;
 
       -- ─── shop ───
       SELECT 1 INTO t FROM information_schema.columns
@@ -193,7 +193,7 @@ def ensure_multitenant_schema(conn):
         ALTER TABLE public.shop ADD COLUMN tenant_id BIGINT;
       END IF;
       UPDATE public.shop SET tenant_id = 1 WHERE tenant_id IS NULL;
-      ALTER TABLE public.shop ALTER COLUMN tenant_id SET NOT NULL;
+      ALTER TABLE public.shop ALTER COLUMN tenant_id SET DEFAULT 1;
 
       -- ─── group ───
       SELECT 1 INTO t FROM information_schema.columns
@@ -202,7 +202,7 @@ def ensure_multitenant_schema(conn):
         ALTER TABLE public."group" ADD COLUMN tenant_id BIGINT;
       END IF;
       UPDATE public."group" SET tenant_id = 1 WHERE tenant_id IS NULL;
-      ALTER TABLE public."group" ALTER COLUMN tenant_id SET NOT NULL;
+      ALTER TABLE public."group" ALTER COLUMN tenant_id SET DEFAULT 1;
 
       -- ─── advertisement ───
       SELECT 1 INTO t FROM information_schema.columns
@@ -211,7 +211,7 @@ def ensure_multitenant_schema(conn):
         ALTER TABLE public.advertisement ADD COLUMN tenant_id BIGINT;
       END IF;
       UPDATE public.advertisement SET tenant_id = 1 WHERE tenant_id IS NULL;
-      ALTER TABLE public.advertisement ALTER COLUMN tenant_id SET NOT NULL;
+      ALTER TABLE public.advertisement ALTER COLUMN tenant_id SET DEFAULT 1;
 
       -- ─── device_video_shop_group ───
       SELECT 1 INTO t FROM information_schema.columns
@@ -220,7 +220,7 @@ def ensure_multitenant_schema(conn):
         ALTER TABLE public.device_video_shop_group ADD COLUMN tenant_id BIGINT;
       END IF;
       UPDATE public.device_video_shop_group SET tenant_id = 1 WHERE tenant_id IS NULL;
-      ALTER TABLE public.device_video_shop_group ALTER COLUMN tenant_id SET NOT NULL;
+      ALTER TABLE public.device_video_shop_group ALTER COLUMN tenant_id SET DEFAULT 1;
 
       -- ─── device_layout ───
       SELECT 1 INTO t FROM information_schema.columns
@@ -229,7 +229,7 @@ def ensure_multitenant_schema(conn):
         ALTER TABLE public.device_layout ADD COLUMN tenant_id BIGINT;
       END IF;
       UPDATE public.device_layout SET tenant_id = 1 WHERE tenant_id IS NULL;
-      ALTER TABLE public.device_layout ALTER COLUMN tenant_id SET NOT NULL;
+      ALTER TABLE public.device_layout ALTER COLUMN tenant_id SET DEFAULT 1;
 
       -- ─── device_logs ───
       SELECT 1 INTO t FROM information_schema.columns
@@ -238,7 +238,7 @@ def ensure_multitenant_schema(conn):
         ALTER TABLE public.device_logs ADD COLUMN tenant_id BIGINT;
       END IF;
       UPDATE public.device_logs SET tenant_id = 1 WHERE tenant_id IS NULL;
-      ALTER TABLE public.device_logs ALTER COLUMN tenant_id SET NOT NULL;
+      ALTER TABLE public.device_logs ALTER COLUMN tenant_id SET DEFAULT 1;
 
       -- ─── device_temperature ───
       IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='device_temperature') THEN
@@ -248,7 +248,7 @@ def ensure_multitenant_schema(conn):
           ALTER TABLE public.device_temperature ADD COLUMN tenant_id BIGINT;
         END IF;
         UPDATE public.device_temperature SET tenant_id = 1 WHERE tenant_id IS NULL;
-        ALTER TABLE public.device_temperature ALTER COLUMN tenant_id SET NOT NULL;
+        ALTER TABLE public.device_temperature ALTER COLUMN tenant_id SET DEFAULT 1;
       END IF;
 
       -- ─── temperature (alternate table name) ───
@@ -259,7 +259,7 @@ def ensure_multitenant_schema(conn):
           ALTER TABLE public.temperature ADD COLUMN tenant_id BIGINT;
         END IF;
         UPDATE public.temperature SET tenant_id = 1 WHERE tenant_id IS NULL;
-        ALTER TABLE public.temperature ALTER COLUMN tenant_id SET NOT NULL;
+        ALTER TABLE public.temperature ALTER COLUMN tenant_id SET DEFAULT 1;
       END IF;
 
       -- ─── device_online_history ───
@@ -269,7 +269,7 @@ def ensure_multitenant_schema(conn):
         ALTER TABLE public.device_online_history ADD COLUMN tenant_id BIGINT;
       END IF;
       UPDATE public.device_online_history SET tenant_id = 1 WHERE tenant_id IS NULL;
-      ALTER TABLE public.device_online_history ALTER COLUMN tenant_id SET NOT NULL;
+      ALTER TABLE public.device_online_history ALTER COLUMN tenant_id SET DEFAULT 1;
 
       -- ─── group_video ───
       SELECT 1 INTO t FROM information_schema.columns
@@ -278,7 +278,7 @@ def ensure_multitenant_schema(conn):
         ALTER TABLE public.group_video ADD COLUMN tenant_id BIGINT;
       END IF;
       UPDATE public.group_video SET tenant_id = 1 WHERE tenant_id IS NULL;
-      ALTER TABLE public.group_video ALTER COLUMN tenant_id SET NOT NULL;
+      ALTER TABLE public.group_video ALTER COLUMN tenant_id SET DEFAULT 1;
 
       -- ─── group_advertisement ───
       SELECT 1 INTO t FROM information_schema.columns
@@ -287,7 +287,7 @@ def ensure_multitenant_schema(conn):
         ALTER TABLE public.group_advertisement ADD COLUMN tenant_id BIGINT;
       END IF;
       UPDATE public.group_advertisement SET tenant_id = 1 WHERE tenant_id IS NULL;
-      ALTER TABLE public.group_advertisement ALTER COLUMN tenant_id SET NOT NULL;
+      ALTER TABLE public.group_advertisement ALTER COLUMN tenant_id SET DEFAULT 1;
 
       -- ─── device_advertisement_shop_group ───
       SELECT 1 INTO t FROM information_schema.columns
@@ -296,7 +296,7 @@ def ensure_multitenant_schema(conn):
         ALTER TABLE public.device_advertisement_shop_group ADD COLUMN tenant_id BIGINT;
       END IF;
       UPDATE public.device_advertisement_shop_group SET tenant_id = 1 WHERE tenant_id IS NULL;
-      ALTER TABLE public.device_advertisement_shop_group ALTER COLUMN tenant_id SET NOT NULL;
+      ALTER TABLE public.device_advertisement_shop_group ALTER COLUMN tenant_id SET DEFAULT 1;
 
       -- ─── device_assignment ───
       SELECT 1 INTO t FROM information_schema.columns
@@ -305,7 +305,7 @@ def ensure_multitenant_schema(conn):
         ALTER TABLE public.device_assignment ADD COLUMN tenant_id BIGINT;
       END IF;
       UPDATE public.device_assignment SET tenant_id = 1 WHERE tenant_id IS NULL;
-      ALTER TABLE public.device_assignment ALTER COLUMN tenant_id SET NOT NULL;
+      ALTER TABLE public.device_assignment ALTER COLUMN tenant_id SET DEFAULT 1;
 
       -- ─── count_history (may or may not exist) ───
       IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='count_history') THEN
@@ -315,7 +315,7 @@ def ensure_multitenant_schema(conn):
           ALTER TABLE public.count_history ADD COLUMN tenant_id BIGINT;
         END IF;
         UPDATE public.count_history SET tenant_id = 1 WHERE tenant_id IS NULL;
-        ALTER TABLE public.count_history ALTER COLUMN tenant_id SET NOT NULL;
+        ALTER TABLE public.count_history ALTER COLUMN tenant_id SET DEFAULT 1;
       END IF;
 
     END $$;
