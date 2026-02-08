@@ -14,6 +14,7 @@ from typing import Optional, List, Dict, Any, Tuple
 
 from migrations.dvsg_schema import ensure_dvsg_schema
 from migrations.multi_tenant import ensure_multi_tenant_schema
+from platform_api import router as platform_router
 from pydantic import BaseModel, Field
 
 from fastapi import FastAPI, HTTPException, Query, Path, Depends, Header, UploadFile, File, Form
@@ -68,6 +69,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount platform API (company management, dashboard, impersonation)
+app.include_router(platform_router, prefix="/platform", tags=["Platform Admin"])
 
 
 # ---------- Pydantic models ----------
