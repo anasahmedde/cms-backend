@@ -4416,20 +4416,22 @@ def create_user(body: UserCreateIn, user: Dict = Depends(require_permission("man
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                # Check uniqueness within tenant scope
-                if tenant_id:
-                    cur.execute("SELECT id FROM public.users WHERE username = %s AND tenant_id = %s;", (body.username.lower(), tenant_id))
-                else:
-                    cur.execute("SELECT id FROM public.users WHERE username = %s AND tenant_id IS NULL;", (body.username.lower(),))
-                if cur.fetchone():
-                    raise HTTPException(status_code=400, detail="Username already exists in this company")
+                # Check uniqueness globally - same username cannot exist in any company
+                cur.execute("""SELECT u.id, c.name FROM public.users u 
+                    LEFT JOIN public.company c ON u.tenant_id = c.id 
+                    WHERE u.username = %s;""", (body.username.lower(),))
+                existing = cur.fetchone()
+                if existing:
+                    company_name = existing[1] or "Platform"
+                    raise HTTPException(status_code=400, detail=f"Username '{body.username.lower()}' is already assigned to '{company_name}'. Please use another username.")
                 if body.email:
-                    if tenant_id:
-                        cur.execute("SELECT id FROM public.users WHERE email = %s AND tenant_id = %s;", (body.email.lower(), tenant_id))
-                    else:
-                        cur.execute("SELECT id FROM public.users WHERE email = %s AND tenant_id IS NULL;", (body.email.lower(),))
-                    if cur.fetchone():
-                        raise HTTPException(status_code=400, detail="Email already exists in this company")
+                    cur.execute("""SELECT u.id, c.name FROM public.users u 
+                        LEFT JOIN public.company c ON u.tenant_id = c.id 
+                        WHERE u.email = %s;""", (body.email.lower(),))
+                    existing_email = cur.fetchone()
+                    if existing_email:
+                        company_name = existing_email[1] or "Platform"
+                        raise HTTPException(status_code=400, detail=f"Email '{body.email.lower()}' is already assigned to '{company_name}'. Please use another email.")
                 if body.role not in ROLE_PERMISSIONS:
                     raise HTTPException(status_code=400, detail=f"Invalid role")
 
