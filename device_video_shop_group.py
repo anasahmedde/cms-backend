@@ -1236,21 +1236,43 @@ def create_link_by_names(conn, payload: LinkCreate) -> Dict[str, Any]:
         _enforce_single_group_shop_for_device(conn, did, gid, sid)
         
         if gid is None:
+            # Try insert first, if duplicate exists update it
             cur.execute("""
                 INSERT INTO public.device_video_shop_group (did, vid, sid, gid, display_order)
                 VALUES (%s, %s, %s, NULL, %s)
-                ON CONFLICT (did, vid, sid) WHERE (gid IS NULL)
-                DO UPDATE SET updated_at = NOW(), display_order = EXCLUDED.display_order
-                RETURNING id;
+                ON CONFLICT DO NOTHING;
             """, (did, vid, sid, payload.display_order))
+            if cur.rowcount == 0:
+                # Already exists, update and fetch
+                cur.execute("""
+                    UPDATE public.device_video_shop_group SET updated_at = NOW(), display_order = %s
+                    WHERE did = %s AND vid = %s AND sid = %s AND gid IS NULL
+                    RETURNING id;
+                """, (payload.display_order, did, vid, sid))
+            else:
+                cur.execute("""
+                    SELECT id FROM public.device_video_shop_group
+                    WHERE did = %s AND vid = %s AND sid = %s AND gid IS NULL
+                    ORDER BY id DESC LIMIT 1;
+                """, (did, vid, sid))
         else:
             cur.execute("""
                 INSERT INTO public.device_video_shop_group (did, vid, sid, gid, display_order)
                 VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (did, vid, sid, gid) WHERE (gid IS NOT NULL)
-                DO UPDATE SET updated_at = NOW(), display_order = EXCLUDED.display_order
-                RETURNING id;
+                ON CONFLICT DO NOTHING;
             """, (did, vid, sid, gid, payload.display_order))
+            if cur.rowcount == 0:
+                cur.execute("""
+                    UPDATE public.device_video_shop_group SET updated_at = NOW(), display_order = %s
+                    WHERE did = %s AND vid = %s AND sid = %s AND gid = %s
+                    RETURNING id;
+                """, (payload.display_order, did, vid, sid, gid))
+            else:
+                cur.execute("""
+                    SELECT id FROM public.device_video_shop_group
+                    WHERE did = %s AND vid = %s AND sid = %s AND gid = %s
+                    ORDER BY id DESC LIMIT 1;
+                """, (did, vid, sid, gid))
             
             # Also add to group_video table to ensure group-level association exists
             # This ensures future device assignments will get this video
@@ -2028,14 +2050,18 @@ def link_device_to_group(body: DeviceToGroupIn):
                 created_links = []
                 if group_videos:
                     for vid, video_name in group_videos:
-                        # Use explicit conflict target for clarity
                         cur.execute("""
                             INSERT INTO public.device_video_shop_group (did, vid, sid, gid)
                             VALUES (%s, %s, %s, %s)
-                            ON CONFLICT (did, vid, sid, gid) WHERE gid IS NOT NULL
-                            DO UPDATE SET updated_at = NOW()
-                            RETURNING id;
+                            ON CONFLICT DO NOTHING;
                         """, (did, vid, sid, gid))
+                        if cur.rowcount > 0:
+                            cur.execute("SELECT id FROM public.device_video_shop_group WHERE did=%s AND vid=%s AND sid=%s AND gid=%s ORDER BY id DESC LIMIT 1;", (did, vid, sid, gid))
+                        else:
+                            cur.execute("""
+                                UPDATE public.device_video_shop_group SET updated_at = NOW()
+                                WHERE did=%s AND vid=%s AND sid=%s AND gid=%s RETURNING id;
+                            """, (did, vid, sid, gid))
                         link_row = cur.fetchone()
                         if link_row:
                             created_links.append({"link_id": link_row[0], "video_name": video_name})
@@ -2152,22 +2178,24 @@ def sync_group_devices(gname: str, body: GroupSyncIn):
                             INSERT INTO public.device_video_shop_group 
                                 (did, vid, sid, gid, display_order, device_rotation, device_resolution, grid_position, grid_size)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (did, vid, sid, gid) WHERE (gid IS NOT NULL)
-                            DO UPDATE SET 
-                                display_order = EXCLUDED.display_order,
-                                device_rotation = EXCLUDED.device_rotation,
-                                device_resolution = EXCLUDED.device_resolution,
-                                grid_position = EXCLUDED.grid_position,
-                                grid_size = EXCLUDED.grid_size,
-                                updated_at = NOW()
-                            RETURNING id, (xmax = 0) as inserted;
+                            ON CONFLICT DO NOTHING;
                         """, (target_did, vid, target_sid, gid, display_order, device_rotation, device_resolution, grid_position, grid_size))
-                        link_row = cur.fetchone()
+                        inserted = cur.rowcount > 0
+                        if not inserted:
+                            cur.execute("""
+                                UPDATE public.device_video_shop_group SET 
+                                    display_order = %s, device_rotation = %s, device_resolution = %s,
+                                    grid_position = %s, grid_size = %s, updated_at = NOW()
+                                WHERE did = %s AND vid = %s AND sid = %s AND gid = %s
+                                RETURNING id;
+                            """, (display_order, device_rotation, device_resolution, grid_position, grid_size,
+                                  target_did, vid, target_sid, gid))
+                        link_row = True
                         if link_row:
-                            if link_row[1]:  # inserted
+                            if inserted:
                                 device_result["links_created"] += 1
                                 results["links_created"] += 1
-                            else:  # updated
+                            else:
                                 device_result["links_updated"] += 1
                                 results["links_updated"] += 1
                     
@@ -3195,7 +3223,7 @@ def create_device_with_linking(body: DeviceCreateIn, user: Dict = Depends(get_cu
                         cur.execute("""
                             INSERT INTO public.device_video_shop_group (did, vid, sid, gid)
                             VALUES (%s, %s, %s, %s)
-                            ON CONFLICT (did, vid, sid, gid) WHERE (gid IS NOT NULL)
+                            ON CONFLICT DO NOTHING
                             DO UPDATE SET updated_at = NOW()
                             RETURNING id;
                         """, (did, vid, sid, gid))
@@ -4717,11 +4745,16 @@ async def upload_advertisement(
                 cur.execute("""
                     INSERT INTO public.advertisement (ad_name, s3_link, rotation, fit_mode, display_duration)
                     VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (ad_name)
-                    DO UPDATE SET s3_link = EXCLUDED.s3_link, rotation = EXCLUDED.rotation,
-                        fit_mode = EXCLUDED.fit_mode, display_duration = EXCLUDED.display_duration, updated_at = NOW()
-                    RETURNING id;
+                    ON CONFLICT DO NOTHING;
                 """, (ad_name, s3_uri, rotation, fit_mode, display_duration))
+                if cur.rowcount == 0:
+                    cur.execute("""
+                        UPDATE public.advertisement SET s3_link = %s, rotation = %s,
+                            fit_mode = %s, display_duration = %s, updated_at = NOW()
+                        WHERE ad_name = %s RETURNING id;
+                    """, (s3_uri, rotation, fit_mode, display_duration, ad_name))
+                else:
+                    cur.execute("SELECT id FROM public.advertisement WHERE ad_name = %s ORDER BY id DESC LIMIT 1;", (ad_name,))
                 new_id = cur.fetchone()[0]
                 conn.commit()
         
@@ -5686,12 +5719,17 @@ async def standalone_upload_video(
             cur.execute("""
                 INSERT INTO public.video (video_name, s3_link, rotation, content_type, fit_mode, display_duration)
                 VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (video_name)
-                DO UPDATE SET s3_link = EXCLUDED.s3_link, rotation = EXCLUDED.rotation,
-                    content_type = EXCLUDED.content_type, fit_mode = EXCLUDED.fit_mode,
-                    display_duration = EXCLUDED.display_duration, updated_at = NOW()
-                RETURNING id;
+                ON CONFLICT DO NOTHING;
             """, (video_name, s3_uri, rotation, content_type, fit_mode, display_duration))
+            if cur.rowcount == 0:
+                cur.execute("""
+                    UPDATE public.video SET s3_link = %s, rotation = %s,
+                        content_type = %s, fit_mode = %s,
+                        display_duration = %s, updated_at = NOW()
+                    WHERE video_name = %s RETURNING id;
+                """, (s3_uri, rotation, content_type, fit_mode, display_duration, video_name))
+            else:
+                cur.execute("SELECT id FROM public.video WHERE video_name = %s ORDER BY id DESC LIMIT 1;", (video_name,))
             new_id = cur.fetchone()[0]
         conn.commit()
     return {"id": new_id, "video_name": video_name, "s3_link": s3_uri, "key": key,
