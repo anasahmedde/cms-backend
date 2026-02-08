@@ -13,6 +13,7 @@ from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 
 from migrations.dvsg_schema import ensure_dvsg_schema
+from migrations.multitenant_schema import ensure_multitenant_schema
 from pydantic import BaseModel, Field
 
 from fastapi import FastAPI, HTTPException, Query, Path, Depends, Header, UploadFile, File, Form
@@ -23,6 +24,16 @@ import psycopg2
 from psycopg2 import sql
 from psycopg2.pool import ThreadedConnectionPool, PoolError
 import boto3
+
+# Multi-tenant auth (replaces old inline auth)
+from tenant_context import (
+    TenantContext, get_tenant_context, get_current_user,
+    require_permission, require_platform_user, require_tenant_context,
+    hash_password, verify_password, generate_token, create_session,
+    invalidate_user_sessions, invalidate_tenant_sessions,
+    active_sessions, log_audit, ROLE_PERMISSIONS,
+)
+from platform_api import router as platform_router
 
 load_dotenv()
 
@@ -41,8 +52,7 @@ PRESIGN_EXPIRES = int(os.getenv("PRESIGN_EXPIRES", "900"))  # 15 min
 # Online threshold in seconds (2 minutes - allows for network delays)
 ONLINE_THRESHOLD_SECONDS = 120
 
-# Session tokens (in-memory)
-active_sessions: Dict[str, Dict] = {}
+# NOTE: active_sessions is now imported from tenant_context
 
 # Download progress tracking (in-memory) - stores real-time download progress per device
 # Format: { "mobile_id": { "current_file": 1, "total_files": 3, "file_name": "video.mp4", "progress": 65, "downloaded_bytes": 5242880, "total_bytes": 8388608, "updated_at": datetime } }
@@ -131,46 +141,10 @@ class UserListOut(BaseModel):
     items: List[UserOut]
     total: int
 
-ROLE_PERMISSIONS = {
-    "admin": ["view_dashboard", "manage_devices", "manage_groups", "manage_shops", "upload_videos", "manage_videos", "manage_links", "manage_users", "view_reports", "export_data"],
-    "manager": ["view_dashboard", "manage_devices", "manage_groups", "manage_shops", "upload_videos", "manage_videos", "manage_links", "view_reports", "export_data"],
-    "editor": ["view_dashboard", "upload_videos", "manage_videos", "manage_links", "view_reports"],
-    "viewer": ["view_dashboard", "view_reports"],
-}
+ROLE_PERMISSIONS_LEGACY = ROLE_PERMISSIONS  # backward compat alias
 
-def hash_password(password: str) -> str:
-    return hashlib.sha256(f"digix_salt_{password}".encode()).hexdigest()
-
-def verify_password(password: str, password_hash: str) -> bool:
-    return hash_password(password) == password_hash
-
-def generate_token() -> str:
-    return secrets.token_urlsafe(32)
-
-def invalidate_user_sessions(user_id: int):
-    """Remove all active sessions for a specific user."""
-    tokens_to_remove = [token for token, session in active_sessions.items() if session.get("user_id") == user_id]
-    for token in tokens_to_remove:
-        del active_sessions[token]
-
-def get_current_user(authorization: Optional[str] = Header(None)) -> Dict:
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
-    if token not in active_sessions:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-    session = active_sessions[token]
-    if datetime.now() > session.get("expires_at", datetime.min):
-        del active_sessions[token]
-        raise HTTPException(status_code=401, detail="Token expired")
-    return session
-
-def require_permission(permission: str):
-    def checker(user: Dict = Depends(get_current_user)):
-        if permission not in user.get("permissions", []) and user.get("role") != "admin":
-            raise HTTPException(status_code=403, detail=f"Permission denied: {permission}")
-        return user
-    return checker
+# NOTE: hash_password, verify_password, generate_token, invalidate_user_sessions,
+# get_current_user, require_permission are now imported from tenant_context
 
 
 class DeviceMonthlyCountUpdateIn(BaseModel):
@@ -661,7 +635,7 @@ def fetch_links_for_mobile(conn, mobile_id: str, limit: int, offset: int) -> Lis
         return [_row_to_link_dict(r) for r in rows]
 
 
-def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid, limit, offset):
+def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid, limit, offset, tenant_id=None):
     """
     List all device-video-shop-group links.
     Also includes:
@@ -669,6 +643,10 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
     - Completely unassigned devices (not in any group) - shown with gname="Unassigned"
     """
     where, params = [], []
+    # Tenant scoping
+    if tenant_id:
+        where.append("l.tenant_id = %s")
+        params.append(tenant_id)
     if mobile_id:
         where.append("(d.mobile_id ILIKE %s OR d.device_name ILIKE %s)")
         params.append(f"%{mobile_id}%")
@@ -1242,11 +1220,15 @@ def on_startup():
     pg_init_pool()
     with pg_conn() as conn:
         ensure_dvsg_schema(conn)
+        ensure_multitenant_schema(conn)
 
 
 @app.on_event("shutdown")
 def on_shutdown():
     pg_close_pool()
+
+# Mount platform router
+app.include_router(platform_router, prefix="/platform", tags=["platform"])
 
 
 # ---------- health endpoints ----------
@@ -1821,9 +1803,11 @@ def list_links_route(
     gid: Optional[int] = Query(None, ge=1),
     limit: int = Query(200, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    user: Dict = Depends(get_current_user),
 ):
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
-        rows = list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid, limit, offset)
+        rows = list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid, limit, offset, tenant_id=tenant_id)
         return {"count": len(rows), "items": rows, "limit": limit, "offset": offset}
 
 
@@ -4151,27 +4135,102 @@ def get_device_uptime_report(
 
 # ========== USER MANAGEMENT ENDPOINTS ==========
 
-@app.post("/auth/login", response_model=UserLoginOut)
+@app.post("/auth/login")
 def login(body: UserLoginIn):
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, username, password_hash, full_name, role, is_active FROM public.users WHERE username = %s LIMIT 1;", (body.username.lower(),))
+            # Fetch user with company and role info
+            cur.execute("""
+                SELECT u.id, u.username, u.password_hash, u.full_name, u.role, u.is_active,
+                       u.user_type, u.tenant_id, u.role_id, u.must_change_password,
+                       c.slug as company_slug, c.name as company_name, c.status as company_status,
+                       r.name as role_name, r.permissions as role_permissions
+                FROM public.users u
+                LEFT JOIN public.company c ON u.tenant_id = c.id
+                LEFT JOIN public.role r ON u.role_id = r.id
+                WHERE u.username = %s LIMIT 1;
+            """, (body.username.lower(),))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=401, detail="Invalid username or password")
-            user_id, username, password_hash, full_name, role, is_active = row
+
+            (user_id, username, password_hash, full_name, legacy_role, is_active,
+             user_type, tenant_id, role_id, must_change_password,
+             company_slug, company_name, company_status,
+             role_name, role_permissions) = row
+
             if not is_active:
                 raise HTTPException(status_code=401, detail="Account is disabled")
             if not verify_password(body.password, password_hash):
                 raise HTTPException(status_code=401, detail="Invalid username or password")
+
+            # Company users: check company status
+            if user_type == "company" and tenant_id:
+                if company_status == "suspended":
+                    raise HTTPException(status_code=403, detail="Company account suspended. Contact platform administrator.")
+                if company_status == "cancelled":
+                    raise HTTPException(status_code=403, detail="Company account cancelled.")
+
+            # Resolve permissions: prefer role table, fallback to legacy
+            if role_permissions:
+                if isinstance(role_permissions, str):
+                    permissions = json.loads(role_permissions)
+                elif isinstance(role_permissions, list):
+                    permissions = role_permissions
+                else:
+                    permissions = list(role_permissions)
+            else:
+                # Fallback to legacy ROLE_PERMISSIONS
+                permissions = list(ROLE_PERMISSIONS.get(legacy_role, []))
+
+            # Also merge any custom permissions from user_permissions table
             cur.execute("SELECT permission FROM public.user_permissions WHERE user_id = %s;", (user_id,))
-            custom_permissions = [r[0] for r in cur.fetchall()]
-            permissions = list(set(ROLE_PERMISSIONS.get(role, []) + custom_permissions))
+            custom_perms = [r[0] for r in cur.fetchall()]
+            permissions = list(set(permissions + custom_perms))
+
+            # Effective role name
+            effective_role = role_name or legacy_role or "viewer"
+
             cur.execute("UPDATE public.users SET last_login = NOW() WHERE id = %s;", (user_id,))
             conn.commit()
-            token = generate_token()
-            active_sessions[token] = {"user_id": user_id, "username": username, "full_name": full_name, "role": role, "permissions": permissions, "expires_at": datetime.now() + timedelta(hours=24)}
-            return UserLoginOut(token=token, user_id=user_id, username=username, full_name=full_name, role=role, permissions=permissions)
+
+            token = create_session(
+                user_id=user_id,
+                username=username,
+                full_name=full_name,
+                user_type=user_type or "company",
+                tenant_id=tenant_id,
+                role_name=effective_role,
+                role_id=role_id,
+                permissions=permissions,
+                company_slug=company_slug,
+                company_name=company_name,
+            )
+
+            # Audit log
+            log_audit(conn, tenant_id, user_id, "user.login", "user", user_id)
+            conn.commit()
+
+            result = {
+                "token": token,
+                "user_id": user_id,
+                "username": username,
+                "full_name": full_name,
+                "role": effective_role,
+                "permissions": permissions,
+                "user_type": user_type or "company",
+                "must_change_password": must_change_password or False,
+            }
+
+            # Include company info for company users
+            if tenant_id:
+                result["company"] = {
+                    "id": tenant_id,
+                    "slug": company_slug,
+                    "name": company_name,
+                }
+
+            return result
 
 @app.post("/auth/logout")
 def logout(authorization: Optional[str] = Header(None)):
@@ -4181,23 +4240,56 @@ def logout(authorization: Optional[str] = Header(None)):
             del active_sessions[token]
     return {"message": "Logged out successfully"}
 
-@app.get("/auth/me", response_model=UserOut)
+@app.get("/auth/me")
 def get_current_user_info(user: Dict = Depends(get_current_user)):
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, username, email, full_name, role, is_active, created_at, last_login FROM public.users WHERE id = %s LIMIT 1;", (user["user_id"],))
+            cur.execute("""
+                SELECT u.id, u.username, u.email, u.full_name, u.role, u.is_active, u.created_at, u.last_login,
+                       u.user_type, u.tenant_id, u.must_change_password,
+                       c.slug as company_slug, c.name as company_name
+                FROM public.users u
+                LEFT JOIN public.company c ON u.tenant_id = c.id
+                WHERE u.id = %s LIMIT 1;
+            """, (user["user_id"],))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="User not found")
-            return UserOut(id=row[0], username=row[1], email=row[2], full_name=row[3], role=row[4], is_active=row[5], created_at=row[6], last_login=row[7], permissions=user.get("permissions", []))
+            result = {
+                "id": row[0], "username": row[1], "email": row[2], "full_name": row[3],
+                "role": row[4], "is_active": row[5], "created_at": row[6], "last_login": row[7],
+                "permissions": user.get("permissions", []),
+                "user_type": row[8] or "company",
+                "tenant_id": row[9],
+                "must_change_password": row[10] or False,
+            }
+            if row[9]:
+                result["company"] = {"id": row[9], "slug": row[11], "name": row[12]}
+            return result
 
 @app.get("/users", response_model=UserListOut)
 def list_users(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), user: Dict = Depends(require_permission("manage_users"))):
+    # Resolve tenant scope
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM public.users;")
-            total = cur.fetchone()[0]
-            cur.execute("SELECT u.id, u.username, u.email, u.full_name, u.role, u.is_active, u.created_at, u.last_login, ARRAY_AGG(up.permission) FILTER (WHERE up.permission IS NOT NULL) as permissions FROM public.users u LEFT JOIN public.user_permissions up ON u.id = up.user_id GROUP BY u.id ORDER BY u.created_at DESC LIMIT %s OFFSET %s;", (limit, offset))
+            if user.get("user_type") == "platform" and tenant_id is None:
+                # Platform admin without impersonation: show all users
+                cur.execute("SELECT COUNT(*) FROM public.users;")
+                total = cur.fetchone()[0]
+                cur.execute("""SELECT u.id, u.username, u.email, u.full_name, u.role, u.is_active, u.created_at, u.last_login,
+                    ARRAY_AGG(up.permission) FILTER (WHERE up.permission IS NOT NULL) as permissions
+                    FROM public.users u LEFT JOIN public.user_permissions up ON u.id = up.user_id
+                    GROUP BY u.id ORDER BY u.created_at DESC LIMIT %s OFFSET %s;""", (limit, offset))
+            else:
+                # Scoped to tenant
+                cur.execute("SELECT COUNT(*) FROM public.users WHERE tenant_id = %s;", (tenant_id,))
+                total = cur.fetchone()[0]
+                cur.execute("""SELECT u.id, u.username, u.email, u.full_name, u.role, u.is_active, u.created_at, u.last_login,
+                    ARRAY_AGG(up.permission) FILTER (WHERE up.permission IS NOT NULL) as permissions
+                    FROM public.users u LEFT JOIN public.user_permissions up ON u.id = up.user_id
+                    WHERE u.tenant_id = %s
+                    GROUP BY u.id ORDER BY u.created_at DESC LIMIT %s OFFSET %s;""", (tenant_id, limit, offset))
             items = []
             for row in cur.fetchall():
                 permissions = row[8] if row[8] else []
@@ -4207,20 +4299,42 @@ def list_users(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0
 
 @app.post("/users", response_model=UserOut)
 def create_user(body: UserCreateIn, user: Dict = Depends(require_permission("manage_users"))):
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM public.users WHERE username = %s;", (body.username.lower(),))
+                # Check uniqueness within tenant scope
+                if tenant_id:
+                    cur.execute("SELECT id FROM public.users WHERE username = %s AND tenant_id = %s;", (body.username.lower(), tenant_id))
+                else:
+                    cur.execute("SELECT id FROM public.users WHERE username = %s AND tenant_id IS NULL;", (body.username.lower(),))
                 if cur.fetchone():
                     raise HTTPException(status_code=400, detail="Username already exists")
                 if body.email:
-                    cur.execute("SELECT id FROM public.users WHERE email = %s;", (body.email.lower(),))
+                    if tenant_id:
+                        cur.execute("SELECT id FROM public.users WHERE email = %s AND tenant_id = %s;", (body.email.lower(), tenant_id))
+                    else:
+                        cur.execute("SELECT id FROM public.users WHERE email = %s AND tenant_id IS NULL;", (body.email.lower(),))
                     if cur.fetchone():
                         raise HTTPException(status_code=400, detail="Email already exists")
                 if body.role not in ROLE_PERMISSIONS:
                     raise HTTPException(status_code=400, detail=f"Invalid role")
+
+                # Check quota for company users
+                if tenant_id:
+                    cur.execute("SELECT max_users FROM public.company WHERE id = %s;", (tenant_id,))
+                    company_row = cur.fetchone()
+                    if company_row:
+                        cur.execute("SELECT COUNT(*) FROM public.users WHERE tenant_id = %s;", (tenant_id,))
+                        current_count = cur.fetchone()[0]
+                        if current_count >= company_row[0]:
+                            raise HTTPException(status_code=400, detail=f"User limit reached ({company_row[0]})")
+
                 password_hash = hash_password(body.password)
-                cur.execute("INSERT INTO public.users (username, email, password_hash, full_name, role, created_by) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id, created_at;", (body.username.lower(), body.email.lower() if body.email else None, password_hash, body.full_name, body.role, user["user_id"]))
+                user_type = "platform" if tenant_id is None and user.get("user_type") == "platform" else "company"
+                cur.execute("""INSERT INTO public.users (username, email, password_hash, full_name, role, created_by, tenant_id, user_type)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id, created_at;""",
+                    (body.username.lower(), body.email.lower() if body.email else None, password_hash, body.full_name, body.role, user["user_id"], tenant_id, user_type))
                 new_user_id, created_at = cur.fetchone()
                 for perm in body.permissions:
                     cur.execute("INSERT INTO public.user_permissions (user_id, permission) VALUES (%s, %s) ON CONFLICT DO NOTHING;", (new_user_id, perm))
@@ -4395,9 +4509,11 @@ def _ad_slug(s: str) -> str:
     s = re.sub(r"[^\w\-.]+", "-", s, flags=re.UNICODE)
     return re.sub(r"-{2,}", "-", s).strip("-").lower()
 
-def _make_ad_s3_key(ad_name: str, ext: str = ".jpg") -> str:
+def _make_ad_s3_key(ad_name: str, ext: str = ".jpg", tenant_slug: str = None) -> str:
     base = _ad_slug(ad_name)
     filename = f"{base}{ext}"
+    if tenant_slug:
+        return f"tenants/{tenant_slug}/advertisements/{filename}"
     return f"{S3_AD_PREFIX}/{filename}".strip("/") if S3_AD_PREFIX else filename
 
 def _to_ad_s3_uri(key: str) -> str:
@@ -4437,16 +4553,23 @@ def ad_presign_get_object(s3_uri: str, expires_in: int = AD_PRESIGN_EXPIRES) -> 
 
 # --- Advertisement CRUD ---
 @app.get("/advertisements")
-def list_advertisements(q: Optional[str] = Query(None), limit: int = Query(50, ge=1, le=1000), offset: int = Query(0, ge=0)):
-    """List all advertisements."""
+def list_advertisements(q: Optional[str] = Query(None), limit: int = Query(50, ge=1, le=1000), offset: int = Query(0, ge=0), user: Dict = Depends(get_current_user)):
+    """List all advertisements for the current tenant."""
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            sql = """SELECT id, ad_name, s3_link, rotation, fit_mode, display_duration, created_at, updated_at
+            base = """SELECT id, ad_name, s3_link, rotation, fit_mode, display_duration, created_at, updated_at
                      FROM public.advertisement"""
-            if q:
-                cur.execute(sql + " WHERE ad_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s", (f"%{q}%", limit, offset))
+            if tenant_id:
+                if q:
+                    cur.execute(base + " WHERE tenant_id = %s AND ad_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s", (tenant_id, f"%{q}%", limit, offset))
+                else:
+                    cur.execute(base + " WHERE tenant_id = %s ORDER BY id DESC LIMIT %s OFFSET %s", (tenant_id, limit, offset))
             else:
-                cur.execute(sql + " ORDER BY id DESC LIMIT %s OFFSET %s", (limit, offset))
+                if q:
+                    cur.execute(base + " WHERE ad_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s", (f"%{q}%", limit, offset))
+                else:
+                    cur.execute(base + " ORDER BY id DESC LIMIT %s OFFSET %s", (limit, offset))
             rows = cur.fetchall()
             items = [{"id": r[0], "ad_name": r[1], "s3_link": r[2], "rotation": r[3],
                       "fit_mode": r[4], "display_duration": r[5], "created_at": r[6], "updated_at": r[7]} 
@@ -5139,9 +5262,11 @@ def _video_slug(s: str) -> str:
     s = _re.sub(r"[^\w\-.]+", "-", s, flags=_re.UNICODE)
     return _re.sub(r"-{2,}", "-", s).strip("-").lower()
 
-def _make_video_s3_key(video_name: str) -> str:
+def _make_video_s3_key(video_name: str, tenant_slug: str = None) -> str:
     base = _video_slug(video_name)
     filename = f"{base}{S3_VIDEO_FORCED_EXT}"
+    if tenant_slug:
+        return f"tenants/{tenant_slug}/videos/{filename}"
     return f"{S3_VIDEO_PREFIX}/{filename}".strip("/") if S3_VIDEO_PREFIX else filename
 
 def _to_video_s3_uri(key: str) -> str:
@@ -5212,16 +5337,23 @@ def standalone_list_devices(
     q: Optional[str] = Query(None, description="Search mobile_id or device_name (ILIKE)"),
     limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    user: Dict = Depends(get_current_user),
 ):
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
+            # Build tenant filter
+            tenant_filter = "d.tenant_id = %s" if tenant_id else "TRUE"
+            tenant_params = [tenant_id] if tenant_id else []
+
             if q:
-                cur.execute("SELECT COUNT(*) FROM public.device WHERE mobile_id ILIKE %s OR device_name ILIKE %s;", (f"%{q}%", f"%{q}%"))
+                cur.execute(f"SELECT COUNT(*) FROM public.device d WHERE {tenant_filter} AND (d.mobile_id ILIKE %s OR d.device_name ILIKE %s);",
+                            tenant_params + [f"%{q}%", f"%{q}%"])
             else:
-                cur.execute("SELECT COUNT(*) FROM public.device;")
+                cur.execute(f"SELECT COUNT(*) FROM public.device d WHERE {tenant_filter};", tenant_params)
             total = int(cur.fetchone()[0])
 
-            base_sql = """
+            base_sql = f"""
                 SELECT d.id, d.mobile_id, d.download_status, d.created_at, d.updated_at,
                        d.resolution, d.device_name,
                        COALESCE(g1.gname, g2.gname) as group_name, d.is_active
@@ -5234,12 +5366,13 @@ def standalone_list_devices(
                     JOIN public."group" g ON g.id = dvsg.gid
                     WHERE dvsg.gid IS NOT NULL
                 ) g2 ON g2.did = d.id AND g1.gname IS NULL
+                WHERE {tenant_filter}
             """
             if q:
-                cur.execute(base_sql + " WHERE d.mobile_id ILIKE %s OR d.device_name ILIKE %s ORDER BY d.id DESC LIMIT %s OFFSET %s;",
-                            (f"%{q}%", f"%{q}%", limit, offset))
+                cur.execute(base_sql + " AND (d.mobile_id ILIKE %s OR d.device_name ILIKE %s) ORDER BY d.id DESC LIMIT %s OFFSET %s;",
+                            tenant_params + [f"%{q}%", f"%{q}%", limit, offset])
             else:
-                cur.execute(base_sql + " ORDER BY d.id DESC LIMIT %s OFFSET %s;", (limit, offset))
+                cur.execute(base_sql + " ORDER BY d.id DESC LIMIT %s OFFSET %s;", tenant_params + [limit, offset])
             rows = cur.fetchall()
 
     items = [
@@ -5315,14 +5448,22 @@ def standalone_list_groups(
     q: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    user: Dict = Depends(get_current_user),
 ):
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
+            t_filter = 'tenant_id = %s AND' if tenant_id else ''
+            t_params = [tenant_id] if tenant_id else []
             if q:
-                cur.execute('SELECT id, gname, created_at, updated_at FROM public."group" WHERE gname ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s;',
-                            (f"%{q}%", limit, offset))
+                cur.execute(f'SELECT id, gname, created_at, updated_at FROM public."group" WHERE {t_filter} gname ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s;',
+                            t_params + [f"%{q}%", limit, offset])
             else:
-                cur.execute('SELECT id, gname, created_at, updated_at FROM public."group" ORDER BY id DESC LIMIT %s OFFSET %s;', (limit, offset))
+                if tenant_id:
+                    cur.execute(f'SELECT id, gname, created_at, updated_at FROM public."group" WHERE tenant_id = %s ORDER BY id DESC LIMIT %s OFFSET %s;',
+                                (tenant_id, limit, offset))
+                else:
+                    cur.execute('SELECT id, gname, created_at, updated_at FROM public."group" ORDER BY id DESC LIMIT %s OFFSET %s;', (limit, offset))
             rows = cur.fetchall()
     items = [{"id": r[0], "gname": r[1], "created_at": r[2], "updated_at": r[3]} for r in rows]
     return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
@@ -5408,14 +5549,23 @@ def standalone_list_shops(
     q: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    user: Dict = Depends(get_current_user),
 ):
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            if q:
-                cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop WHERE shop_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s;",
-                            (f"%{q}%", limit, offset))
+            if tenant_id:
+                if q:
+                    cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop WHERE tenant_id = %s AND shop_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s;",
+                                (tenant_id, f"%{q}%", limit, offset))
+                else:
+                    cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop WHERE tenant_id = %s ORDER BY id DESC LIMIT %s OFFSET %s;", (tenant_id, limit, offset))
             else:
-                cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop ORDER BY id DESC LIMIT %s OFFSET %s;", (limit, offset))
+                if q:
+                    cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop WHERE shop_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s;",
+                                (f"%{q}%", limit, offset))
+                else:
+                    cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop ORDER BY id DESC LIMIT %s OFFSET %s;", (limit, offset))
             rows = cur.fetchall()
     items = [{"id": r[0], "shop_name": r[1], "created_at": r[2], "updated_at": r[3]} for r in rows]
     return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
@@ -5488,14 +5638,22 @@ def standalone_list_videos(
     q: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    user: Dict = Depends(get_current_user),
 ):
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            sql = "SELECT id, video_name, s3_link, rotation, content_type, fit_mode, display_duration, created_at, updated_at FROM public.video"
-            if q:
-                cur.execute(sql + " WHERE video_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s", (f"%{q}%", limit, offset))
+            base = "SELECT id, video_name, s3_link, rotation, content_type, fit_mode, display_duration, created_at, updated_at FROM public.video"
+            if tenant_id:
+                if q:
+                    cur.execute(base + " WHERE tenant_id = %s AND video_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s", (tenant_id, f"%{q}%", limit, offset))
+                else:
+                    cur.execute(base + " WHERE tenant_id = %s ORDER BY id DESC LIMIT %s OFFSET %s", (tenant_id, limit, offset))
             else:
-                cur.execute(sql + " ORDER BY id DESC LIMIT %s OFFSET %s", (limit, offset))
+                if q:
+                    cur.execute(base + " WHERE video_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s", (f"%{q}%", limit, offset))
+                else:
+                    cur.execute(base + " ORDER BY id DESC LIMIT %s OFFSET %s", (limit, offset))
             rows = cur.fetchall()
     items = [{"id": r[0], "video_name": r[1], "s3_link": r[2], "rotation": r[3],
               "content_type": r[4], "fit_mode": r[5], "display_duration": r[6],
