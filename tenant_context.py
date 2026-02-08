@@ -64,34 +64,6 @@ class TenantContext:
 active_sessions: Dict[str, Dict[str, Any]] = {}
 
 
-def _get_all_sessions() -> Dict[str, Dict[str, Any]]:
-    """
-    Get merged view of sessions from both tenant_context and
-    device_video_shop_group. Uses lazy import to avoid circular deps.
-    """
-    merged = dict(active_sessions)
-    try:
-        from device_video_shop_group import active_sessions as main_sessions
-        # Main app sessions take precedence (login happens there)
-        merged.update(main_sessions)
-    except ImportError:
-        pass
-    return merged
-
-
-def _find_session(token: str) -> Optional[Dict[str, Any]]:
-    """Find a session by token, checking both session stores."""
-    if token in active_sessions:
-        return active_sessions[token]
-    try:
-        from device_video_shop_group import active_sessions as main_sessions
-        if token in main_sessions:
-            return main_sessions[token]
-    except ImportError:
-        pass
-    return None
-
-
 def hash_password(password: str) -> str:
     return hashlib.sha256(f"digix_salt_{password}".encode()).hexdigest()
 
@@ -164,44 +136,29 @@ def create_session(
 def get_tenant_context(authorization: Optional[str] = Header(None)) -> TenantContext:
     """
     FastAPI dependency: resolves the authenticated user + tenant context.
-    Checks both tenant_context.active_sessions and the main app's active_sessions.
+    Replaces the old get_current_user().
     """
     if not authorization:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
 
-    session = _find_session(token)
-    if session is None:
+    if token not in active_sessions:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
+    session = active_sessions[token]
+
     if datetime.now() > session.get("expires_at", datetime.min):
-        # Try to remove from whichever store has it
-        active_sessions.pop(token, None)
-        try:
-            from device_video_shop_group import active_sessions as main_sessions
-            main_sessions.pop(token, None)
-        except ImportError:
-            pass
+        del active_sessions[token]
         raise HTTPException(status_code=401, detail="Token expired")
-
-    # Map fields from main app session format to TenantContext
-    # Main app uses: company_id, is_super_admin, role
-    # Tenant context uses: tenant_id, user_type, role_name
-    user_type = session.get("user_type", "company")
-    if session.get("is_super_admin"):
-        user_type = "platform"
-
-    tenant_id = session.get("tenant_id") or session.get("company_id")
-    active_tenant_id = session.get("active_tenant_id") or tenant_id
 
     return TenantContext(
         user_id=session["user_id"],
         username=session["username"],
         full_name=session.get("full_name"),
-        user_type=user_type,
-        tenant_id=tenant_id,
-        active_tenant_id=active_tenant_id,
+        user_type=session.get("user_type", "company"),
+        tenant_id=session.get("tenant_id"),
+        active_tenant_id=session.get("active_tenant_id") or session.get("tenant_id"),
         role_name=session.get("role_name") or session.get("role", "viewer"),
         role_id=session.get("role_id"),
         permissions=session.get("permissions", []),
@@ -285,11 +242,11 @@ def require_tenant_context(ctx: TenantContext = Depends(get_tenant_context)) -> 
 
 def start_impersonation(token: str, company_id: int, company_slug: str, company_name: str):
     """Set a platform user's session to impersonate a company."""
-    session = _find_session(token)
-    if session is None:
+    if token not in active_sessions:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    if session.get("user_type") != "platform" and not session.get("is_super_admin"):
+    session = active_sessions[token]
+    if session["user_type"] != "platform":
         raise HTTPException(status_code=403, detail="Only platform users can impersonate")
     if "platform.impersonate" not in session.get("permissions", []) and \
        "company.full_access" not in session.get("permissions", []):
@@ -303,10 +260,10 @@ def start_impersonation(token: str, company_id: int, company_slug: str, company_
 
 def stop_impersonation(token: str):
     """Revert a platform user's session to their own context."""
-    session = _find_session(token)
-    if session is None:
+    if token not in active_sessions:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+    session = active_sessions[token]
     session["active_tenant_id"] = session.get("tenant_id")  # back to None for platform
     session["company_slug"] = None
     session["company_name"] = None

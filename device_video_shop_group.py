@@ -14,7 +14,6 @@ from typing import Optional, List, Dict, Any, Tuple
 
 from migrations.dvsg_schema import ensure_dvsg_schema
 from migrations.multi_tenant import ensure_multi_tenant_schema
-from platform_api import router as platform_router
 from pydantic import BaseModel, Field
 
 from fastapi import FastAPI, HTTPException, Query, Path, Depends, Header, UploadFile, File, Form
@@ -69,9 +68,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Mount platform API (company management, dashboard, impersonation)
-app.include_router(platform_router, prefix="/platform", tags=["Platform Admin"])
 
 
 # ---------- Pydantic models ----------
@@ -1867,19 +1863,11 @@ def list_links_route(
     is_super = _is_super(user)
     with pg_conn() as conn:
         rows = list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid, limit, offset)
-        # Filter by company through device ownership
-        if not is_super and cid is not None:
-            # Get device IDs belonging to this company
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM public.device WHERE company_id = %s", (cid,))
-                company_device_ids = {r[0] for r in cur.fetchall()}
-            rows = [r for r in rows if r.get("did") in company_device_ids]
-        elif not is_super and cid is None:
-            # Non-super user with no company: only see devices with no company
-            with conn.cursor() as cur:
-                cur.execute("SELECT id FROM public.device WHERE company_id IS NULL")
-                null_company_device_ids = {r[0] for r in cur.fetchall()}
-            rows = [r for r in rows if r.get("did") in null_company_device_ids]
+        # Filter by company if not super admin
+        if not is_super:
+            if cid is not None:
+                rows = [r for r in rows if True]  # For now return all; company filter via device
+            # TODO: For full isolation, filter links where the device belongs to user's company
         return {"count": len(rows), "items": rows, "limit": limit, "offset": offset}
 
 
@@ -4292,10 +4280,8 @@ def list_users(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0
             is_super = _is_super(user)
             if is_super:
                 cur.execute("SELECT COUNT(*) FROM public.users;")
-            elif cid is not None:
-                cur.execute("SELECT COUNT(*) FROM public.users WHERE company_id = %s;", (cid,))
             else:
-                cur.execute("SELECT COUNT(*) FROM public.users WHERE company_id IS NULL;")
+                cur.execute("SELECT COUNT(*) FROM public.users WHERE company_id = %s;", (cid,))
             total = cur.fetchone()[0]
             if is_super:
                 cur.execute("""
@@ -4307,7 +4293,7 @@ def list_users(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0
                     LEFT JOIN public.company c ON c.id = u.company_id
                     GROUP BY u.id, c.name ORDER BY u.created_at DESC LIMIT %s OFFSET %s;
                 """, (limit, offset))
-            elif cid is not None:
+            else:
                 cur.execute("""
                     SELECT u.id, u.username, u.email, u.full_name, u.role, u.is_active, u.created_at, u.last_login,
                            ARRAY_AGG(up.permission) FILTER (WHERE up.permission IS NOT NULL) as permissions,
@@ -4318,17 +4304,6 @@ def list_users(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0
                     WHERE u.company_id = %s
                     GROUP BY u.id, c.name ORDER BY u.created_at DESC LIMIT %s OFFSET %s;
                 """, (cid, limit, offset))
-            else:
-                cur.execute("""
-                    SELECT u.id, u.username, u.email, u.full_name, u.role, u.is_active, u.created_at, u.last_login,
-                           ARRAY_AGG(up.permission) FILTER (WHERE up.permission IS NOT NULL) as permissions,
-                           u.company_id, COALESCE(u.is_super_admin, FALSE), c.name as company_name
-                    FROM public.users u
-                    LEFT JOIN public.user_permissions up ON u.id = up.user_id
-                    LEFT JOIN public.company c ON c.id = u.company_id
-                    WHERE u.company_id IS NULL
-                    GROUP BY u.id, c.name ORDER BY u.created_at DESC LIMIT %s OFFSET %s;
-                """, (limit, offset))
             rows = cur.fetchall()
             items = []
             for row in rows:
@@ -4711,8 +4686,16 @@ async def upload_advertisement(
         # Upsert to database with company_id
         with pg_conn() as conn:
             with conn.cursor() as cur:
-                # Use correct ON CONFLICT target based on whether user has a company
-                if cid is not None:
+                cur.execute("""
+                    INSERT INTO public.advertisement (ad_name, s3_link, rotation, fit_mode, display_duration, company_id)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (ad_name) WHERE company_id IS NULL
+                    DO UPDATE SET s3_link = EXCLUDED.s3_link, rotation = EXCLUDED.rotation,
+                        fit_mode = EXCLUDED.fit_mode, display_duration = EXCLUDED.display_duration, updated_at = NOW()
+                    RETURNING id;
+                """, (ad_name, s3_uri, rotation, fit_mode, display_duration, cid))
+                row = cur.fetchone()
+                if not row:
                     cur.execute("""
                         INSERT INTO public.advertisement (ad_name, s3_link, rotation, fit_mode, display_duration, company_id)
                         VALUES (%s, %s, %s, %s, %s, %s)
@@ -4721,16 +4704,7 @@ async def upload_advertisement(
                             fit_mode = EXCLUDED.fit_mode, display_duration = EXCLUDED.display_duration, updated_at = NOW()
                         RETURNING id;
                     """, (ad_name, s3_uri, rotation, fit_mode, display_duration, cid))
-                else:
-                    cur.execute("""
-                        INSERT INTO public.advertisement (ad_name, s3_link, rotation, fit_mode, display_duration, company_id)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (ad_name) WHERE company_id IS NULL
-                        DO UPDATE SET s3_link = EXCLUDED.s3_link, rotation = EXCLUDED.rotation,
-                            fit_mode = EXCLUDED.fit_mode, display_duration = EXCLUDED.display_duration, updated_at = NOW()
-                        RETURNING id;
-                    """, (ad_name, s3_uri, rotation, fit_mode, display_duration, cid))
-                row = cur.fetchone()
+                    row = cur.fetchone()
                 new_id = row[0]
                 conn.commit()
         
@@ -5710,8 +5684,18 @@ async def standalone_upload_video(
     s3_uri = _to_video_s3_uri(key)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            # Use correct ON CONFLICT target based on whether user has a company
-            if cid is not None:
+            cur.execute("""
+                INSERT INTO public.video (video_name, s3_link, rotation, content_type, fit_mode, display_duration, company_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (video_name) WHERE company_id IS NULL
+                DO UPDATE SET s3_link = EXCLUDED.s3_link, rotation = EXCLUDED.rotation,
+                    content_type = EXCLUDED.content_type, fit_mode = EXCLUDED.fit_mode,
+                    display_duration = EXCLUDED.display_duration, updated_at = NOW()
+                RETURNING id;
+            """, (video_name, s3_uri, rotation, content_type, fit_mode, display_duration, cid))
+            row = cur.fetchone()
+            if not row:
+                # Retry with company-scoped conflict
                 cur.execute("""
                     INSERT INTO public.video (video_name, s3_link, rotation, content_type, fit_mode, display_duration, company_id)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -5721,17 +5705,7 @@ async def standalone_upload_video(
                         display_duration = EXCLUDED.display_duration, updated_at = NOW()
                     RETURNING id;
                 """, (video_name, s3_uri, rotation, content_type, fit_mode, display_duration, cid))
-            else:
-                cur.execute("""
-                    INSERT INTO public.video (video_name, s3_link, rotation, content_type, fit_mode, display_duration, company_id)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (video_name) WHERE company_id IS NULL
-                    DO UPDATE SET s3_link = EXCLUDED.s3_link, rotation = EXCLUDED.rotation,
-                        content_type = EXCLUDED.content_type, fit_mode = EXCLUDED.fit_mode,
-                        display_duration = EXCLUDED.display_duration, updated_at = NOW()
-                    RETURNING id;
-                """, (video_name, s3_uri, rotation, content_type, fit_mode, display_duration, cid))
-            row = cur.fetchone()
+                row = cur.fetchone()
             new_id = row[0]
         conn.commit()
     return {"id": new_id, "video_name": video_name, "s3_link": s3_uri, "key": key,
