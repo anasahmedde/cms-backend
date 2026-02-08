@@ -312,6 +312,104 @@ def reactivate_company(slug: str, ctx: TenantContext = Depends(require_platform_
             conn.rollback(); raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.delete("/companies/{slug}")
+def delete_company(slug: str, ctx: TenantContext = Depends(require_platform_user)):
+    """Permanently delete a company and ALL its data. Irreversible."""
+    if not ctx.has_permission("platform.manage_companies") and not ctx.has_permission("company.full_access"):
+        raise HTTPException(status_code=403, detail="Missing platform.manage_companies permission")
+    pg_conn = _get_pg_conn()
+    with pg_conn() as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, slug, name FROM public.company WHERE slug=%s", (slug,))
+                c = cur.fetchone()
+                if not c:
+                    raise HTTPException(status_code=404, detail="Company not found")
+                cid = c[0]
+
+                # Collect S3 keys before deleting rows
+                s3_keys = []
+                cur.execute("SELECT s3_link FROM public.video WHERE tenant_id=%s AND s3_link IS NOT NULL", (cid,))
+                s3_keys.extend([r[0] for r in cur.fetchall()])
+                cur.execute("SELECT s3_link FROM public.advertisement WHERE tenant_id=%s AND s3_link IS NOT NULL", (cid,))
+                s3_keys.extend([r[0] for r in cur.fetchall()])
+
+                # Delete from all tenant-scoped tables (order matters for FK constraints)
+                tenant_tables = [
+                    "device_advertisement_shop_group",
+                    "device_video_shop_group",
+                    "device_assignment",
+                    "group_video",
+                    "group_advertisement",
+                    "device_layout",
+                    "device_logs",
+                    "device_temperature",
+                    "temperature",
+                    "device_online_history",
+                    "count_history",
+                    "user_permissions",
+                    "device",
+                    "video",
+                    "advertisement",
+                    "shop",
+                    '"group"',
+                ]
+                counts = {}
+                for tbl in tenant_tables:
+                    cur.execute(f"DELETE FROM public.{tbl} WHERE tenant_id=%s", (cid,))
+                    counts[tbl.strip('"')] = cur.rowcount
+
+                # Delete users belonging to this company
+                cur.execute("DELETE FROM public.users WHERE tenant_id=%s", (cid,))
+                counts["users"] = cur.rowcount
+
+                # Delete roles for this company
+                cur.execute("DELETE FROM public.role WHERE tenant_id=%s", (cid,))
+                counts["roles"] = cur.rowcount
+
+                # Delete audit logs
+                cur.execute("DELETE FROM public.audit_log WHERE tenant_id=%s", (cid,))
+                counts["audit_log"] = cur.rowcount
+
+                # Invalidate all sessions
+                invalidate_tenant_sessions(cid)
+
+                # Finally delete the company itself
+                cur.execute("DELETE FROM public.company WHERE id=%s", (cid,))
+
+            conn.commit()
+
+            # Clean up S3 objects in background (best-effort)
+            if s3_keys:
+                try:
+                    import boto3, os
+                    s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION", "us-east-2"))
+                    bucket = os.getenv("S3_BUCKET")
+                    if bucket:
+                        # S3 delete_objects accepts max 1000 keys per call
+                        for i in range(0, len(s3_keys), 1000):
+                            batch = s3_keys[i:i+1000]
+                            s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in batch]})
+                except Exception as s3_err:
+                    print(f"[WARN] S3 cleanup failed for company {slug}: {s3_err}", flush=True)
+
+            # Log deletion to audit (tenant_id=None since company is gone)
+            log_audit(conn, None, ctx.user_id, "company.delete", "company", cid,
+                      {"slug": slug, "name": c[2], "deleted_rows": counts})
+            conn.commit()
+
+            return {
+                "message": f"Company '{c[2]}' ({slug}) permanently deleted",
+                "company_id": cid,
+                "deleted_rows": counts,
+                "s3_keys_deleted": len(s3_keys),
+            }
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback(); raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/companies/{slug}/stats", response_model=CompanyStatsOut)
 def get_company_stats(slug: str, ctx: TenantContext = Depends(require_platform_user)):
     pg_conn = _get_pg_conn()
@@ -328,6 +426,119 @@ def get_company_stats(slug: str, ctx: TenantContext = Depends(require_platform_u
                 cur.execute(f"SELECT COUNT(*) FROM public.{tbl} WHERE tenant_id=%s", (cid,))
                 counts[key] = cur.fetchone()[0]
             return CompanyStatsOut(company_id=cid, slug=c[1], name=c[2], **counts)
+
+
+# ══════════════════════════════════════════════════════════════
+# PLATFORM DASHBOARD  (aggregated metrics across all companies)
+# ══════════════════════════════════════════════════════════════
+
+class PlatformDashboardOut(BaseModel):
+    total_companies: int
+    active_companies: int
+    suspended_companies: int
+    trial_companies: int
+    total_devices: int
+    online_devices: int
+    offline_devices: int
+    total_videos: int
+    total_advertisements: int
+    total_users: int
+    total_groups: int
+    total_shops: int
+    total_storage_used_mb: float
+    companies: list  # per-company breakdown
+
+
+@router.get("/dashboard", response_model=PlatformDashboardOut)
+def platform_dashboard(ctx: TenantContext = Depends(require_platform_user)):
+    """Aggregated platform dashboard with per-company breakdown."""
+    pg_conn = _get_pg_conn()
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            # Global company counts by status
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE status='active') AS active,
+                    COUNT(*) FILTER (WHERE status='suspended') AS suspended,
+                    COUNT(*) FILTER (WHERE status='trial') AS trial
+                FROM public.company
+            """)
+            r = cur.fetchone()
+            totals = dict(total_companies=r[0], active_companies=r[1],
+                          suspended_companies=r[2], trial_companies=r[3])
+
+            # Global device counts
+            cur.execute("""
+                SELECT COUNT(*), COUNT(*) FILTER (WHERE is_online = TRUE),
+                       COUNT(*) FILTER (WHERE is_online = FALSE OR is_online IS NULL)
+                FROM public.device
+            """)
+            r = cur.fetchone()
+            totals["total_devices"] = r[0]
+            totals["online_devices"] = r[1]
+            totals["offline_devices"] = r[2]
+
+            # Global entity counts
+            cur.execute("SELECT COUNT(*) FROM public.video")
+            totals["total_videos"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM public.advertisement")
+            totals["total_advertisements"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM public.users WHERE user_type='company'")
+            totals["total_users"] = cur.fetchone()[0]
+            cur.execute('SELECT COUNT(*) FROM public."group"')
+            totals["total_groups"] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM public.shop")
+            totals["total_shops"] = cur.fetchone()[0]
+
+            # Approximate storage: count S3 objects (we don't store file sizes, so estimate)
+            cur.execute("SELECT COUNT(*) FROM public.video WHERE s3_link IS NOT NULL")
+            vid_count = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM public.advertisement WHERE s3_link IS NOT NULL")
+            ad_count = cur.fetchone()[0]
+            # Rough estimate: avg 50MB per video, 5MB per ad
+            totals["total_storage_used_mb"] = round(vid_count * 50 + ad_count * 5, 1)
+
+            # Per-company breakdown
+            cur.execute("""
+                SELECT
+                    c.id, c.slug, c.name, c.status, c.max_devices, c.max_users,
+                    c.max_storage_mb, c.created_at,
+                    COALESCE(d.total, 0)   AS device_count,
+                    COALESCE(d.online, 0)  AS devices_online,
+                    COALESCE(d.offline, 0) AS devices_offline,
+                    COALESCE(v.cnt, 0)     AS video_count,
+                    COALESCE(ad.cnt, 0)    AS ad_count,
+                    COALESCE(u.cnt, 0)     AS user_count,
+                    COALESCE(g.cnt, 0)     AS group_count,
+                    COALESCE(s.cnt, 0)     AS shop_count
+                FROM public.company c
+                LEFT JOIN (
+                    SELECT tenant_id, COUNT(*) AS total,
+                           COUNT(*) FILTER (WHERE is_online = TRUE) AS online,
+                           COUNT(*) FILTER (WHERE is_online = FALSE OR is_online IS NULL) AS offline
+                    FROM public.device GROUP BY tenant_id
+                ) d ON d.tenant_id = c.id
+                LEFT JOIN (SELECT tenant_id, COUNT(*) AS cnt FROM public.video GROUP BY tenant_id) v ON v.tenant_id = c.id
+                LEFT JOIN (SELECT tenant_id, COUNT(*) AS cnt FROM public.advertisement GROUP BY tenant_id) ad ON ad.tenant_id = c.id
+                LEFT JOIN (SELECT tenant_id, COUNT(*) AS cnt FROM public.users WHERE user_type='company' GROUP BY tenant_id) u ON u.tenant_id = c.id
+                LEFT JOIN (SELECT tenant_id, COUNT(*) AS cnt FROM public."group" GROUP BY tenant_id) g ON g.tenant_id = c.id
+                LEFT JOIN (SELECT tenant_id, COUNT(*) AS cnt FROM public.shop GROUP BY tenant_id) s ON s.tenant_id = c.id
+                ORDER BY c.created_at DESC
+            """)
+            companies = []
+            for row in cur.fetchall():
+                companies.append({
+                    "id": row[0], "slug": row[1], "name": row[2], "status": row[3],
+                    "max_devices": row[4], "max_users": row[5], "max_storage_mb": row[6],
+                    "created_at": str(row[7]),
+                    "device_count": row[8], "devices_online": row[9], "devices_offline": row[10],
+                    "video_count": row[11], "ad_count": row[12], "user_count": row[13],
+                    "group_count": row[14], "shop_count": row[15],
+                })
+
+            totals["companies"] = companies
+            return totals
 
 
 # ══════════════════════════════════════════════════════════════
