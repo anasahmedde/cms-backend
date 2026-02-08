@@ -4746,8 +4746,10 @@ async def upload_advertisement(
     rotation: int = Form(0),
     fit_mode: str = Form("cover"),
     display_duration: int = Form(10),
+    user: Dict = Depends(get_current_user),
 ):
     """Upload an image advertisement to S3 and create database record."""
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     try:
         # Detect file extension
         ext = _detect_image_extension(file.filename or ad_name)
@@ -4777,19 +4779,34 @@ async def upload_advertisement(
         # Upsert to database
         with pg_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO public.advertisement (ad_name, s3_link, rotation, fit_mode, display_duration)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT DO NOTHING;
-                """, (ad_name, s3_uri, rotation, fit_mode, display_duration))
-                if cur.rowcount == 0:
+                if tenant_id:
                     cur.execute("""
-                        UPDATE public.advertisement SET s3_link = %s, rotation = %s,
-                            fit_mode = %s, display_duration = %s, updated_at = NOW()
-                        WHERE ad_name = %s RETURNING id;
-                    """, (s3_uri, rotation, fit_mode, display_duration, ad_name))
+                        INSERT INTO public.advertisement (ad_name, s3_link, rotation, fit_mode, display_duration, tenant_id)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT DO NOTHING;
+                    """, (ad_name, s3_uri, rotation, fit_mode, display_duration, tenant_id))
+                    if cur.rowcount == 0:
+                        cur.execute("""
+                            UPDATE public.advertisement SET s3_link = %s, rotation = %s,
+                                fit_mode = %s, display_duration = %s, updated_at = NOW()
+                            WHERE ad_name = %s AND tenant_id = %s RETURNING id;
+                        """, (s3_uri, rotation, fit_mode, display_duration, ad_name, tenant_id))
+                    else:
+                        cur.execute("SELECT id FROM public.advertisement WHERE ad_name = %s AND tenant_id = %s ORDER BY id DESC LIMIT 1;", (ad_name, tenant_id))
                 else:
-                    cur.execute("SELECT id FROM public.advertisement WHERE ad_name = %s ORDER BY id DESC LIMIT 1;", (ad_name,))
+                    cur.execute("""
+                        INSERT INTO public.advertisement (ad_name, s3_link, rotation, fit_mode, display_duration)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT DO NOTHING;
+                    """, (ad_name, s3_uri, rotation, fit_mode, display_duration))
+                    if cur.rowcount == 0:
+                        cur.execute("""
+                            UPDATE public.advertisement SET s3_link = %s, rotation = %s,
+                                fit_mode = %s, display_duration = %s, updated_at = NOW()
+                            WHERE ad_name = %s RETURNING id;
+                        """, (s3_uri, rotation, fit_mode, display_duration, ad_name))
+                    else:
+                        cur.execute("SELECT id FROM public.advertisement WHERE ad_name = %s ORDER BY id DESC LIMIT 1;", (ad_name,))
                 new_id = cur.fetchone()[0]
                 conn.commit()
         
@@ -5739,7 +5756,9 @@ async def standalone_upload_video(
     rotation: int = Form(0),
     fit_mode: str = Form("cover"),
     display_duration: int = Form(10),
+    user: Dict = Depends(get_current_user),
 ):
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     key = _make_video_s3_key(video_name)
     if not overwrite and _video_s3_key_exists(key):
         raise HTTPException(status_code=409, detail="Video exists. Use overwrite=true.")
@@ -5751,20 +5770,36 @@ async def standalone_upload_video(
     s3_uri = _to_video_s3_uri(key)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO public.video (video_name, s3_link, rotation, content_type, fit_mode, display_duration)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING;
-            """, (video_name, s3_uri, rotation, content_type, fit_mode, display_duration))
-            if cur.rowcount == 0:
+            if tenant_id:
                 cur.execute("""
-                    UPDATE public.video SET s3_link = %s, rotation = %s,
-                        content_type = %s, fit_mode = %s,
-                        display_duration = %s, updated_at = NOW()
-                    WHERE video_name = %s RETURNING id;
-                """, (s3_uri, rotation, content_type, fit_mode, display_duration, video_name))
+                    INSERT INTO public.video (video_name, s3_link, rotation, content_type, fit_mode, display_duration, tenant_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING;
+                """, (video_name, s3_uri, rotation, content_type, fit_mode, display_duration, tenant_id))
+                if cur.rowcount == 0:
+                    cur.execute("""
+                        UPDATE public.video SET s3_link = %s, rotation = %s,
+                            content_type = %s, fit_mode = %s,
+                            display_duration = %s, updated_at = NOW()
+                        WHERE video_name = %s AND tenant_id = %s RETURNING id;
+                    """, (s3_uri, rotation, content_type, fit_mode, display_duration, video_name, tenant_id))
+                else:
+                    cur.execute("SELECT id FROM public.video WHERE video_name = %s AND tenant_id = %s ORDER BY id DESC LIMIT 1;", (video_name, tenant_id))
             else:
-                cur.execute("SELECT id FROM public.video WHERE video_name = %s ORDER BY id DESC LIMIT 1;", (video_name,))
+                cur.execute("""
+                    INSERT INTO public.video (video_name, s3_link, rotation, content_type, fit_mode, display_duration)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING;
+                """, (video_name, s3_uri, rotation, content_type, fit_mode, display_duration))
+                if cur.rowcount == 0:
+                    cur.execute("""
+                        UPDATE public.video SET s3_link = %s, rotation = %s,
+                            content_type = %s, fit_mode = %s,
+                            display_duration = %s, updated_at = NOW()
+                        WHERE video_name = %s RETURNING id;
+                    """, (s3_uri, rotation, content_type, fit_mode, display_duration, video_name))
+                else:
+                    cur.execute("SELECT id FROM public.video WHERE video_name = %s ORDER BY id DESC LIMIT 1;", (video_name,))
             new_id = cur.fetchone()[0]
         conn.commit()
     return {"id": new_id, "video_name": video_name, "s3_link": s3_uri, "key": key,
