@@ -91,6 +91,11 @@ async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
         status_code=500,
         content={"detail": error_detail, "traceback": tb.split("\n")[-4:]},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        },
     )
 
 # Debug endpoint to check server state
@@ -3216,7 +3221,11 @@ def create_device_with_linking(body: DeviceCreateIn, user: Dict = Depends(get_cu
             import traceback
             tb = traceback.format_exc()
             print(f"[DEVICE CREATE ERROR] {str(e)}\n{tb}", flush=True)
-            raise HTTPException(status_code=500, detail=f"Device create failed: {str(e)}")
+            return JSONResponse(
+                status_code=500,
+                content={"detail": f"Device create failed: {str(e)}", "traceback": tb.split("\n")[-6:]},
+                headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "*", "Access-Control-Allow-Headers": "*"},
+            )
 
 
 # ---------- Group video endpoints ----------
