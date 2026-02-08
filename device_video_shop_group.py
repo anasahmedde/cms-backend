@@ -3223,8 +3223,7 @@ def create_device_with_linking(body: DeviceCreateIn, user: Dict = Depends(get_cu
                         cur.execute("""
                             INSERT INTO public.device_video_shop_group (did, vid, sid, gid)
                             VALUES (%s, %s, %s, %s)
-                            ON CONFLICT DO NOTHING
-                            DO UPDATE SET updated_at = NOW()
+                            ON CONFLICT (did, vid) DO UPDATE SET updated_at = NOW()
                             RETURNING id;
                         """, (did, vid, sid, gid))
                         if cur.fetchone():
