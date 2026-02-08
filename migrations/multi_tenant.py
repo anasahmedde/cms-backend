@@ -2,7 +2,9 @@
 """
 Multi-tenant migration: adds company table and company_id FK to all entity tables.
 Designed to be fully idempotent — safe to run multiple times even if
-the company table was partially created in a previous run.
+the company table was partially created in a previous run, or was
+created by multitenant_schema.py with a different column set.
+
 Existing data gets company_id = NULL (super-admin scope).
 """
 
@@ -13,7 +15,10 @@ def ensure_multi_tenant_schema(conn):
     Must be called AFTER ensure_dvsg_schema().
     """
 
-    # ── 1. Company table (minimal CREATE, then ALTER for extra cols) ──
+    # ── 1. Company table ──────────────────────────────────────────
+    # Create base table if it doesn't exist at all.
+    # If it was already created by multitenant_schema.py (with different
+    # columns like 'status' instead of 'is_active'), this is a no-op.
     ddl_company_table = """
     CREATE TABLE IF NOT EXISTS public.company (
         id          BIGSERIAL PRIMARY KEY,
@@ -24,13 +29,17 @@ def ensure_multi_tenant_schema(conn):
     );
     """
 
-    # Idempotent column adds + unique constraints
+    # Idempotent column adds + unique constraints.
+    # This handles BOTH cases:
+    #   a) Table just created above (needs is_active)
+    #   b) Table created by multitenant_schema.py (has 'status', needs is_active)
+    #   c) Table already has is_active from a previous run (no-op)
     ddl_company_cols = """
     DO $$
-    DECLARE t text;
+    DECLARE _found text;
     BEGIN
-      -- is_active
-      SELECT 1 INTO t FROM information_schema.columns
+      -- is_active column
+      SELECT 1 INTO _found FROM information_schema.columns
        WHERE table_schema='public' AND table_name='company' AND column_name='is_active';
       IF NOT FOUND THEN
         ALTER TABLE public.company ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT TRUE;
@@ -64,79 +73,86 @@ def ensure_multi_tenant_schema(conn):
     END $$;
     """
 
+    # Indexes — MUST run AFTER ddl_company_cols so is_active exists
     ddl_company_indexes = """
     CREATE INDEX IF NOT EXISTS idx_company_slug ON public.company(slug);
     CREATE INDEX IF NOT EXISTS idx_company_is_active ON public.company(is_active);
     """
 
+    # Updated_at trigger (requires set_updated_at function from dvsg_schema)
     ddl_company_trigger = """
     DO $$
     BEGIN
         IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_company_updated_at') THEN
-            CREATE TRIGGER trg_company_updated_at
-            BEFORE UPDATE ON public.company
-            FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+            IF EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'set_updated_at') THEN
+                CREATE TRIGGER trg_company_updated_at
+                BEFORE UPDATE ON public.company
+                FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+            END IF;
         END IF;
     END $$;
     """
 
-    # ── 2. Add company_id to entity tables ────────────────────────────
+    # ── 2. Add company_id to entity tables ────────────────────────
     ddl_add_company_id = """
     DO $$
-    DECLARE t text;
+    DECLARE _found text;
     BEGIN
       -- users.company_id
-      SELECT 1 INTO t FROM information_schema.columns
+      SELECT 1 INTO _found FROM information_schema.columns
        WHERE table_schema='public' AND table_name='users' AND column_name='company_id';
       IF NOT FOUND THEN
         ALTER TABLE public.users ADD COLUMN company_id BIGINT REFERENCES public.company(id) ON DELETE SET NULL;
       END IF;
-      CREATE INDEX IF NOT EXISTS idx_users_company_id ON public.users(company_id);
 
       -- device.company_id
-      SELECT 1 INTO t FROM information_schema.columns
+      SELECT 1 INTO _found FROM information_schema.columns
        WHERE table_schema='public' AND table_name='device' AND column_name='company_id';
       IF NOT FOUND THEN
         ALTER TABLE public.device ADD COLUMN company_id BIGINT REFERENCES public.company(id) ON DELETE SET NULL;
       END IF;
-      CREATE INDEX IF NOT EXISTS idx_device_company_id ON public.device(company_id);
 
       -- video.company_id
-      SELECT 1 INTO t FROM information_schema.columns
+      SELECT 1 INTO _found FROM information_schema.columns
        WHERE table_schema='public' AND table_name='video' AND column_name='company_id';
       IF NOT FOUND THEN
         ALTER TABLE public.video ADD COLUMN company_id BIGINT REFERENCES public.company(id) ON DELETE SET NULL;
       END IF;
-      CREATE INDEX IF NOT EXISTS idx_video_company_id ON public.video(company_id);
 
       -- shop.company_id
-      SELECT 1 INTO t FROM information_schema.columns
+      SELECT 1 INTO _found FROM information_schema.columns
        WHERE table_schema='public' AND table_name='shop' AND column_name='company_id';
       IF NOT FOUND THEN
         ALTER TABLE public.shop ADD COLUMN company_id BIGINT REFERENCES public.company(id) ON DELETE SET NULL;
       END IF;
-      CREATE INDEX IF NOT EXISTS idx_shop_company_id ON public.shop(company_id);
 
       -- group.company_id
-      SELECT 1 INTO t FROM information_schema.columns
+      SELECT 1 INTO _found FROM information_schema.columns
        WHERE table_schema='public' AND table_name='group' AND column_name='company_id';
       IF NOT FOUND THEN
         ALTER TABLE public."group" ADD COLUMN company_id BIGINT REFERENCES public.company(id) ON DELETE SET NULL;
       END IF;
-      CREATE INDEX IF NOT EXISTS idx_group_company_id ON public."group"(company_id);
 
       -- advertisement.company_id
-      SELECT 1 INTO t FROM information_schema.columns
+      SELECT 1 INTO _found FROM information_schema.columns
        WHERE table_schema='public' AND table_name='advertisement' AND column_name='company_id';
       IF NOT FOUND THEN
         ALTER TABLE public.advertisement ADD COLUMN company_id BIGINT REFERENCES public.company(id) ON DELETE SET NULL;
       END IF;
-      CREATE INDEX IF NOT EXISTS idx_advertisement_company_id ON public.advertisement(company_id);
-
     END $$;
     """
 
-    # ── 3. Update unique constraints to be company-scoped ─────────────
+    # Indexes for company_id columns (separate statement, safe after columns exist)
+    ddl_company_id_indexes = """
+    CREATE INDEX IF NOT EXISTS idx_users_company_id ON public.users(company_id);
+    CREATE INDEX IF NOT EXISTS idx_device_company_id ON public.device(company_id);
+    CREATE INDEX IF NOT EXISTS idx_video_company_id ON public.video(company_id);
+    CREATE INDEX IF NOT EXISTS idx_shop_company_id ON public.shop(company_id);
+    CREATE INDEX IF NOT EXISTS idx_group_company_id ON public."group"(company_id);
+    CREATE INDEX IF NOT EXISTS idx_advertisement_company_id ON public.advertisement(company_id);
+    """
+
+    # ── 3. Update unique constraints to be company-scoped ─────────
     ddl_company_scoped_unique = """
     DO $$
     BEGIN
@@ -193,12 +209,12 @@ def ensure_multi_tenant_schema(conn):
     END $$;
     """
 
-    # ── 4. Add is_super_admin flag to users ───────────────────────────
+    # ── 4. Add is_super_admin flag to users ───────────────────────
     ddl_super_admin = """
     DO $$
-    DECLARE t text;
+    DECLARE _found text;
     BEGIN
-      SELECT 1 INTO t FROM information_schema.columns
+      SELECT 1 INTO _found FROM information_schema.columns
        WHERE table_schema='public' AND table_name='users' AND column_name='is_super_admin';
       IF NOT FOUND THEN
         ALTER TABLE public.users ADD COLUMN is_super_admin BOOLEAN NOT NULL DEFAULT FALSE;
@@ -207,21 +223,47 @@ def ensure_multi_tenant_schema(conn):
     END $$;
     """
 
-    # ── Execute all (order matters) ───────────────────────────────────
+    # ── Execute all ───────────────────────────────────────────────
+    # Key fix: commit between steps so that columns created in one step
+    # are visible to the next step (e.g., is_active must exist before
+    # CREATE INDEX on is_active). This avoids the "column does not exist"
+    # error that occurs when all statements run in one transaction.
     with conn.cursor() as cur:
-        # 1. Create company table first (base structure)
+        # Step 1a: Create company table (no-op if exists)
         cur.execute(ddl_company_table)
-        # 2. Add missing columns to company table
-        cur.execute(ddl_company_cols)
-        # 3. Indexes (safe now that is_active exists)
-        cur.execute(ddl_company_indexes)
-        # 4. Trigger
-        cur.execute(ddl_company_trigger)
-        # 5. Add company_id FK to all entity tables
-        cur.execute(ddl_add_company_id)
-        # 6. Switch unique constraints to company-scoped
-        cur.execute(ddl_company_scoped_unique)
-        # 7. Super admin flag
-        cur.execute(ddl_super_admin)
+    conn.commit()
 
+    with conn.cursor() as cur:
+        # Step 1b: Add missing columns (is_active, unique constraints)
+        cur.execute(ddl_company_cols)
+    conn.commit()
+
+    with conn.cursor() as cur:
+        # Step 1c: Indexes on company table (now safe — is_active exists)
+        cur.execute(ddl_company_indexes)
+    conn.commit()
+
+    with conn.cursor() as cur:
+        # Step 1d: Updated_at trigger
+        cur.execute(ddl_company_trigger)
+    conn.commit()
+
+    with conn.cursor() as cur:
+        # Step 2a: Add company_id FK to all entity tables
+        cur.execute(ddl_add_company_id)
+    conn.commit()
+
+    with conn.cursor() as cur:
+        # Step 2b: Indexes for company_id columns
+        cur.execute(ddl_company_id_indexes)
+    conn.commit()
+
+    with conn.cursor() as cur:
+        # Step 3: Switch unique constraints to company-scoped
+        cur.execute(ddl_company_scoped_unique)
+    conn.commit()
+
+    with conn.cursor() as cur:
+        # Step 4: Super admin flag
+        cur.execute(ddl_super_admin)
     conn.commit()
