@@ -195,18 +195,31 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> Dict:
 def require_permission(permission: str):
     """
     FastAPI dependency factory: checks a specific permission.
-    Returns TenantContext if authorized.
-    
-    BACKWARD COMPATIBLE: also works when assigned to a `user: Dict` param
-    because TenantContext has all dict keys accessible.
+    Returns a Dict (NOT TenantContext) for backward compatibility
+    with all existing endpoints that do user.get("key").
     """
-    def checker(ctx: TenantContext = Depends(get_tenant_context)) -> TenantContext:
+    def checker(authorization: Optional[str] = Header(None)) -> Dict:
+        ctx = get_tenant_context(authorization)
         if ctx.has_permission(permission):
-            return ctx
-        # Also check the old-style: platform users with full_access bypass
-        if ctx.user_type == "platform" and "company.full_access" in ctx.permissions:
-            return ctx
-        raise HTTPException(status_code=403, detail=f"Permission denied: {permission}")
+            pass  # authorized
+        elif ctx.user_type == "platform" and "company.full_access" in ctx.permissions:
+            pass  # super admin bypass
+        else:
+            raise HTTPException(status_code=403, detail=f"Permission denied: {permission}")
+        # Return as dict for backward compat
+        return {
+            "user_id": ctx.user_id,
+            "username": ctx.username,
+            "full_name": ctx.full_name,
+            "role": ctx.role_name,
+            "permissions": ctx.permissions,
+            "user_type": ctx.user_type,
+            "tenant_id": ctx.tenant_id,
+            "active_tenant_id": ctx.active_tenant_id,
+            "company_slug": ctx.company_slug,
+            "company_name": ctx.company_name,
+            "is_impersonating": ctx.is_impersonating,
+        }
     return checker
 
 
