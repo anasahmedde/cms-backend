@@ -158,6 +158,21 @@ def create_company(body: CompanyCreateIn, ctx: TenantContext = Depends(require_p
                 if cur.fetchone():
                     raise HTTPException(status_code=400, detail=f"Slug '{body.slug}' already exists")
 
+                # Check if admin username is already taken globally
+                cur.execute("SELECT u.id, c.name FROM public.users u LEFT JOIN public.company c ON u.tenant_id = c.id WHERE u.username = %s;", (body.admin_username.lower(),))
+                existing = cur.fetchone()
+                if existing:
+                    company_name = existing[1] or "Platform"
+                    raise HTTPException(status_code=400, detail=f"Username '{body.admin_username.lower()}' is already assigned to company '{company_name}'. Please use another username.")
+
+                # Check if admin email is already taken globally
+                if body.admin_email:
+                    cur.execute("SELECT u.id, c.name FROM public.users u LEFT JOIN public.company c ON u.tenant_id = c.id WHERE u.email = %s;", (body.admin_email.lower(),))
+                    existing_email = cur.fetchone()
+                    if existing_email:
+                        company_name = existing_email[1] or "Platform"
+                        raise HTTPException(status_code=400, detail=f"Email '{body.admin_email.lower()}' is already assigned to company '{company_name}'. Please use another email.")
+
                 cur.execute(f"""
                     INSERT INTO public.company
                         (slug, name, email, phone, address, max_devices, max_users, max_storage_mb, created_by)
