@@ -78,6 +78,55 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Global exception handler to preserve CORS on 500s and log actual errors
+from fastapi.responses import JSONResponse
+from starlette.requests import Request
+import traceback as _tb
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    error_detail = str(exc)
+    tb = _tb.format_exc()
+    print(f"[UNHANDLED ERROR] {request.method} {request.url.path}: {error_detail}\n{tb}", flush=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": error_detail, "traceback": tb.split("\n")[-4:]},
+    )
+
+# Debug endpoint to check server state
+@app.get("/debug/health")
+def debug_health():
+    """Quick health check with migration status."""
+    try:
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                # Check if tenant_id column exists and has DEFAULT
+                cur.execute("""
+                    SELECT column_default FROM information_schema.columns 
+                    WHERE table_schema='public' AND table_name='device' AND column_name='tenant_id';
+                """)
+                device_default = cur.fetchone()
+                
+                cur.execute("SELECT COUNT(*) FROM public.company;")
+                company_count = cur.fetchone()[0]
+                
+                cur.execute("SELECT COUNT(*) FROM public.role;")
+                role_count = cur.fetchone()[0]
+                
+                cur.execute("SELECT id, slug, name, status FROM public.company ORDER BY id LIMIT 5;")
+                companies = [{"id": r[0], "slug": r[1], "name": r[2], "status": r[3]} for r in cur.fetchall()]
+                
+                return {
+                    "status": "ok",
+                    "device_tenant_id_default": str(device_default) if device_default else "NO DEFAULT",
+                    "companies": company_count,
+                    "roles": role_count,
+                    "company_list": companies,
+                    "active_sessions": len(active_sessions),
+                }
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
 
 # ---------- Pydantic models ----------
 class DeviceCountsOut(BaseModel):
@@ -3162,9 +3211,12 @@ def create_device_with_linking(body: DeviceCreateIn, user: Dict = Depends(get_cu
         except HTTPException:
             conn.rollback()
             raise
-        except:
+        except Exception as e:
             conn.rollback()
-            raise
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[DEVICE CREATE ERROR] {str(e)}\n{tb}", flush=True)
+            raise HTTPException(status_code=500, detail=f"Device create failed: {str(e)}")
 
 
 # ---------- Group video endpoints ----------
