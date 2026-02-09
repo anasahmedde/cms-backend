@@ -418,10 +418,30 @@ def delete_company(slug: str, force: bool = Query(False), ctx: TenantContext = D
                     s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION", "us-east-2"))
                     bucket = os.getenv("S3_BUCKET")
                     if bucket:
+                        # Extract actual keys from s3://bucket/key URIs
+                        actual_keys = []
+                        for uri in s3_keys:
+                            if uri and uri.startswith("s3://"):
+                                parts = uri.replace("s3://", "").split("/", 1)
+                                if len(parts) > 1:
+                                    actual_keys.append(parts[1])
+                            elif uri:
+                                actual_keys.append(uri)
+                        # Also delete tenant prefix folder
+                        company_slug_val = slug
+                        try:
+                            paginator = s3.get_paginator('list_objects_v2')
+                            for prefix in [f"tenants/{company_slug_val}/"]:
+                                for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                                    for obj in page.get('Contents', []):
+                                        actual_keys.append(obj['Key'])
+                        except Exception:
+                            pass
                         # S3 delete_objects accepts max 1000 keys per call
-                        for i in range(0, len(s3_keys), 1000):
-                            batch = s3_keys[i:i+1000]
-                            s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in batch]})
+                        for i in range(0, len(actual_keys), 1000):
+                            batch = actual_keys[i:i+1000]
+                            if batch:
+                                s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in batch]})
                 except Exception as s3_err:
                     print(f"[WARN] S3 cleanup failed for company {slug}: {s3_err}", flush=True)
 

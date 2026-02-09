@@ -4761,7 +4761,8 @@ async def upload_advertisement(
     try:
         # Detect file extension
         ext = _detect_image_extension(file.filename or ad_name)
-        key = _make_ad_s3_key(ad_name, ext)
+        tenant_slug = _get_tenant_slug(tenant_id)
+        key = _make_ad_s3_key(ad_name, ext, tenant_slug=tenant_slug)
         content_type = _get_content_type_for_image(ext)
         
         # Check if exists (if not overwriting)
@@ -4947,9 +4948,20 @@ def delete_advertisement(ad_name: str, force: bool = Query(False)):
                 if cur.rowcount: unlinked["device_links"] = cur.rowcount
                 cur.execute("DELETE FROM public.group_advertisement WHERE aid = %s", (aid,))
                 if cur.rowcount: unlinked["group_links"] = cur.rowcount
+
+                # Get S3 link before deleting DB record
+                cur.execute("SELECT s3_link FROM public.advertisement WHERE id = %s;", (aid,))
+                s3_row = cur.fetchone()
+                s3_key = _s3_key_from_uri(s3_row[0]) if s3_row and s3_row[0] else None
+
                 cur.execute("DELETE FROM public.advertisement WHERE id = %s RETURNING id;", (aid,))
                 rows = cur.fetchall()
             conn.commit()
+
+            # Delete from S3 after DB commit
+            if s3_key:
+                _s3_delete_key(s3_key)
+
             return {"deleted_count": len(rows), "unlinked": unlinked}
         except HTTPException:
             conn.rollback(); raise
@@ -5433,6 +5445,47 @@ class StandaloneFitModeUpdate(BaseModel):
 # --- S3 config for video uploads ---
 S3_VIDEO_PREFIX = os.getenv("S3_PREFIX", "myvideos").strip("/")
 S3_VIDEO_FORCED_EXT = ".mp4"
+
+# Cache tenant slugs to avoid repeated DB lookups
+_tenant_slug_cache: Dict[int, str] = {}
+
+def _get_tenant_slug(tenant_id) -> Optional[str]:
+    """Get company slug for tenant-scoped S3 paths."""
+    if not tenant_id:
+        return None
+    tid = int(tenant_id)
+    if tid in _tenant_slug_cache:
+        return _tenant_slug_cache[tid]
+    try:
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT slug FROM public.company WHERE id = %s;", (tid,))
+                row = cur.fetchone()
+                if row:
+                    _tenant_slug_cache[tid] = row[0]
+                    return row[0]
+    except Exception:
+        pass
+    return None
+
+def _s3_delete_key(key: str):
+    """Delete a single S3 object. Silently ignores errors."""
+    if not key:
+        return
+    try:
+        s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else boto3.client("s3")
+        s3.delete_object(Bucket=S3_BUCKET, Key=key)
+    except Exception as e:
+        print(f"[S3 delete] Warning: failed to delete {key}: {e}")
+
+def _s3_key_from_uri(s3_uri: str) -> Optional[str]:
+    """Extract S3 key from s3://bucket/key URI."""
+    if not s3_uri:
+        return None
+    if s3_uri.startswith("s3://"):
+        parts = s3_uri.replace("s3://", "").split("/", 1)
+        return parts[1] if len(parts) > 1 else None
+    return s3_uri
 
 def _video_slug(s: str) -> str:
     import re as _re
@@ -5969,7 +6022,8 @@ async def standalone_upload_video(
     user: Dict = Depends(get_current_user),
 ):
     tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
-    key = _make_video_s3_key(video_name)
+    tenant_slug = _get_tenant_slug(tenant_id)
+    key = _make_video_s3_key(video_name, tenant_slug=tenant_slug)
     if not overwrite and _video_s3_key_exists(key):
         raise HTTPException(status_code=409, detail="Video exists. Use overwrite=true.")
     content_type = _detect_video_content_type(file.filename or video_name)
@@ -6098,9 +6152,20 @@ def standalone_delete_video(video_name: str, force: bool = Query(False)):
                 if cur.rowcount: unlinked["device_links"] = cur.rowcount
                 cur.execute("DELETE FROM public.group_video WHERE vid = %s", (vid,))
                 if cur.rowcount: unlinked["group_links"] = cur.rowcount
+
+                # Get S3 link before deleting DB record
+                cur.execute("SELECT s3_link FROM public.video WHERE id = %s;", (vid,))
+                s3_row = cur.fetchone()
+                s3_key = _s3_key_from_uri(s3_row[0]) if s3_row and s3_row[0] else None
+
                 cur.execute("DELETE FROM public.video WHERE id = %s RETURNING id;", (vid,))
                 deleted = cur.fetchall()
             conn.commit()
+
+            # Delete from S3 after DB commit
+            if s3_key:
+                _s3_delete_key(s3_key)
+
             return {"deleted_count": len(deleted), "unlinked": unlinked}
         except HTTPException:
             conn.rollback(); raise
