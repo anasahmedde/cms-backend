@@ -740,8 +740,11 @@ def ensure_multitenant_schema(conn):
         duration_sec    INT,
         ip_address      INET,
         user_agent      TEXT,
-        is_active       BOOLEAN NOT NULL DEFAULT TRUE
+        is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+        last_heartbeat  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    -- Add column if table already exists (idempotent)
+    ALTER TABLE public.user_session ADD COLUMN IF NOT EXISTS last_heartbeat TIMESTAMPTZ DEFAULT NOW();
     CREATE INDEX IF NOT EXISTS idx_usession_user ON public.user_session(user_id);
     CREATE INDEX IF NOT EXISTS idx_usession_tenant ON public.user_session(tenant_id);
     CREATE INDEX IF NOT EXISTS idx_usession_login ON public.user_session(login_at DESC);
