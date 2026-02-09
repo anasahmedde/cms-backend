@@ -4691,22 +4691,32 @@ def list_advertisements(q: Optional[str] = Query(None), limit: int = Query(50, g
     tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            base = """SELECT id, ad_name, s3_link, rotation, fit_mode, display_duration, created_at, updated_at
-                     FROM public.advertisement"""
             if tenant_id:
+                base = """SELECT id, ad_name, s3_link, rotation, fit_mode, display_duration, created_at, updated_at
+                         FROM public.advertisement"""
                 if q:
                     cur.execute(base + " WHERE tenant_id = %s AND ad_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s", (tenant_id, f"%{q}%", limit, offset))
                 else:
                     cur.execute(base + " WHERE tenant_id = %s ORDER BY id DESC LIMIT %s OFFSET %s", (tenant_id, limit, offset))
+                rows = cur.fetchall()
+                items = [{"id": r[0], "ad_name": r[1], "s3_link": r[2], "rotation": r[3],
+                          "fit_mode": r[4], "display_duration": r[5], "created_at": r[6], "updated_at": r[7]} 
+                         for r in rows]
             else:
+                # Platform admin: include company name
+                base = """SELECT a.id, a.ad_name, a.s3_link, a.rotation, a.fit_mode, a.display_duration,
+                                 a.created_at, a.updated_at, c.name as company_name, c.slug as company_slug
+                          FROM public.advertisement a
+                          LEFT JOIN public.company c ON c.id = a.tenant_id"""
                 if q:
-                    cur.execute(base + " WHERE ad_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s", (f"%{q}%", limit, offset))
+                    cur.execute(base + " WHERE a.ad_name ILIKE %s ORDER BY a.id DESC LIMIT %s OFFSET %s", (f"%{q}%", limit, offset))
                 else:
-                    cur.execute(base + " ORDER BY id DESC LIMIT %s OFFSET %s", (limit, offset))
-            rows = cur.fetchall()
-            items = [{"id": r[0], "ad_name": r[1], "s3_link": r[2], "rotation": r[3],
-                      "fit_mode": r[4], "display_duration": r[5], "created_at": r[6], "updated_at": r[7]} 
-                     for r in rows]
+                    cur.execute(base + " ORDER BY a.id DESC LIMIT %s OFFSET %s", (limit, offset))
+                rows = cur.fetchall()
+                items = [{"id": r[0], "ad_name": r[1], "s3_link": r[2], "rotation": r[3],
+                          "fit_mode": r[4], "display_duration": r[5], "created_at": r[6], "updated_at": r[7],
+                          "company_name": r[8], "company_slug": r[9]} 
+                         for r in rows]
             return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
 
 @app.get("/advertisement/{ad_name}")
@@ -4762,7 +4772,9 @@ async def upload_advertisement(
         # Detect file extension
         ext = _detect_image_extension(file.filename or ad_name)
         tenant_slug = _get_tenant_slug(tenant_id)
-        key = _make_ad_s3_key(ad_name, ext, tenant_slug=tenant_slug)
+        # Append company suffix for tenant isolation
+        stored_name = f"{ad_name}-{tenant_slug}" if tenant_slug and tenant_slug != "default" else ad_name
+        key = _make_ad_s3_key(stored_name, ext, tenant_slug=tenant_slug)
         content_type = _get_content_type_for_image(ext)
         
         # Check if exists (if not overwriting)
@@ -4793,15 +4805,15 @@ async def upload_advertisement(
                         INSERT INTO public.advertisement (ad_name, s3_link, rotation, fit_mode, display_duration, tenant_id)
                         VALUES (%s, %s, %s, %s, %s, %s)
                         ON CONFLICT DO NOTHING;
-                    """, (ad_name, s3_uri, rotation, fit_mode, display_duration, tenant_id))
+                    """, (stored_name, s3_uri, rotation, fit_mode, display_duration, tenant_id))
                     if cur.rowcount == 0:
                         cur.execute("""
                             UPDATE public.advertisement SET s3_link = %s, rotation = %s,
                                 fit_mode = %s, display_duration = %s, updated_at = NOW()
                             WHERE ad_name = %s AND tenant_id = %s RETURNING id;
-                        """, (s3_uri, rotation, fit_mode, display_duration, ad_name, tenant_id))
+                        """, (s3_uri, rotation, fit_mode, display_duration, stored_name, tenant_id))
                     else:
-                        cur.execute("SELECT id FROM public.advertisement WHERE ad_name = %s AND tenant_id = %s ORDER BY id DESC LIMIT 1;", (ad_name, tenant_id))
+                        cur.execute("SELECT id FROM public.advertisement WHERE ad_name = %s AND tenant_id = %s ORDER BY id DESC LIMIT 1;", (stored_name, tenant_id))
                 else:
                     cur.execute("""
                         INSERT INTO public.advertisement (ad_name, s3_link, rotation, fit_mode, display_duration)
@@ -6023,7 +6035,9 @@ async def standalone_upload_video(
 ):
     tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     tenant_slug = _get_tenant_slug(tenant_id)
-    key = _make_video_s3_key(video_name, tenant_slug=tenant_slug)
+    # Append company suffix for tenant isolation
+    stored_name = f"{video_name}-{tenant_slug}" if tenant_slug and tenant_slug != "default" else video_name
+    key = _make_video_s3_key(stored_name, tenant_slug=tenant_slug)
     if not overwrite and _video_s3_key_exists(key):
         raise HTTPException(status_code=409, detail="Video exists. Use overwrite=true.")
     content_type = _detect_video_content_type(file.filename or video_name)
@@ -6039,16 +6053,16 @@ async def standalone_upload_video(
                     INSERT INTO public.video (video_name, s3_link, rotation, content_type, fit_mode, display_duration, tenant_id)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT DO NOTHING;
-                """, (video_name, s3_uri, rotation, content_type, fit_mode, display_duration, tenant_id))
+                """, (stored_name, s3_uri, rotation, content_type, fit_mode, display_duration, tenant_id))
                 if cur.rowcount == 0:
                     cur.execute("""
                         UPDATE public.video SET s3_link = %s, rotation = %s,
                             content_type = %s, fit_mode = %s,
                             display_duration = %s, updated_at = NOW()
                         WHERE video_name = %s AND tenant_id = %s RETURNING id;
-                    """, (s3_uri, rotation, content_type, fit_mode, display_duration, video_name, tenant_id))
+                    """, (s3_uri, rotation, content_type, fit_mode, display_duration, stored_name, tenant_id))
                 else:
-                    cur.execute("SELECT id FROM public.video WHERE video_name = %s AND tenant_id = %s ORDER BY id DESC LIMIT 1;", (video_name, tenant_id))
+                    cur.execute("SELECT id FROM public.video WHERE video_name = %s AND tenant_id = %s ORDER BY id DESC LIMIT 1;", (stored_name, tenant_id))
             else:
                 cur.execute("""
                     INSERT INTO public.video (video_name, s3_link, rotation, content_type, fit_mode, display_duration)
@@ -6080,21 +6094,31 @@ def standalone_list_videos(
     tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            base = "SELECT id, video_name, s3_link, rotation, content_type, fit_mode, display_duration, created_at, updated_at FROM public.video"
             if tenant_id:
+                base = "SELECT v.id, v.video_name, v.s3_link, v.rotation, v.content_type, v.fit_mode, v.display_duration, v.created_at, v.updated_at FROM public.video v"
                 if q:
-                    cur.execute(base + " WHERE tenant_id = %s AND video_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s", (tenant_id, f"%{q}%", limit, offset))
+                    cur.execute(base + " WHERE v.tenant_id = %s AND v.video_name ILIKE %s ORDER BY v.id DESC LIMIT %s OFFSET %s", (tenant_id, f"%{q}%", limit, offset))
                 else:
-                    cur.execute(base + " WHERE tenant_id = %s ORDER BY id DESC LIMIT %s OFFSET %s", (tenant_id, limit, offset))
+                    cur.execute(base + " WHERE v.tenant_id = %s ORDER BY v.id DESC LIMIT %s OFFSET %s", (tenant_id, limit, offset))
+                rows = cur.fetchall()
+                items = [{"id": r[0], "video_name": r[1], "s3_link": r[2], "rotation": r[3],
+                          "content_type": r[4], "fit_mode": r[5], "display_duration": r[6],
+                          "created_at": r[7], "updated_at": r[8]} for r in rows]
             else:
+                # Platform admin: include company name
+                base = """SELECT v.id, v.video_name, v.s3_link, v.rotation, v.content_type, v.fit_mode,
+                                 v.display_duration, v.created_at, v.updated_at, c.name as company_name, c.slug as company_slug
+                          FROM public.video v
+                          LEFT JOIN public.company c ON c.id = v.tenant_id"""
                 if q:
-                    cur.execute(base + " WHERE video_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s", (f"%{q}%", limit, offset))
+                    cur.execute(base + " WHERE v.video_name ILIKE %s ORDER BY v.id DESC LIMIT %s OFFSET %s", (f"%{q}%", limit, offset))
                 else:
-                    cur.execute(base + " ORDER BY id DESC LIMIT %s OFFSET %s", (limit, offset))
-            rows = cur.fetchall()
-    items = [{"id": r[0], "video_name": r[1], "s3_link": r[2], "rotation": r[3],
-              "content_type": r[4], "fit_mode": r[5], "display_duration": r[6],
-              "created_at": r[7], "updated_at": r[8]} for r in rows]
+                    cur.execute(base + " ORDER BY v.id DESC LIMIT %s OFFSET %s", (limit, offset))
+                rows = cur.fetchall()
+                items = [{"id": r[0], "video_name": r[1], "s3_link": r[2], "rotation": r[3],
+                          "content_type": r[4], "fit_mode": r[5], "display_duration": r[6],
+                          "created_at": r[7], "updated_at": r[8],
+                          "company_name": r[9], "company_slug": r[10]} for r in rows]
     return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
 
 @app.put("/video/{video_name}")
