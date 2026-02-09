@@ -796,3 +796,144 @@ def get_my_company_stats(ctx: TenantContext = Depends(require_tenant_context)):
                 cur.execute(f"SELECT COUNT(*) FROM public.{tbl} WHERE tenant_id=%s", (tid,))
                 counts[key] = cur.fetchone()[0]
             return CompanyStatsOut(company_id=tid, slug=c[0], name=c[1], **counts)
+
+
+# ══════════════════════════════════════════════════════════════
+# USER ACTIVITY TRACKING (Platform Admin)
+# ══════════════════════════════════════════════════════════════
+
+@router.get("/user-activity")
+def get_user_activity(
+    days: int = Query(7, ge=1, le=90),
+    company_slug: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    ctx: TenantContext = Depends(require_platform_user),
+):
+    """Get user activity across all companies for platform dashboard."""
+    pg_conn = _get_pg_conn()
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            # ── Recent sessions ──
+            tenant_filter = ""
+            params = [days, limit]
+            if company_slug:
+                tenant_filter = "AND c.slug = %s"
+                params = [days, company_slug, limit]
+
+            cur.execute(f"""
+                SELECT s.id, s.user_id, s.username, s.tenant_id,
+                       c.name as company_name, c.slug as company_slug,
+                       s.login_at, s.logout_at, s.duration_sec, s.is_active
+                FROM public.user_session s
+                LEFT JOIN public.company c ON c.id = s.tenant_id
+                WHERE s.login_at >= NOW() - INTERVAL '%s days' {tenant_filter}
+                ORDER BY s.login_at DESC
+                LIMIT %s;
+            """, params)
+            sessions = []
+            for r in cur.fetchall():
+                sessions.append({
+                    "id": r[0], "user_id": r[1], "username": r[2], "tenant_id": r[3],
+                    "company_name": r[4], "company_slug": r[5],
+                    "login_at": r[6].isoformat() if r[6] else None,
+                    "logout_at": r[7].isoformat() if r[7] else None,
+                    "duration_sec": r[8], "is_active": r[9],
+                })
+
+            # ── Currently active users ──
+            cur.execute("""
+                SELECT s.user_id, s.username, s.tenant_id, c.name as company_name,
+                       s.login_at, s.duration_sec
+                FROM public.user_session s
+                LEFT JOIN public.company c ON c.id = s.tenant_id
+                WHERE s.is_active = TRUE
+                ORDER BY s.login_at DESC;
+            """)
+            active_users = []
+            for r in cur.fetchall():
+                active_users.append({
+                    "user_id": r[0], "username": r[1], "tenant_id": r[2],
+                    "company_name": r[3],
+                    "login_at": r[4].isoformat() if r[4] else None,
+                    "duration_sec": r[5],
+                })
+
+            # ── Page visit summary (top pages in period) ──
+            p2 = [days]
+            if company_slug:
+                p2.append(company_slug)
+            cur.execute(f"""
+                SELECT pv.page, COUNT(*) as visits,
+                       COUNT(DISTINCT pv.user_id) as unique_users,
+                       AVG(pv.duration_sec) FILTER (WHERE pv.duration_sec IS NOT NULL) as avg_duration
+                FROM public.user_page_visit pv
+                LEFT JOIN public.company c ON c.id = pv.tenant_id
+                WHERE pv.visited_at >= NOW() - INTERVAL '%s days'
+                {"AND c.slug = %s" if company_slug else ""}
+                GROUP BY pv.page
+                ORDER BY visits DESC;
+            """, p2)
+            page_stats = []
+            for r in cur.fetchall():
+                page_stats.append({
+                    "page": r[0], "visits": r[1], "unique_users": r[2],
+                    "avg_duration_sec": round(float(r[3]), 1) if r[3] else None,
+                })
+
+            # ── Per-user summary ──
+            p3 = [days, limit]
+            if company_slug:
+                p3 = [days, company_slug, limit]
+            cur.execute(f"""
+                SELECT s.user_id, s.username, s.tenant_id, c.name as company_name,
+                       COUNT(*) as total_sessions,
+                       SUM(COALESCE(s.duration_sec, 0)) as total_duration_sec,
+                       MAX(s.login_at) as last_login,
+                       COUNT(*) FILTER (WHERE s.is_active = TRUE) as active_now
+                FROM public.user_session s
+                LEFT JOIN public.company c ON c.id = s.tenant_id
+                WHERE s.login_at >= NOW() - INTERVAL '%s days'
+                {"AND c.slug = %s" if company_slug else ""}
+                GROUP BY s.user_id, s.username, s.tenant_id, c.name
+                ORDER BY last_login DESC
+                LIMIT %s;
+            """, p3)
+            user_summaries = []
+            for r in cur.fetchall():
+                user_summaries.append({
+                    "user_id": r[0], "username": r[1], "tenant_id": r[2],
+                    "company_name": r[3], "total_sessions": r[4],
+                    "total_duration_sec": r[5],
+                    "last_login": r[6].isoformat() if r[6] else None,
+                    "is_online": r[7] > 0,
+                })
+
+            # ── Daily login counts (for chart) ──
+            p4 = [days]
+            if company_slug:
+                p4.append(company_slug)
+            cur.execute(f"""
+                SELECT DATE(s.login_at) as day, COUNT(*) as logins,
+                       COUNT(DISTINCT s.user_id) as unique_users
+                FROM public.user_session s
+                LEFT JOIN public.company c ON c.id = s.tenant_id
+                WHERE s.login_at >= NOW() - INTERVAL '%s days'
+                {"AND c.slug = %s" if company_slug else ""}
+                GROUP BY DATE(s.login_at)
+                ORDER BY day;
+            """, p4)
+            daily_logins = []
+            for r in cur.fetchall():
+                daily_logins.append({
+                    "date": r[0].isoformat() if r[0] else None,
+                    "logins": r[1], "unique_users": r[2],
+                })
+
+            return {
+                "sessions": sessions,
+                "active_users": active_users,
+                "page_stats": page_stats,
+                "user_summaries": user_summaries,
+                "daily_logins": daily_logins,
+                "period_days": days,
+            }

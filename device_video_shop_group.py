@@ -4310,6 +4310,18 @@ def login(body: UserLoginIn):
 
             # Audit log
             log_audit(conn, tenant_id, user_id, "user.login", "user", user_id)
+
+            # Track user session
+            try:
+                cur.execute("""
+                    INSERT INTO public.user_session (user_id, tenant_id, username, login_at, is_active)
+                    VALUES (%s, %s, %s, NOW(), TRUE) RETURNING id;
+                """, (user_id, tenant_id, username))
+                session_row = cur.fetchone()
+                session_id = session_row[0] if session_row else None
+            except Exception:
+                session_id = None
+
             conn.commit()
 
             result = {
@@ -4321,6 +4333,7 @@ def login(body: UserLoginIn):
                 "permissions": permissions,
                 "user_type": user_type or "company",
                 "must_change_password": must_change_password or False,
+                "session_id": session_id,
             }
 
             # Include company info for company users
@@ -4335,10 +4348,32 @@ def login(body: UserLoginIn):
 
 @app.post("/auth/logout")
 def logout(authorization: Optional[str] = Header(None)):
+    user_id = None
+    tenant_id = None
     if authorization:
         token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
         if token in active_sessions:
+            session_data = active_sessions[token]
+            user_id = session_data.get("user_id")
+            tenant_id = session_data.get("tenant_id")
             del active_sessions[token]
+
+    # Close the most recent active session for this user
+    if user_id:
+        try:
+            with pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE public.user_session
+                        SET logout_at = NOW(), is_active = FALSE,
+                            duration_sec = EXTRACT(EPOCH FROM (NOW() - login_at))::INT
+                        WHERE user_id = %s AND is_active = TRUE
+                        ORDER BY login_at DESC LIMIT 1;
+                    """, (user_id,))
+                    log_audit(conn, tenant_id, user_id, "user.logout", "user", user_id)
+                conn.commit()
+        except Exception:
+            pass
     return {"message": "Logged out successfully"}
 
 @app.get("/auth/me")
@@ -4367,6 +4402,65 @@ def get_current_user_info(user: Dict = Depends(get_current_user)):
             if row[9]:
                 result["company"] = {"id": row[9], "slug": row[11], "name": row[12]}
             return result
+
+
+# ─── User Activity Tracking ─────────────────────────────────
+
+class PageTrackIn(BaseModel):
+    page: str
+    session_id: Optional[int] = None
+    prev_page: Optional[str] = None
+    prev_duration_sec: Optional[int] = None
+
+@app.post("/track/page")
+def track_page_visit(body: PageTrackIn, user: Dict = Depends(get_current_user)):
+    """Track which page/tab a user visits. Called by frontend on navigation."""
+    user_id = user.get("user_id")
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
+    try:
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                # If prev_page duration provided, update the last visit
+                if body.prev_page and body.prev_duration_sec is not None:
+                    cur.execute("""
+                        UPDATE public.user_page_visit
+                        SET duration_sec = %s
+                        WHERE id = (
+                            SELECT id FROM public.user_page_visit
+                            WHERE user_id = %s AND page = %s AND duration_sec IS NULL
+                            ORDER BY visited_at DESC LIMIT 1
+                        );
+                    """, (body.prev_duration_sec, user_id, body.prev_page))
+
+                # Insert new page visit
+                cur.execute("""
+                    INSERT INTO public.user_page_visit (session_id, user_id, tenant_id, page, visited_at)
+                    VALUES (%s, %s, %s, %s, NOW()) RETURNING id;
+                """, (body.session_id, user_id, tenant_id, body.page))
+            conn.commit()
+        return {"ok": True}
+    except Exception:
+        return {"ok": True}  # Never fail silently
+
+
+@app.post("/track/heartbeat")
+def track_heartbeat(user: Dict = Depends(get_current_user)):
+    """Keep user session alive — update last activity timestamp."""
+    user_id = user.get("user_id")
+    try:
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                # Keep session marked active and update duration
+                cur.execute("""
+                    UPDATE public.user_session
+                    SET duration_sec = EXTRACT(EPOCH FROM (NOW() - login_at))::INT
+                    WHERE user_id = %s AND is_active = TRUE;
+                """, (user_id,))
+            conn.commit()
+    except Exception:
+        pass
+    return {"ok": True}
+
 
 @app.get("/users", response_model=UserListOut)
 def list_users(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), user: Dict = Depends(require_permission("manage_users"))):
