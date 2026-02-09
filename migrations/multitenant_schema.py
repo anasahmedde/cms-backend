@@ -672,6 +672,60 @@ def ensure_multitenant_schema(conn):
     """
 
     # ══════════════════════════════════════════════════════════════
+    # 12. AUTO-POPULATE tenant_id TRIGGERS
+    # ══════════════════════════════════════════════════════════════
+    # These triggers automatically copy tenant_id from the device table
+    # into link/assignment rows on INSERT, so application code doesn't
+    # need to pass tenant_id for every link creation.
+    ddl_auto_tenant_triggers = """
+    -- Trigger function: copy tenant_id from device
+    CREATE OR REPLACE FUNCTION fn_auto_tenant_from_device()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF NEW.tenant_id IS NULL OR NEW.tenant_id = 1 THEN
+            SELECT tenant_id INTO NEW.tenant_id
+            FROM public.device WHERE id = NEW.did;
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    -- device_video_shop_group
+    DROP TRIGGER IF EXISTS trg_dvsg_auto_tenant ON public.device_video_shop_group;
+    CREATE TRIGGER trg_dvsg_auto_tenant
+        BEFORE INSERT ON public.device_video_shop_group
+        FOR EACH ROW EXECUTE FUNCTION fn_auto_tenant_from_device();
+
+    -- device_advertisement_shop_group
+    DROP TRIGGER IF EXISTS trg_dasg_auto_tenant ON public.device_advertisement_shop_group;
+    CREATE TRIGGER trg_dasg_auto_tenant
+        BEFORE INSERT ON public.device_advertisement_shop_group
+        FOR EACH ROW EXECUTE FUNCTION fn_auto_tenant_from_device();
+
+    -- device_assignment
+    DROP TRIGGER IF EXISTS trg_da_auto_tenant ON public.device_assignment;
+    CREATE TRIGGER trg_da_auto_tenant
+        BEFORE INSERT ON public.device_assignment
+        FOR EACH ROW EXECUTE FUNCTION fn_auto_tenant_from_device();
+
+    -- Fix any existing rows that have wrong tenant_id (inherit from device)
+    UPDATE public.device_video_shop_group l
+       SET tenant_id = d.tenant_id
+      FROM public.device d
+     WHERE l.did = d.id AND l.tenant_id IS DISTINCT FROM d.tenant_id;
+
+    UPDATE public.device_advertisement_shop_group l
+       SET tenant_id = d.tenant_id
+      FROM public.device d
+     WHERE l.did = d.id AND l.tenant_id IS DISTINCT FROM d.tenant_id;
+
+    UPDATE public.device_assignment l
+       SET tenant_id = d.tenant_id
+      FROM public.device d
+     WHERE l.did = d.id AND l.tenant_id IS DISTINCT FROM d.tenant_id;
+    """
+
+    # ══════════════════════════════════════════════════════════════
     # EXECUTE ALL
     # ══════════════════════════════════════════════════════════════
     with conn.cursor() as cur:
@@ -710,6 +764,7 @@ def ensure_multitenant_schema(conn):
         cur.execute(ddl_seed_platform_roles)
         cur.execute(ddl_migrate_existing_admin)
         cur.execute(ddl_seed_default_company_roles)
+        cur.execute(ddl_auto_tenant_triggers)
 
     conn.commit()
 
