@@ -726,6 +726,44 @@ def ensure_multitenant_schema(conn):
     """
 
     # ══════════════════════════════════════════════════════════════
+    # 13. USER ACTIVITY TRACKING
+    # ══════════════════════════════════════════════════════════════
+    ddl_user_activity = """
+    -- User sessions: tracks login/logout with duration
+    CREATE TABLE IF NOT EXISTS public.user_session (
+        id              BIGSERIAL PRIMARY KEY,
+        user_id         BIGINT NOT NULL,
+        tenant_id       BIGINT,
+        username        VARCHAR(255),
+        login_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        logout_at       TIMESTAMPTZ,
+        duration_sec    INT,
+        ip_address      INET,
+        user_agent      TEXT,
+        is_active       BOOLEAN NOT NULL DEFAULT TRUE
+    );
+    CREATE INDEX IF NOT EXISTS idx_usession_user ON public.user_session(user_id);
+    CREATE INDEX IF NOT EXISTS idx_usession_tenant ON public.user_session(tenant_id);
+    CREATE INDEX IF NOT EXISTS idx_usession_login ON public.user_session(login_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_usession_active ON public.user_session(is_active) WHERE is_active = TRUE;
+
+    -- Page visits: tracks which pages/tabs each user visits
+    CREATE TABLE IF NOT EXISTS public.user_page_visit (
+        id              BIGSERIAL PRIMARY KEY,
+        session_id      BIGINT,
+        user_id         BIGINT NOT NULL,
+        tenant_id       BIGINT,
+        page            VARCHAR(100) NOT NULL,
+        visited_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        duration_sec    INT
+    );
+    CREATE INDEX IF NOT EXISTS idx_upvisit_user ON public.user_page_visit(user_id);
+    CREATE INDEX IF NOT EXISTS idx_upvisit_session ON public.user_page_visit(session_id);
+    CREATE INDEX IF NOT EXISTS idx_upvisit_tenant ON public.user_page_visit(tenant_id);
+    CREATE INDEX IF NOT EXISTS idx_upvisit_visited ON public.user_page_visit(visited_at DESC);
+    """
+
+    # ══════════════════════════════════════════════════════════════
     # EXECUTE ALL
     # ══════════════════════════════════════════════════════════════
     with conn.cursor() as cur:
@@ -765,6 +803,7 @@ def ensure_multitenant_schema(conn):
         cur.execute(ddl_migrate_existing_admin)
         cur.execute(ddl_seed_default_company_roles)
         cur.execute(ddl_auto_tenant_triggers)
+        cur.execute(ddl_user_activity)
 
     conn.commit()
 
