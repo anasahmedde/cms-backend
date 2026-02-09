@@ -4908,20 +4908,43 @@ def set_advertisement_fit_mode(ad_name: str, body: AdvertisementFitModeUpdate):
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/advertisement/{ad_name}")
-def delete_advertisement(ad_name: str):
-    """Delete an advertisement."""
+def delete_advertisement(ad_name: str, force: bool = Query(False)):
+    """Delete an advertisement. Returns 409 with linked info if linked and force=false."""
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM public.advertisement WHERE ad_name = %s RETURNING id;", (ad_name,))
-                rows = cur.fetchall()
-                conn.commit()
-                if not rows:
+                cur.execute("SELECT id FROM public.advertisement WHERE ad_name = %s LIMIT 1;", (ad_name,))
+                row = cur.fetchone()
+                if not row:
                     raise HTTPException(status_code=404, detail="Advertisement not found")
-                return {"deleted_count": len(rows)}
+                aid = row[0]
+
+                linked = {}
+                cur.execute("SELECT COUNT(*) FROM public.device_advertisement_shop_group WHERE aid = %s", (aid,))
+                cnt = cur.fetchone()[0]
+                if cnt: linked["device_links"] = cnt
+                cur.execute("SELECT COUNT(*) FROM public.group_advertisement WHERE aid = %s", (aid,))
+                cnt = cur.fetchone()[0]
+                if cnt: linked["group_links"] = cnt
+
+                if linked and not force:
+                    raise HTTPException(status_code=409, detail={
+                        "message": f"Advertisement '{ad_name}' is linked to other resources. Delete will unlink everything.",
+                        "linked": linked,
+                        "ad_name": ad_name,
+                    })
+
+                unlinked = {}
+                cur.execute("DELETE FROM public.device_advertisement_shop_group WHERE aid = %s", (aid,))
+                if cur.rowcount: unlinked["device_links"] = cur.rowcount
+                cur.execute("DELETE FROM public.group_advertisement WHERE aid = %s", (aid,))
+                if cur.rowcount: unlinked["group_links"] = cur.rowcount
+                cur.execute("DELETE FROM public.advertisement WHERE id = %s RETURNING id;", (aid,))
+                rows = cur.fetchall()
+            conn.commit()
+            return {"deleted_count": len(rows), "unlinked": unlinked}
         except HTTPException:
-            conn.rollback()
-            raise
+            conn.rollback(); raise
         except Exception as e:
             conn.rollback()
             raise HTTPException(status_code=500, detail=str(e))
@@ -5678,11 +5701,31 @@ def standalone_unassign_group_devices(gname: str):
 def standalone_insert_shop(req: StandaloneShopCreate, user: Dict = Depends(get_current_user)):
     tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
     with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO public.shop (shop_name, tenant_id) VALUES (%s, %s) RETURNING id;", (req.shop_name, tenant_id))
-            new_id = cur.fetchone()[0]
-        conn.commit()
-    return {"id": new_id, "message": "Shop inserted successfully"}
+        try:
+            with conn.cursor() as cur:
+                # Try insert, handle any unique violation gracefully
+                cur.execute("""
+                    INSERT INTO public.shop (shop_name, tenant_id) VALUES (%s, %s)
+                    ON CONFLICT DO NOTHING
+                    RETURNING id;
+                """, (req.shop_name, tenant_id))
+                row = cur.fetchone()
+                if row:
+                    new_id = row[0]
+                    conn.commit()
+                    return {"id": new_id, "message": "Shop inserted successfully"}
+                else:
+                    # Already exists - return it
+                    cur.execute("SELECT id FROM public.shop WHERE shop_name = %s AND tenant_id = %s LIMIT 1;", (req.shop_name, tenant_id))
+                    existing = cur.fetchone()
+                    if existing:
+                        return {"id": existing[0], "message": "Shop already exists", "existed": True}
+                    raise HTTPException(status_code=409, detail=f"Shop '{req.shop_name}' already exists")
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail=f"Shop '{req.shop_name}' already exists")
 
 @app.get("/shop/{shop_name}")
 def standalone_get_shop(shop_name: str = Path(...)):
@@ -5856,15 +5899,47 @@ def standalone_update_video(video_name: str, patch: StandaloneVideoUpdate):
             "content_type": row[4], "fit_mode": row[5], "display_duration": row[6], "created_at": row[7], "updated_at": row[8]}}
 
 @app.delete("/video/{video_name}")
-def standalone_delete_video(video_name: str):
+def standalone_delete_video(video_name: str, force: bool = Query(False)):
     with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM public.video WHERE video_name = %s RETURNING id;", (video_name,))
-            deleted = cur.fetchall()
-        conn.commit()
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Video not found")
-    return {"deleted_count": len(deleted)}
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM public.video WHERE video_name = %s LIMIT 1;", (video_name,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="Video not found")
+                vid = row[0]
+
+                # Check what's linked
+                linked = {}
+                cur.execute("SELECT COUNT(*) FROM public.device_video_shop_group WHERE vid = %s", (vid,))
+                cnt = cur.fetchone()[0]
+                if cnt: linked["device_links"] = cnt
+                cur.execute("SELECT COUNT(*) FROM public.group_video WHERE vid = %s", (vid,))
+                cnt = cur.fetchone()[0]
+                if cnt: linked["group_links"] = cnt
+
+                if linked and not force:
+                    raise HTTPException(status_code=409, detail={
+                        "message": f"Video '{video_name}' is linked to other resources. Delete will unlink everything.",
+                        "linked": linked,
+                        "video_name": video_name,
+                    })
+
+                # Unlink first, then delete
+                unlinked = {}
+                cur.execute("DELETE FROM public.device_video_shop_group WHERE vid = %s", (vid,))
+                if cur.rowcount: unlinked["device_links"] = cur.rowcount
+                cur.execute("DELETE FROM public.group_video WHERE vid = %s", (vid,))
+                if cur.rowcount: unlinked["group_links"] = cur.rowcount
+                cur.execute("DELETE FROM public.video WHERE id = %s RETURNING id;", (vid,))
+                deleted = cur.fetchall()
+            conn.commit()
+            return {"deleted_count": len(deleted), "unlinked": unlinked}
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
