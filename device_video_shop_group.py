@@ -794,6 +794,10 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
                         SELECT 1 FROM public.device_video_shop_group l WHERE l.did = da.did
                     )
                 """
+                # Tenant scoping for device_assignment query
+                if tenant_id:
+                    assignment_sql += " AND d.tenant_id = %s"
+                    assignment_params.append(tenant_id)
                 if assignment_where:
                     assignment_sql += " AND " + " AND ".join(assignment_where)
                 assignment_sql += " ORDER BY da.id DESC LIMIT %s OFFSET %s;"
@@ -840,6 +844,10 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
                         SELECT 1 FROM public.device_assignment da WHERE da.did = d.id
                     )
                 """
+                # Tenant scoping for unassigned devices query
+                if tenant_id:
+                    unassigned_sql += " AND d.tenant_id = %s"
+                    unassigned_params.append(tenant_id)
                 if unassigned_where:
                     unassigned_sql += " AND " + " AND ".join(unassigned_where)
                 unassigned_sql += " ORDER BY d.is_online DESC, d.id DESC LIMIT %s OFFSET %s;"
@@ -5486,12 +5494,29 @@ def standalone_insert_device(req: StandaloneDeviceRequest, user: Dict = Depends(
         raise HTTPException(status_code=400, detail="mobile_id is required")
     tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
     with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO public.device (mobile_id, download_status, tenant_id) VALUES (%s, %s, %s) RETURNING id;",
-                        (mobile, bool(req.download_status), tenant_id))
-            new_id = cur.fetchone()[0]
-        conn.commit()
-    return {"id": new_id, "message": "Device inserted successfully"}
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO public.device (mobile_id, download_status, tenant_id) VALUES (%s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    RETURNING id;
+                """, (mobile, bool(req.download_status), tenant_id))
+                row = cur.fetchone()
+                if row:
+                    new_id = row[0]
+                    conn.commit()
+                    return {"id": new_id, "message": "Device inserted successfully"}
+                else:
+                    cur.execute("SELECT id FROM public.device WHERE mobile_id = %s AND tenant_id = %s LIMIT 1;", (mobile, tenant_id))
+                    existing = cur.fetchone()
+                    if existing:
+                        return {"id": existing[0], "message": "Device already exists", "existed": True}
+                    raise HTTPException(status_code=409, detail=f"Device '{mobile}' already exists")
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail=f"Device '{mobile}' already exists")
 
 @app.get("/device/{mobile_id}")
 def standalone_get_device(mobile_id: str = Path(...)):
@@ -5575,22 +5600,66 @@ def standalone_update_device(mobile_id: str, patch: StandaloneDeviceUpdate):
     return {"message": "Device updated", "item": {"id": row[0], "mobile_id": row[1], "download_status": row[2], "created_at": row[3], "updated_at": row[4]}}
 
 @app.delete("/device/{mobile_id}")
-def standalone_delete_device(mobile_id: str):
-    # Check for links first
+def standalone_delete_device(mobile_id: str, force: bool = Query(False)):
     with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id FROM public.device WHERE mobile_id = %s ORDER BY id DESC;", (mobile_id,))
-            device_ids = [r[0] for r in cur.fetchall()]
-            if not device_ids:
-                raise HTTPException(status_code=404, detail="Device not found")
-            cur.execute("SELECT COUNT(*) FROM public.device_video_shop_group WHERE did = ANY(%s::bigint[]);", (device_ids,))
-            linked_count = int(cur.fetchone()[0])
-            if linked_count > 0:
-                raise HTTPException(status_code=409, detail=f"Device '{mobile_id}' has {linked_count} link(s). Remove links first.")
-            cur.execute("DELETE FROM public.device WHERE mobile_id = %s RETURNING id;", (mobile_id,))
-            deleted = cur.fetchall()
-        conn.commit()
-    return {"deleted_count": len(deleted)}
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM public.device WHERE mobile_id = %s ORDER BY id DESC;", (mobile_id,))
+                device_ids = [r[0] for r in cur.fetchall()]
+                if not device_ids:
+                    raise HTTPException(status_code=404, detail="Device not found")
+
+                # Check all FK references
+                linked = {}
+                for tbl, col, label in [
+                    ("device_video_shop_group", "did", "video_links"),
+                    ("device_advertisement_shop_group", "did", "ad_links"),
+                    ("device_assignment", "did", "group_assignments"),
+                    ("device_layout", "did", "layouts"),
+                    ("device_logs", "did", "logs"),
+                ]:
+                    try:
+                        cur.execute(f"SELECT COUNT(*) FROM public.{tbl} WHERE {col} = ANY(%s::bigint[]);", (device_ids,))
+                        cnt = cur.fetchone()[0]
+                        if cnt: linked[label] = cnt
+                    except Exception:
+                        pass
+
+                if linked and not force:
+                    raise HTTPException(status_code=409, detail={
+                        "message": f"Device '{mobile_id}' has linked resources. Use force=true to unlink and delete.",
+                        "linked": linked,
+                        "mobile_id": mobile_id,
+                    })
+
+                # Unlink everything
+                unlinked = {}
+                for tbl, col, label in [
+                    ("device_video_shop_group", "did", "video_links"),
+                    ("device_advertisement_shop_group", "did", "ad_links"),
+                    ("device_assignment", "did", "group_assignments"),
+                    ("device_layout", "did", "layouts"),
+                    ("device_logs", "did", "logs"),
+                    ("device_temperature", "did", "temperatures"),
+                    ("device_online_history", "did", "online_history"),
+                ]:
+                    try:
+                        cur.execute(f"SAVEPOINT sp_{label}")
+                        cur.execute(f"DELETE FROM public.{tbl} WHERE {col} = ANY(%s::bigint[]);", (device_ids,))
+                        if cur.rowcount: unlinked[label] = cur.rowcount
+                        cur.execute(f"RELEASE SAVEPOINT sp_{label}")
+                    except Exception:
+                        cur.execute(f"ROLLBACK TO SAVEPOINT sp_{label}")
+
+                cur.execute("DELETE FROM public.device WHERE mobile_id = %s RETURNING id;", (mobile_id,))
+                deleted = cur.fetchall()
+            conn.commit()
+            return {"deleted_count": len(deleted), "unlinked": unlinked}
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 # ═══════════════ GROUP CRUD ═══════════════
@@ -5599,11 +5668,29 @@ def standalone_delete_device(mobile_id: str):
 def standalone_insert_group(req: StandaloneGroupCreate, user: Dict = Depends(get_current_user)):
     tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
     with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute('INSERT INTO public."group" (gname, tenant_id) VALUES (%s, %s) RETURNING id;', (req.gname, tenant_id))
-            new_id = cur.fetchone()[0]
-        conn.commit()
-    return {"id": new_id, "message": "Group inserted successfully"}
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO public."group" (gname, tenant_id) VALUES (%s, %s)
+                    ON CONFLICT DO NOTHING
+                    RETURNING id;
+                """, (req.gname, tenant_id))
+                row = cur.fetchone()
+                if row:
+                    new_id = row[0]
+                    conn.commit()
+                    return {"id": new_id, "message": "Group inserted successfully"}
+                else:
+                    cur.execute('SELECT id FROM public."group" WHERE gname = %s AND tenant_id = %s LIMIT 1;', (req.gname, tenant_id))
+                    existing = cur.fetchone()
+                    if existing:
+                        return {"id": existing[0], "message": "Group already exists", "existed": True}
+                    raise HTTPException(status_code=409, detail=f"Group '{req.gname}' already exists")
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail=f"Group '{req.gname}' already exists")
 
 @app.get("/group/{gname}")
 def standalone_get_group(gname: str = Path(...)):
@@ -5656,27 +5743,63 @@ def standalone_update_group(gname: str, patch: StandaloneGroupUpdate):
 @app.delete("/group/{gname}")
 def standalone_delete_group(gname: str, force: bool = Query(False)):
     with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (gname,))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Group not found")
-            gid = row[0]
-            # Check device attachments
-            cur.execute("SELECT COUNT(*) FROM public.device_assignment WHERE gid = %s;", (gid,))
-            dev_count = int(cur.fetchone()[0])
-            if dev_count > 0 and not force:
-                raise HTTPException(status_code=409, detail=f"Group has {dev_count} device(s) attached. Use ?force=true to delete.")
-            if force:
-                cur.execute("DELETE FROM public.device_assignment WHERE gid = %s;", (gid,))
-                cur.execute("DELETE FROM public.device_video_shop_group WHERE gid = %s;", (gid,))
-                cur.execute("DELETE FROM public.group_video WHERE gid = %s;", (gid,))
-                cur.execute("DELETE FROM public.group_advertisement WHERE gid = %s;", (gid,))
-            cur.execute("DELETE FROM public.group_video WHERE gid = %s;", (gid,))
-            cur.execute('DELETE FROM public."group" WHERE gname = %s RETURNING id;', (gname,))
-            deleted = cur.fetchall()
-        conn.commit()
-    return {"deleted_count": len(deleted), "devices_unassigned": dev_count if force else 0}
+        try:
+            with conn.cursor() as cur:
+                cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (gname,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="Group not found")
+                gid = row[0]
+
+                # Check all FK references
+                linked = {}
+                for tbl, col, label in [
+                    ("device_assignment", "gid", "device_assignments"),
+                    ("device_video_shop_group", "gid", "video_links"),
+                    ("device_advertisement_shop_group", "gid", "ad_links"),
+                    ("group_video", "gid", "group_videos"),
+                    ("group_advertisement", "gid", "group_ads"),
+                ]:
+                    try:
+                        cur.execute(f"SELECT COUNT(*) FROM public.{tbl} WHERE {col} = %s;", (gid,))
+                        cnt = cur.fetchone()[0]
+                        if cnt: linked[label] = cnt
+                    except Exception:
+                        pass
+
+                if linked and not force:
+                    raise HTTPException(status_code=409, detail={
+                        "message": f"Group '{gname}' has linked resources. Use force=true to unlink and delete.",
+                        "linked": linked,
+                        "gname": gname,
+                    })
+
+                # Unlink everything
+                unlinked = {}
+                for tbl, col, label in [
+                    ("device_video_shop_group", "gid", "video_links"),
+                    ("device_advertisement_shop_group", "gid", "ad_links"),
+                    ("device_assignment", "gid", "device_assignments"),
+                    ("group_video", "gid", "group_videos"),
+                    ("group_advertisement", "gid", "group_ads"),
+                ]:
+                    try:
+                        cur.execute(f"SAVEPOINT sp_{label}")
+                        cur.execute(f"DELETE FROM public.{tbl} WHERE {col} = %s;", (gid,))
+                        if cur.rowcount: unlinked[label] = cur.rowcount
+                        cur.execute(f"RELEASE SAVEPOINT sp_{label}")
+                    except Exception:
+                        cur.execute(f"ROLLBACK TO SAVEPOINT sp_{label}")
+
+                cur.execute('DELETE FROM public."group" WHERE id = %s RETURNING id;', (gid,))
+                deleted = cur.fetchall()
+            conn.commit()
+            return {"deleted_count": len(deleted), "unlinked": unlinked}
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/group/{gname}/unassign-devices")
 def standalone_unassign_group_devices(gname: str):
@@ -5778,15 +5901,59 @@ def standalone_update_shop(shop_name: str, patch: StandaloneShopUpdate):
     return {"message": "Shop updated", "item": {"id": row[0], "shop_name": row[1], "created_at": row[2], "updated_at": row[3]}}
 
 @app.delete("/shop/{shop_name}")
-def standalone_delete_shop(shop_name: str):
+def standalone_delete_shop(shop_name: str, force: bool = Query(False)):
     with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM public.shop WHERE shop_name = %s RETURNING id;", (shop_name,))
-            deleted = cur.fetchall()
-        conn.commit()
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Shop not found")
-    return {"deleted_count": len(deleted)}
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM public.shop WHERE shop_name = %s LIMIT 1;", (shop_name,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="Shop not found")
+                sid = row[0]
+
+                # Check FK references
+                linked = {}
+                for tbl, col, label in [
+                    ("device_video_shop_group", "sid", "video_links"),
+                    ("device_advertisement_shop_group", "sid", "ad_links"),
+                ]:
+                    try:
+                        cur.execute(f"SELECT COUNT(*) FROM public.{tbl} WHERE {col} = %s;", (sid,))
+                        cnt = cur.fetchone()[0]
+                        if cnt: linked[label] = cnt
+                    except Exception:
+                        pass
+
+                if linked and not force:
+                    raise HTTPException(status_code=409, detail={
+                        "message": f"Shop '{shop_name}' is linked to other resources. Use force=true to unlink and delete.",
+                        "linked": linked,
+                        "shop_name": shop_name,
+                    })
+
+                # Unlink
+                unlinked = {}
+                for tbl, col, label in [
+                    ("device_video_shop_group", "sid", "video_links"),
+                    ("device_advertisement_shop_group", "sid", "ad_links"),
+                ]:
+                    try:
+                        cur.execute(f"SAVEPOINT sp_{label}")
+                        cur.execute(f"DELETE FROM public.{tbl} WHERE {col} = %s;", (sid,))
+                        if cur.rowcount: unlinked[label] = cur.rowcount
+                        cur.execute(f"RELEASE SAVEPOINT sp_{label}")
+                    except Exception:
+                        cur.execute(f"ROLLBACK TO SAVEPOINT sp_{label}")
+
+                cur.execute("DELETE FROM public.shop WHERE id = %s RETURNING id;", (sid,))
+                deleted = cur.fetchall()
+            conn.commit()
+            return {"deleted_count": len(deleted), "unlinked": unlinked}
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 # ═══════════════ VIDEO CRUD ═══════════════
