@@ -813,6 +813,18 @@ def get_user_activity(
     pg_conn = _get_pg_conn()
     with pg_conn() as conn:
         with conn.cursor() as cur:
+            # ── Auto-expire stale sessions (no heartbeat in 2 minutes) ──
+            cur.execute("""
+                UPDATE public.user_session
+                SET is_active = FALSE,
+                    logout_at = last_heartbeat,
+                    duration_sec = EXTRACT(EPOCH FROM (last_heartbeat - login_at))::INT
+                WHERE is_active = TRUE
+                  AND last_heartbeat < NOW() - INTERVAL '2 minutes';
+            """)
+            if cur.rowcount > 0:
+                conn.commit()
+
             # ── Recent sessions ──
             tenant_filter = ""
             params = [days, limit]
@@ -858,28 +870,61 @@ def get_user_activity(
                     "duration_sec": r[5],
                 })
 
-            # ── Page visit summary (top pages in period) ──
+            # ── Page visit drill-down: company → user → page ──
             p2 = [days]
             if company_slug:
                 p2.append(company_slug)
             cur.execute(f"""
-                SELECT pv.page, c.name as company_name, c.slug as company_slug,
+                SELECT COALESCE(c.name, 'Platform') as company_name,
+                       COALESCE(c.slug, '_platform') as company_slug,
+                       u.username,
+                       pv.page,
                        COUNT(*) as visits,
-                       COUNT(DISTINCT pv.user_id) as unique_users,
                        AVG(pv.duration_sec) FILTER (WHERE pv.duration_sec IS NOT NULL) as avg_duration
                 FROM public.user_page_visit pv
                 LEFT JOIN public.company c ON c.id = pv.tenant_id
+                LEFT JOIN public.users u ON u.id = pv.user_id
                 WHERE pv.visited_at >= NOW() - INTERVAL '%s days'
                 {"AND c.slug = %s" if company_slug else ""}
-                GROUP BY pv.page, c.name, c.slug
-                ORDER BY visits DESC;
+                GROUP BY c.name, c.slug, u.username, pv.page
+                ORDER BY c.name, u.username, visits DESC;
             """, p2)
-            page_stats = []
+            # Build nested structure: company → users → pages
+            page_drill = {}
             for r in cur.fetchall():
+                cname = r[0] or "Platform"
+                cslug = r[1] or "_platform"
+                uname = r[2] or "unknown"
+                page = r[3]
+                visits = r[4]
+                avg_dur = round(float(r[5]), 1) if r[5] else None
+
+                if cslug not in page_drill:
+                    page_drill[cslug] = {"company_name": cname, "company_slug": cslug, "total_visits": 0, "users": {}}
+                page_drill[cslug]["total_visits"] += visits
+
+                if uname not in page_drill[cslug]["users"]:
+                    page_drill[cslug]["users"][uname] = {"username": uname, "total_visits": 0, "pages": []}
+                page_drill[cslug]["users"][uname]["total_visits"] += visits
+                page_drill[cslug]["users"][uname]["pages"].append({
+                    "page": page, "visits": visits, "avg_duration_sec": avg_dur,
+                })
+
+            # Convert to list format
+            page_stats = []
+            for cslug, cdata in sorted(page_drill.items(), key=lambda x: -x[1]["total_visits"]):
+                users_list = []
+                for uname, udata in sorted(cdata["users"].items(), key=lambda x: -x[1]["total_visits"]):
+                    users_list.append({
+                        "username": udata["username"],
+                        "total_visits": udata["total_visits"],
+                        "pages": udata["pages"],
+                    })
                 page_stats.append({
-                    "page": r[0], "company_name": r[1], "company_slug": r[2],
-                    "visits": r[3], "unique_users": r[4],
-                    "avg_duration_sec": round(float(r[5]), 1) if r[5] else None,
+                    "company_name": cdata["company_name"],
+                    "company_slug": cdata["company_slug"],
+                    "total_visits": cdata["total_visits"],
+                    "users": users_list,
                 })
 
             # ── Per-user summary ──

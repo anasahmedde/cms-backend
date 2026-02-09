@@ -4457,10 +4457,11 @@ def track_heartbeat(user: Dict = Depends(get_current_user)):
     try:
         with pg_conn() as conn:
             with conn.cursor() as cur:
-                # Keep session marked active and update duration
+                # Keep session marked active and update duration + heartbeat
                 cur.execute("""
                     UPDATE public.user_session
-                    SET duration_sec = EXTRACT(EPOCH FROM (NOW() - login_at))::INT
+                    SET duration_sec = EXTRACT(EPOCH FROM (NOW() - login_at))::INT,
+                        last_heartbeat = NOW()
                     WHERE user_id = %s AND is_active = TRUE;
                 """, (user_id,))
             conn.commit()
