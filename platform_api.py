@@ -328,7 +328,7 @@ def reactivate_company(slug: str, ctx: TenantContext = Depends(require_platform_
 
 
 @router.delete("/companies/{slug}")
-def delete_company(slug: str, ctx: TenantContext = Depends(require_platform_user)):
+def delete_company(slug: str, force: bool = Query(False), ctx: TenantContext = Depends(require_platform_user)):
     """Permanently delete a company and ALL its data. Irreversible."""
     if not ctx.has_permission("platform.manage_companies") and not ctx.has_permission("company.full_access"):
         raise HTTPException(status_code=403, detail="Missing platform.manage_companies permission")
@@ -341,6 +341,26 @@ def delete_company(slug: str, ctx: TenantContext = Depends(require_platform_user
                 if not c:
                     raise HTTPException(status_code=404, detail="Company not found")
                 cid = c[0]
+
+                # Count linked resources
+                linked = {}
+                for tbl, col in [("device", "tenant_id"), ("video", "tenant_id"),
+                                  ("advertisement", "tenant_id"), ("shop", "tenant_id"),
+                                  ('"group"', "tenant_id"), ("users", "tenant_id")]:
+                    try:
+                        cur.execute(f"SELECT COUNT(*) FROM public.{tbl} WHERE {col}=%s", (cid,))
+                        cnt = cur.fetchone()[0]
+                        if cnt: linked[tbl.strip('"')] = cnt
+                    except Exception:
+                        pass
+
+                if linked and not force:
+                    raise HTTPException(status_code=409, detail={
+                        "message": f"Company '{c[2]}' has linked resources. Use force to delete everything.",
+                        "linked": linked,
+                        "company_slug": slug,
+                        "company_name": c[2],
+                    })
 
                 # Collect S3 keys before deleting rows
                 s3_keys = []
@@ -368,6 +388,9 @@ def delete_company(slug: str, ctx: TenantContext = Depends(require_platform_user
                     "advertisement",
                     "shop",
                     '"group"',
+                    "users",
+                    "role",
+                    "audit_log",
                 ]
                 counts = {}
                 for tbl in tenant_tables:
@@ -379,18 +402,6 @@ def delete_company(slug: str, ctx: TenantContext = Depends(require_platform_user
                     except Exception:
                         cur.execute("ROLLBACK TO SAVEPOINT sp_del")
                         counts[tbl.strip('"')] = 0
-
-                # Delete users belonging to this company
-                cur.execute("DELETE FROM public.users WHERE tenant_id=%s", (cid,))
-                counts["users"] = cur.rowcount
-
-                # Delete roles for this company
-                cur.execute("DELETE FROM public.role WHERE tenant_id=%s", (cid,))
-                counts["roles"] = cur.rowcount
-
-                # Delete audit logs
-                cur.execute("DELETE FROM public.audit_log WHERE tenant_id=%s", (cid,))
-                counts["audit_log"] = cur.rowcount
 
                 # Invalidate all sessions
                 invalidate_tenant_sessions(cid)

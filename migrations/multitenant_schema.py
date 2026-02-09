@@ -451,6 +451,18 @@ def ensure_multitenant_schema(conn):
     DROP INDEX IF EXISTS dasg_unique_with_gid;
     DROP INDEX IF EXISTS dasg_unique_no_gid;
 
+    -- Drop leftover indexes from previous company_id-based migration attempts
+    DROP INDEX IF EXISTS idx_shop_null_company_name;
+    DROP INDEX IF EXISTS idx_shop_company_name;
+    DROP INDEX IF EXISTS idx_video_null_company_name;
+    DROP INDEX IF EXISTS idx_video_company_name;
+    DROP INDEX IF EXISTS idx_group_null_company_name;
+    DROP INDEX IF EXISTS idx_group_company_name;
+    DROP INDEX IF EXISTS idx_device_null_company_name;
+    DROP INDEX IF EXISTS idx_device_company_name;
+    DROP INDEX IF EXISTS idx_advertisement_null_company_name;
+    DROP INDEX IF EXISTS idx_advertisement_company_name;
+
     -- Create new composite unique indexes (per-tenant)
     CREATE UNIQUE INDEX IF NOT EXISTS idx_device_tenant_mobile
         ON public.device(tenant_id, mobile_id);
