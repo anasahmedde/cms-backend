@@ -863,21 +863,23 @@ def get_user_activity(
             if company_slug:
                 p2.append(company_slug)
             cur.execute(f"""
-                SELECT pv.page, COUNT(*) as visits,
+                SELECT pv.page, c.name as company_name, c.slug as company_slug,
+                       COUNT(*) as visits,
                        COUNT(DISTINCT pv.user_id) as unique_users,
                        AVG(pv.duration_sec) FILTER (WHERE pv.duration_sec IS NOT NULL) as avg_duration
                 FROM public.user_page_visit pv
                 LEFT JOIN public.company c ON c.id = pv.tenant_id
                 WHERE pv.visited_at >= NOW() - INTERVAL '%s days'
                 {"AND c.slug = %s" if company_slug else ""}
-                GROUP BY pv.page
+                GROUP BY pv.page, c.name, c.slug
                 ORDER BY visits DESC;
             """, p2)
             page_stats = []
             for r in cur.fetchall():
                 page_stats.append({
-                    "page": r[0], "visits": r[1], "unique_users": r[2],
-                    "avg_duration_sec": round(float(r[3]), 1) if r[3] else None,
+                    "page": r[0], "company_name": r[1], "company_slug": r[2],
+                    "visits": r[3], "unique_users": r[4],
+                    "avg_duration_sec": round(float(r[5]), 1) if r[5] else None,
                 })
 
             # ── Per-user summary ──

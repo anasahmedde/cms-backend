@@ -4313,6 +4313,13 @@ def login(body: UserLoginIn):
 
             # Track user session
             try:
+                # Close any stale active sessions for this user first
+                cur.execute("""
+                    UPDATE public.user_session
+                    SET is_active = FALSE, logout_at = NOW(),
+                        duration_sec = EXTRACT(EPOCH FROM (NOW() - login_at))::INT
+                    WHERE user_id = %s AND is_active = TRUE;
+                """, (user_id,))
                 cur.execute("""
                     INSERT INTO public.user_session (user_id, tenant_id, username, login_at, is_active)
                     VALUES (%s, %s, %s, NOW(), TRUE) RETURNING id;
