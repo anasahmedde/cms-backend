@@ -4452,16 +4452,45 @@ def track_page_visit(body: PageTrackIn, user: Dict = Depends(get_current_user)):
 
 @app.post("/track/heartbeat")
 def track_heartbeat(user: Dict = Depends(get_current_user)):
-    """Keep user session alive — update last activity timestamp."""
+    """Keep user session alive — update last activity timestamp.
+    Also re-creates session if none active (e.g. after page reload)."""
     user_id = user.get("user_id")
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
+    username = user.get("username")
     try:
         with pg_conn() as conn:
             with conn.cursor() as cur:
-                # Keep session marked active and update duration + heartbeat
+                # Try to update existing active session
                 cur.execute("""
                     UPDATE public.user_session
                     SET duration_sec = EXTRACT(EPOCH FROM (NOW() - login_at))::INT,
                         last_heartbeat = NOW()
+                    WHERE user_id = %s AND is_active = TRUE;
+                """, (user_id,))
+                if cur.rowcount == 0:
+                    # No active session — create one (page was reloaded)
+                    cur.execute("""
+                        INSERT INTO public.user_session (user_id, tenant_id, username, login_at, is_active, last_heartbeat)
+                        VALUES (%s, %s, %s, NOW(), TRUE, NOW()) RETURNING id;
+                    """, (user_id, tenant_id, username))
+            conn.commit()
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+@app.post("/track/unload")
+def track_unload(user: Dict = Depends(get_current_user)):
+    """Called on beforeunload — marks DB session inactive but does NOT delete auth token.
+    This way page reloads still work. The heartbeat timeout (2 min) is a fallback."""
+    user_id = user.get("user_id")
+    try:
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE public.user_session
+                    SET is_active = FALSE, logout_at = NOW(),
+                        duration_sec = EXTRACT(EPOCH FROM (NOW() - login_at))::INT
                     WHERE user_id = %s AND is_active = TRUE;
                 """, (user_id,))
             conn.commit()
