@@ -1,3 +1,4 @@
+# Existing
 fastapi==0.109.0
 uvicorn[standard]==0.27.0
 psycopg2-binary==2.9.9
@@ -5,3 +6,7 @@ boto3==1.34.0
 python-dotenv==1.0.0
 pydantic==2.5.0
 python-multipart==0.0.6
+
+# NEW - Add these
+asyncpg==0.29.0
+websockets==12.0
