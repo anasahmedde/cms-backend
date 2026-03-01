@@ -412,7 +412,10 @@ def set_company_expiration(
     """
     Set expiration date for a company.
     Platform admin only.
+    If the new expiration causes the company to be expired, all users will be logged out.
     """
+    from tenant_context import invalidate_tenant_sessions
+    
     with pg_conn() as conn:
         with conn.cursor() as cur:
             # Get current values
@@ -426,7 +429,7 @@ def set_company_expiration(
             old_expires_at, old_status, company_name = row
             
             # Calculate new status
-            new_status, _, _, _ = calculate_expiration_status(body.expires_at, body.grace_period_days, None)
+            new_status, new_accessible, _, _ = calculate_expiration_status(body.expires_at, body.grace_period_days, None)
             
             # Update company
             cur.execute("""
@@ -455,13 +458,20 @@ def set_company_expiration(
             
         conn.commit()
     
+    # If the new status makes the company inaccessible, logout all users
+    message = f"Expiration set for {company_name}"
+    if not new_accessible:
+        invalidate_tenant_sessions(company_id)
+        message += " - All users have been logged out"
+    
     return {
         "company_id": company_id,
         "company_name": company_name,
         "expires_at": result[0],
         "expiration_status": result[1],
         "grace_period_days": result[2],
-        "message": f"Expiration set for {company_name}"
+        "users_logged_out": not new_accessible,
+        "message": message
     }
 
 
@@ -597,7 +607,10 @@ def suspend_company(
     """
     Manually suspend a company (immediate block, regardless of expiration).
     Platform admin only.
+    All users of the company will be immediately logged out.
     """
+    from tenant_context import invalidate_tenant_sessions
+    
     with pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -618,11 +631,11 @@ def suspend_company(
                 WHERE id = %s;
             """, (body.reason, company_id))
             
-            # Invalidate all sessions for this company's users
+            # Count affected users
             cur.execute("""
-                SELECT id FROM public.users WHERE tenant_id = %s;
+                SELECT COUNT(*) FROM public.users WHERE tenant_id = %s;
             """, (company_id,))
-            user_ids = [r[0] for r in cur.fetchall()]
+            user_count = cur.fetchone()[0]
             
             log_expiration_event(
                 cur, company_id, "suspended",
@@ -632,13 +645,16 @@ def suspend_company(
             
         conn.commit()
     
+    # Immediately invalidate all sessions for this company's users
+    invalidate_tenant_sessions(company_id)
+    
     return {
         "company_id": company_id,
         "company_name": company_name,
         "expiration_status": "suspended",
         "reason": body.reason,
-        "affected_users": len(user_ids),
-        "message": f"{company_name} has been suspended"
+        "affected_users": user_count,
+        "message": f"{company_name} has been suspended. {user_count} user(s) have been logged out."
     }
 
 
