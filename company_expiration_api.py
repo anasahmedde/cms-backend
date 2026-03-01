@@ -22,7 +22,7 @@ from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel, Field
 
 from database import pg_conn
-from tenant_context import get_current_user, require_platform_user, log_audit, TenantContext
+from tenant_context import get_current_user, require_platform_user, require_tenant_context, log_audit, TenantContext
 
 router = APIRouter()
 
@@ -192,6 +192,77 @@ def get_company_access_status(company_id: int):
     This endpoint doesn't require authentication - used by login flow.
     """
     return check_company_access(company_id)
+
+
+@router.get("/company/expiration-status")
+def get_my_company_expiration_status(user: TenantContext = Depends(require_tenant_context)):
+    """
+    Get expiration status for the currently logged-in user's company.
+    Used by frontend to show warning banners to company users.
+    
+    Returns:
+        - status: active, grace_period, expired, suspended
+        - days_remaining: days until expiration (if active) or days of grace left (if grace_period)
+        - expires_at: expiration date
+        - message: human-readable message
+    """
+    tenant_id = user.tenant_id
+    if not tenant_id:
+        # Platform user or no company - return "active" with no expiration
+        return {
+            "status": "active",
+            "days_remaining": None,
+            "expires_at": None,
+            "message": None
+        }
+    
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT expires_at, grace_period_days, suspended_at, name
+                FROM public.company WHERE id = %s;
+            """, (tenant_id,))
+            row = cur.fetchone()
+            
+            if not row:
+                return {
+                    "status": "active",
+                    "days_remaining": None,
+                    "expires_at": None,
+                    "message": None
+                }
+            
+            expires_at, grace_days, suspended_at, company_name = row
+            effective_grace = grace_days if grace_days is not None else 7
+            
+            status, accessible, days_until, days_since = calculate_expiration_status(
+                expires_at, effective_grace, suspended_at
+            )
+            
+            # Calculate days_remaining based on status
+            if status == "active" and days_until is not None:
+                days_remaining = days_until
+                message = f"Your subscription expires in {days_until} days" if days_until <= 30 else None
+            elif status == "grace_period":
+                days_remaining = effective_grace - (days_since or 0)
+                message = f"Your subscription has expired. You have {days_remaining} days remaining in the grace period."
+            elif status == "expired":
+                days_remaining = None
+                message = "Your subscription has expired. Please contact your administrator."
+            elif status == "suspended":
+                days_remaining = None
+                message = "Your company account has been suspended. Please contact your administrator."
+            else:
+                days_remaining = None
+                message = None
+            
+            return {
+                "status": status,
+                "days_remaining": days_remaining,
+                "expires_at": expires_at.isoformat() if expires_at else None,
+                "message": message,
+                "company_name": company_name
+            }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
