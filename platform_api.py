@@ -578,6 +578,9 @@ class PlatformDashboardOut(BaseModel):
     active_companies: int
     suspended_companies: int
     trial_companies: int
+    expired_companies: int
+    expiring_soon_companies: int
+    grace_period_companies: int
     total_devices: int
     online_devices: int
     offline_devices: int
@@ -588,26 +591,98 @@ class PlatformDashboardOut(BaseModel):
     total_shops: int
     total_storage_used_mb: float
     companies: list  # per-company breakdown
+    expiring_companies: list  # companies expiring soon
+    expired_companies_list: list  # expired companies
+    notifications: list  # notification alerts
 
 
 @router.get("/dashboard", response_model=PlatformDashboardOut)
 def platform_dashboard(ctx: TenantContext = Depends(require_platform_user)):
     """Aggregated platform dashboard with per-company breakdown."""
+    from company_expiration_api import calculate_expiration_status
+    from datetime import datetime, timezone
+    
     pg_conn = _get_pg_conn()
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            # Global company counts by status
+            # Get all companies with expiration data for proper counting
             cur.execute("""
-                SELECT
-                    COUNT(*) AS total,
-                    COUNT(*) FILTER (WHERE status='active') AS active,
-                    COUNT(*) FILTER (WHERE status='suspended') AS suspended,
-                    COUNT(*) FILTER (WHERE status='trial') AS trial
+                SELECT id, slug, name, status, expires_at, grace_period_days, suspended_at
                 FROM public.company
             """)
-            r = cur.fetchone()
-            totals = dict(total_companies=r[0], active_companies=r[1],
-                          suspended_companies=r[2], trial_companies=r[3])
+            all_companies = cur.fetchall()
+            
+            # Calculate actual expiration status for each company
+            now = datetime.now(timezone.utc)
+            active_count = 0
+            suspended_count = 0
+            trial_count = 0
+            expired_count = 0
+            grace_period_count = 0
+            expiring_soon_count = 0
+            expiring_soon_list = []
+            expired_list = []
+            
+            for comp in all_companies:
+                cid, slug, name, db_status, expires_at, grace_days, suspended_at = comp
+                effective_grace = grace_days if grace_days is not None else 7
+                
+                calc_status, accessible, days_until, days_since = calculate_expiration_status(
+                    expires_at, effective_grace, suspended_at
+                )
+                
+                if db_status == 'trial':
+                    trial_count += 1
+                elif calc_status == 'suspended':
+                    suspended_count += 1
+                elif calc_status == 'expired':
+                    expired_count += 1
+                    expired_list.append({
+                        "company_id": cid,
+                        "company_name": name,
+                        "slug": slug,
+                        "expires_at": expires_at.isoformat() if expires_at else None,
+                        "days_since_expiration": days_since
+                    })
+                elif calc_status == 'grace_period':
+                    grace_period_count += 1
+                    # Also count as expiring soon since it's critical
+                    expiring_soon_count += 1
+                    expiring_soon_list.append({
+                        "company_id": cid,
+                        "company_name": name,
+                        "slug": slug,
+                        "expires_at": expires_at.isoformat() if expires_at else None,
+                        "days_until_expiration": 0,
+                        "status": "grace_period",
+                        "days_remaining": effective_grace - (days_since or 0)
+                    })
+                else:
+                    active_count += 1
+                    # Check if expiring in next 30 days
+                    if days_until is not None and days_until <= 30:
+                        expiring_soon_count += 1
+                        expiring_soon_list.append({
+                            "company_id": cid,
+                            "company_name": name,
+                            "slug": slug,
+                            "expires_at": expires_at.isoformat() if expires_at else None,
+                            "days_until_expiration": days_until,
+                            "status": "expiring"
+                        })
+            
+            # Sort expiring soon by days remaining
+            expiring_soon_list.sort(key=lambda x: x.get("days_until_expiration", 999))
+            
+            totals = {
+                "total_companies": len(all_companies),
+                "active_companies": active_count,
+                "suspended_companies": suspended_count,
+                "trial_companies": trial_count,
+                "expired_companies": expired_count,
+                "grace_period_companies": grace_period_count,
+                "expiring_soon_companies": expiring_soon_count
+            }
 
             # Global device counts
             cur.execute("""
@@ -640,11 +715,11 @@ def platform_dashboard(ctx: TenantContext = Depends(require_platform_user)):
             # Rough estimate: avg 50MB per video, 5MB per ad
             totals["total_storage_used_mb"] = round(vid_count * 50 + ad_count * 5, 1)
 
-            # Per-company breakdown
+            # Per-company breakdown with expiration data
             cur.execute("""
                 SELECT
                     c.id, c.slug, c.name, c.status, c.max_devices, c.max_users,
-                    c.max_storage_mb, c.created_at,
+                    c.max_storage_mb, c.created_at, c.expires_at, c.grace_period_days, c.suspended_at,
                     COALESCE(d.total, 0)   AS device_count,
                     COALESCE(d.online, 0)  AS devices_online,
                     COALESCE(d.offline, 0) AS devices_offline,
@@ -669,14 +744,60 @@ def platform_dashboard(ctx: TenantContext = Depends(require_platform_user)):
             """)
             companies = []
             for row in cur.fetchall():
+                expires_at = row[8]
+                grace_days = row[9] if row[9] is not None else 7
+                suspended_at = row[10]
+                
+                calc_status, accessible, days_until, days_since = calculate_expiration_status(
+                    expires_at, grace_days, suspended_at
+                )
+                
                 companies.append({
                     "id": row[0], "slug": row[1], "name": row[2], "status": row[3],
                     "max_devices": row[4], "max_users": row[5], "max_storage_mb": row[6],
                     "created_at": str(row[7]),
-                    "device_count": row[8], "devices_online": row[9], "devices_offline": row[10],
-                    "video_count": row[11], "ad_count": row[12], "user_count": row[13],
-                    "group_count": row[14], "shop_count": row[15],
+                    "expires_at": expires_at.isoformat() if expires_at else None,
+                    "expiration_status": calc_status,
+                    "days_until_expiration": days_until,
+                    "days_since_expiration": days_since,
+                    "device_count": row[11], "devices_online": row[12], "devices_offline": row[13],
+                    "video_count": row[14], "ad_count": row[15], "user_count": row[16],
+                    "group_count": row[17], "shop_count": row[18],
                 })
+
+            # Build notifications list
+            notifications = []
+            if expired_count > 0:
+                notifications.append({
+                    "type": "error",
+                    "title": f"{expired_count} Company{'ies' if expired_count > 1 else ''} Expired",
+                    "message": "Users cannot login and devices are blocked",
+                    "count": expired_count,
+                    "action": "expired"
+                })
+            if grace_period_count > 0:
+                notifications.append({
+                    "type": "warning",
+                    "title": f"{grace_period_count} Company{'ies' if grace_period_count > 1 else ''} in Grace Period",
+                    "message": "Will expire soon if not renewed",
+                    "count": grace_period_count,
+                    "action": "expiring"
+                })
+            critical_expiring = len([c for c in expiring_soon_list if c.get("days_until_expiration", 999) <= 7])
+            if critical_expiring > 0:
+                notifications.append({
+                    "type": "warning",
+                    "title": f"{critical_expiring} Company{'ies' if critical_expiring > 1 else ''} Expiring in 7 days",
+                    "message": "Contact companies to renew subscriptions",
+                    "count": critical_expiring,
+                    "action": "expiring"
+                })
+
+    totals["companies"] = companies
+    totals["expiring_companies"] = expiring_soon_list
+    totals["expired_companies_list"] = expired_list
+    totals["notifications"] = notifications
+    return totals
 
             totals["companies"] = companies
             return totals
