@@ -217,7 +217,7 @@ def create_company(body: CompanyCreateIn, ctx: TenantContext = Depends(require_p
             raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/companies", response_model=CompanyListOut)
+@router.get("/companies")
 def list_companies(
     status: Optional[str] = Query(None),
     q: Optional[str] = Query(None),
@@ -225,23 +225,109 @@ def list_companies(
     offset: int = Query(0, ge=0),
     ctx: TenantContext = Depends(require_platform_user),
 ):
+    """
+    List companies with device counts, user counts, and expiration data.
+    Returns enriched company data for the platform admin dashboard.
+    """
+    from datetime import datetime, timezone
+    
     pg_conn = _get_pg_conn()
     with pg_conn() as conn:
         with conn.cursor() as cur:
             wheres, params = [], []
             if status:
-                wheres.append("status = %s"); params.append(status)
+                wheres.append("c.status = %s"); params.append(status)
             if q:
-                wheres.append("(name ILIKE %s OR slug ILIKE %s OR email ILIKE %s)")
+                wheres.append("(c.name ILIKE %s OR c.slug ILIKE %s OR c.email ILIKE %s)")
                 params.extend([f"%{q}%"] * 3)
             where_sql = f"WHERE {' AND '.join(wheres)}" if wheres else ""
 
-            cur.execute(f"SELECT COUNT(*) FROM public.company {where_sql};", params)
+            cur.execute(f"SELECT COUNT(*) FROM public.company c {where_sql};", params)
             total = cur.fetchone()[0]
 
-            cur.execute(f"SELECT {COMPANY_COLUMNS} FROM public.company {where_sql} ORDER BY created_at DESC LIMIT %s OFFSET %s",
-                        params + [limit, offset])
-            return CompanyListOut(items=[_row_to_company(r) for r in cur.fetchall()], total=total)
+            # Query with device counts, user counts, and expiration data
+            cur.execute(f"""
+                SELECT 
+                    c.id, c.slug, c.name, c.email, c.phone, c.address, c.logo_s3_key,
+                    c.max_devices, c.max_users, c.max_storage_mb, c.status, c.trial_ends_at,
+                    c.primary_color, c.accent_color, c.created_at, c.updated_at,
+                    -- Expiration fields
+                    c.expires_at,
+                    c.grace_period_days,
+                    c.expiration_status,
+                    c.suspended_at,
+                    -- Device counts (subqueries for proper aggregation)
+                    COALESCE((SELECT COUNT(*) FROM public.device d WHERE d.tenant_id = c.id), 0) as device_count,
+                    COALESCE((SELECT COUNT(*) FROM public.device d WHERE d.tenant_id = c.id AND d.is_online = TRUE), 0) as devices_online,
+                    COALESCE((SELECT COUNT(*) FROM public.device d WHERE d.tenant_id = c.id AND d.is_online = FALSE), 0) as devices_offline,
+                    -- User count
+                    COALESCE((SELECT COUNT(*) FROM public.users u WHERE u.tenant_id = c.id), 0) as user_count
+                FROM public.company c
+                {where_sql}
+                ORDER BY c.created_at DESC
+                LIMIT %s OFFSET %s
+            """, params + [limit, offset])
+            
+            items = []
+            now = datetime.now(timezone.utc)
+            
+            for r in cur.fetchall():
+                # Basic fields
+                item = {
+                    "id": r[0], "slug": r[1], "name": r[2], "email": r[3], "phone": r[4],
+                    "address": r[5], "logo_s3_key": r[6], "max_devices": r[7], "max_users": r[8],
+                    "max_storage_mb": r[9], "status": r[10], "trial_ends_at": r[11].isoformat() if r[11] else None,
+                    "primary_color": r[12], "accent_color": r[13], 
+                    "created_at": r[14].isoformat() if r[14] else None, 
+                    "updated_at": r[15].isoformat() if r[15] else None,
+                    # Expiration fields
+                    "expires_at": r[16].isoformat() if r[16] else None,
+                    "grace_period_days": r[17] or 7,
+                    # Device counts
+                    "device_count": r[20] or 0,
+                    "devices_online": r[21] or 0,
+                    "devices_offline": r[22] or 0,
+                    # User count
+                    "user_count": r[23] or 0,
+                }
+                
+                # Calculate expiration status and days
+                expires_at = r[16]
+                grace_period_days = r[17] or 7
+                suspended_at = r[19]
+                
+                if suspended_at:
+                    item["expiration_status"] = "suspended"
+                    item["days_until_expiration"] = None
+                    item["days_since_expiration"] = None
+                elif not expires_at:
+                    item["expiration_status"] = "active"
+                    item["days_until_expiration"] = None
+                    item["days_since_expiration"] = None
+                else:
+                    # Make expires_at timezone-aware if needed
+                    exp_dt = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+                    
+                    if now < exp_dt:
+                        # Not expired yet
+                        days_until = (exp_dt - now).days
+                        item["expiration_status"] = "active"
+                        item["days_until_expiration"] = days_until
+                        item["days_since_expiration"] = None
+                    else:
+                        # Past expiration date
+                        days_since = (now - exp_dt).days
+                        item["days_since_expiration"] = days_since
+                        item["days_until_expiration"] = None
+                        
+                        if days_since <= grace_period_days:
+                            item["expiration_status"] = "grace_period"
+                        else:
+                            item["expiration_status"] = "expired"
+                
+                items.append(item)
+            
+            return {"items": items, "total": total}
 
 
 @router.get("/companies/{slug}", response_model=CompanyOut)
