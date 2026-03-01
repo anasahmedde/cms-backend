@@ -146,8 +146,10 @@ def check_company_access(company_id: int) -> dict:
                 return {"accessible": False, "status": "not_found", "message": "Company not found"}
             
             expires_at, grace_days, suspended_at, suspension_reason, company_name = row
+            # Use 0 as default if grace_days is None, not 7
+            effective_grace_days = grace_days if grace_days is not None else 7
             status, accessible, days_until, days_since = calculate_expiration_status(
-                expires_at, grace_days or 7, suspended_at
+                expires_at, effective_grace_days, suspended_at
             )
             
             if status == "suspended":
@@ -170,8 +172,8 @@ def check_company_access(company_id: int) -> dict:
                 return {
                     "accessible": True,
                     "status": "grace_period",
-                    "message": f"Warning: Company subscription expired {days_since} days ago. Grace period ends in {grace_days - days_since} days.",
-                    "days_remaining": grace_days - days_since
+                    "message": f"Warning: Company subscription expired {days_since} days ago. Grace period ends in {effective_grace_days - days_since} days.",
+                    "days_remaining": effective_grace_days - days_since
                 }
             
             # Active
@@ -231,7 +233,7 @@ def list_companies_expiration(
         
         # Calculate actual status
         actual_status, is_accessible, days_until, days_since = calculate_expiration_status(
-            expires_at, grace_days or 7, suspended_at
+            expires_at, grace_days if grace_days is not None else 7, suspended_at
         )
         
         # Update status in DB if changed
@@ -254,7 +256,7 @@ def list_companies_expiration(
             company_slug=slug,
             expires_at=expires_at,
             expiration_status=actual_status,
-            grace_period_days=grace_days or 7,
+            grace_period_days=grace_days if grace_days is not None else 7,
             days_until_expiration=days_until,
             days_since_expiration=days_since,
             is_accessible=is_accessible,
@@ -306,7 +308,7 @@ def list_companies_expiring_soon(
         cid, name, slug, expires_at, exp_status, grace_days, suspended_at, dev_count, usr_count = row
         
         actual_status, is_accessible, days_until, days_since = calculate_expiration_status(
-            expires_at, grace_days or 7, suspended_at
+            expires_at, grace_days if grace_days is not None else 7, suspended_at
         )
         
         result.append(CompanyExpirationOut(
@@ -315,7 +317,7 @@ def list_companies_expiring_soon(
             company_slug=slug,
             expires_at=expires_at,
             expiration_status=actual_status,
-            grace_period_days=grace_days or 7,
+            grace_period_days=grace_days if grace_days is not None else 7,
             days_until_expiration=days_until,
             days_since_expiration=days_since,
             is_accessible=is_accessible,
@@ -426,7 +428,7 @@ def extend_company_expiration(
                 # Expired or no expiration - extend from today
                 new_expires_at = now + timedelta(days=body.extend_days)
             
-            new_status, _, _, _ = calculate_expiration_status(new_expires_at, grace_days or 7, None)
+            new_status, _, _, _ = calculate_expiration_status(new_expires_at, grace_days if grace_days is not None else 7, None)
             
             cur.execute("""
                 UPDATE public.company 
@@ -603,7 +605,7 @@ def reactivate_company(
                 # Default: extend 30 days from now
                 new_expires_at = now + timedelta(days=30)
             
-            new_status, _, _, _ = calculate_expiration_status(new_expires_at, grace_days or 7, None)
+            new_status, _, _, _ = calculate_expiration_status(new_expires_at, grace_days if grace_days is not None else 7, None)
             
             cur.execute("""
                 UPDATE public.company 
