@@ -218,11 +218,12 @@ async def shutdown_event():
 
 # Include routers
 app.include_router(ws_router, tags=["WebSocket"])
+# NEW: Include company expiration router FIRST (has /platform/companies/expiration routes)
+# Must be before platform_router to avoid route conflicts
+app.include_router(company_expiration_router, tags=["Company Expiration"])
 app.include_router(platform_router, prefix="/platform", tags=["Platform"])
 # NEW: Include client requirements router
 app.include_router(client_requirements_router, tags=["Client Requirements"])
-# NEW: Include company expiration router
-app.include_router(company_expiration_router, tags=["Company Expiration"])
 
 
 # ===========================================================
