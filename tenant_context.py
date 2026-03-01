@@ -137,6 +137,8 @@ def get_tenant_context(authorization: Optional[str] = Header(None)) -> TenantCon
     """
     FastAPI dependency: resolves the authenticated user + tenant context.
     Replaces the old get_current_user().
+    
+    Also checks company expiration - if company is expired, the user is logged out.
     """
     if not authorization:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -151,6 +153,30 @@ def get_tenant_context(authorization: Optional[str] = Header(None)) -> TenantCon
     if datetime.now() > session.get("expires_at", datetime.min):
         del active_sessions[token]
         raise HTTPException(status_code=401, detail="Token expired")
+
+    # Check company expiration for company users (not platform users)
+    tenant_id = session.get("tenant_id")
+    user_type = session.get("user_type", "company")
+    is_impersonating = session.get("is_impersonating", False)
+    
+    # Only check for company users, not platform users (unless impersonating)
+    if user_type == "company" and tenant_id and not is_impersonating:
+        from company_expiration_api import check_company_access
+        company_access = check_company_access(tenant_id)
+        if not company_access.get("accessible", True):
+            # Company is expired/suspended - invalidate session and force logout
+            del active_sessions[token]
+            status = company_access.get("status", "expired")
+            if status == "suspended":
+                raise HTTPException(
+                    status_code=403, 
+                    detail="Company account suspended. You have been logged out. Contact administrator."
+                )
+            else:
+                raise HTTPException(
+                    status_code=403, 
+                    detail="Company subscription expired. You have been logged out. Contact administrator to renew."
+                )
 
     return TenantContext(
         user_id=session["user_id"],
