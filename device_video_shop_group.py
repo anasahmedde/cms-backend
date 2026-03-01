@@ -5919,6 +5919,15 @@ def standalone_list_devices(
     offset: int = Query(0, ge=0),
     user: Dict = Depends(get_current_user),
 ):
+    """
+    List devices with enhanced status information:
+    - is_online: Whether device is currently online
+    - last_online_at: Last time device reported online
+    - temperature: Last reported temperature
+    - content_status: 'synced' | 'syncing' | 'pending' | 'unknown'
+    - video_count: Number of videos assigned to device
+    - downloaded_count: Number of videos downloaded on device
+    """
     tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
@@ -5933,10 +5942,18 @@ def standalone_list_devices(
                 cur.execute(f"SELECT COUNT(*) FROM public.device d WHERE {tenant_filter};", tenant_params)
             total = int(cur.fetchone()[0])
 
+            # Enhanced query with online status, temperature, and content counts
             base_sql = f"""
                 SELECT d.id, d.mobile_id, d.download_status, d.created_at, d.updated_at,
                        d.resolution, d.device_name,
-                       COALESCE(g1.gname, g2.gname) as group_name, d.is_active
+                       COALESCE(g1.gname, g2.gname) as group_name, d.is_active,
+                       d.is_online, d.last_online_at, d.temperature,
+                       -- Count assigned videos
+                       COALESCE(vc.video_count, 0) as video_count,
+                       -- Count downloaded videos (from download_progress JSON if available)
+                       COALESCE(dc.downloaded_count, 0) as downloaded_count,
+                       -- Last content update time
+                       COALESCE(lc.last_content_update, d.updated_at) as last_content_update
                 FROM public.device d
                 LEFT JOIN public.device_assignment da ON da.did = d.id
                 LEFT JOIN public."group" g1 ON g1.id = da.gid
@@ -5946,6 +5963,25 @@ def standalone_list_devices(
                     JOIN public."group" g ON g.id = dvsg.gid
                     WHERE dvsg.gid IS NOT NULL
                 ) g2 ON g2.did = d.id AND g1.gname IS NULL
+                -- Video count subquery
+                LEFT JOIN (
+                    SELECT did, COUNT(DISTINCT vid) as video_count
+                    FROM public.device_video_shop_group
+                    GROUP BY did
+                ) vc ON vc.did = d.id
+                -- Downloaded count (estimate from download_status)
+                LEFT JOIN (
+                    SELECT did, COUNT(*) as downloaded_count
+                    FROM public.device_video_shop_group
+                    WHERE vid IS NOT NULL
+                    GROUP BY did
+                ) dc ON dc.did = d.id AND d.download_status = TRUE
+                -- Last content update
+                LEFT JOIN (
+                    SELECT did, MAX(updated_at) as last_content_update
+                    FROM public.device_video_shop_group
+                    GROUP BY did
+                ) lc ON lc.did = d.id
                 WHERE {tenant_filter}
             """
             if q:
@@ -5955,13 +5991,50 @@ def standalone_list_devices(
                 cur.execute(base_sql + " ORDER BY d.id DESC LIMIT %s OFFSET %s;", tenant_params + [limit, offset])
             rows = cur.fetchall()
 
-    items = [
-        {"id": r[0], "mobile_id": r[1], "download_status": r[2], "created_at": r[3], "updated_at": r[4],
-         "resolution": r[5] if len(r) > 5 else None, "device_name": r[6] if len(r) > 6 else None,
-         "group_name": r[7] if len(r) > 7 else None,
-         "is_active": r[8] if len(r) > 8 and r[8] is not None else True}
-        for r in rows
-    ]
+    items = []
+    for r in rows:
+        is_online = r[9] if len(r) > 9 else False
+        last_online_at = r[10] if len(r) > 10 else None
+        download_status = r[2]
+        video_count = r[12] if len(r) > 12 else 0
+        downloaded_count = r[13] if len(r) > 13 else 0
+        
+        # Determine content_status
+        # - synced: All videos downloaded, device has checked in recently
+        # - syncing: Device is online and downloading
+        # - pending: Content assigned but not yet downloaded
+        # - unknown: No content assigned or device hasn't checked in
+        if video_count == 0:
+            content_status = "no_content"
+        elif download_status and is_online:
+            content_status = "synced"
+        elif is_online and not download_status:
+            content_status = "syncing"
+        elif download_status and not is_online:
+            content_status = "synced"  # Was synced, now offline
+        else:
+            content_status = "pending"
+        
+        items.append({
+            "id": r[0], 
+            "mobile_id": r[1], 
+            "download_status": r[2], 
+            "created_at": r[3], 
+            "updated_at": r[4],
+            "resolution": r[5] if len(r) > 5 else None, 
+            "device_name": r[6] if len(r) > 6 else None,
+            "group_name": r[7] if len(r) > 7 else None,
+            "is_active": r[8] if len(r) > 8 and r[8] is not None else True,
+            # Enhanced fields
+            "is_online": is_online,
+            "last_online_at": last_online_at,
+            "temperature": r[11] if len(r) > 11 else None,
+            "video_count": video_count,
+            "downloaded_count": downloaded_count if download_status else 0,
+            "content_status": content_status,
+            "last_content_update": r[14] if len(r) > 14 else None,
+        })
+    
     return {"items": items, "total": total, "count": len(items), "limit": limit, "offset": offset, "query": q}
 
 @app.put("/device/{mobile_id}")
