@@ -3,6 +3,7 @@
 # Enhanced with: rotation, fit_mode, content_type, logs, counter reset, online threshold
 # UPDATED: Connection pooling + WebSocket real-time updates + Background offline checker
 # UPDATED: Client requirements - Storage 80%, Status Duration, Expiration, Content Approval
+# UPDATED: Company expiration - Block login/devices when company expires
 
 import os
 import io
@@ -62,6 +63,10 @@ from background_tasks import (
     start_background_tasks, stop_background_tasks,
     update_device_status_duration
 )
+
+# NEW: Company Expiration
+from migrations.company_expiration_schema import ensure_company_expiration_schema
+from company_expiration_api import router as company_expiration_router, check_company_access
 
 load_dotenv()
 
@@ -184,13 +189,14 @@ async def startup_event():
     # NEW: Start client requirements background tasks (expiration, approval)
     await start_background_tasks()
     
-    # NEW: Apply client requirements schema migration (idempotent)
+    # NEW: Apply schema migrations (idempotent)
     try:
         with pg_conn() as conn:
             ensure_client_requirements_schema(conn)
-        print("[APP] Client requirements schema verified")
+            ensure_company_expiration_schema(conn)
+        print("[APP] All schema migrations verified")
     except Exception as e:
-        print(f"[APP] Client requirements schema warning: {e}")
+        print(f"[APP] Schema migration warning: {e}")
     
     print("[APP] Startup complete - pools, WebSocket, offline checker, and client features ready")
     print(f"[APP] Offline threshold: {ONLINE_THRESHOLD_SECONDS}s, check interval: {OFFLINE_CHECK_INTERVAL_SECONDS}s")
@@ -215,6 +221,8 @@ app.include_router(ws_router, tags=["WebSocket"])
 app.include_router(platform_router, prefix="/platform", tags=["Platform"])
 # NEW: Include client requirements router
 app.include_router(client_requirements_router, tags=["Client Requirements"])
+# NEW: Include company expiration router
+app.include_router(company_expiration_router, tags=["Company Expiration"])
 
 
 # ===========================================================
@@ -3156,6 +3164,20 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                 tenant_id = device_row[5]
                 device_name = device_row[6]
                 
+                # NEW: Check company expiration - if expired, device shows "Not Enrolled"
+                if tenant_id:
+                    company_access = check_company_access(tenant_id)
+                    if not company_access["accessible"]:
+                        return {
+                            "mobile_id": mobile_id,
+                            "is_online": False,
+                            "is_active": False,  # This makes device show "Not Enrolled"
+                            "force_refresh": True,
+                            "download_status": False,
+                            "company_expired": True,
+                            "message": company_access["message"]
+                        }
+                
                 # If device is deactivated, return response with is_active=false and force_refresh=true
                 if not is_active:
                     cur.execute("""
@@ -4422,12 +4444,20 @@ def login(body: UserLoginIn):
             if not verify_password(body.password, password_hash):
                 raise HTTPException(status_code=401, detail="Invalid username or password")
 
-            # Company users: check company status
+            # Company users: check company status AND expiration
             if user_type == "company" and tenant_id:
                 if company_status == "suspended":
                     raise HTTPException(status_code=403, detail="Company account suspended. Contact platform administrator.")
                 if company_status == "cancelled":
                     raise HTTPException(status_code=403, detail="Company account cancelled.")
+                
+                # NEW: Check company expiration
+                company_access = check_company_access(tenant_id)
+                if not company_access["accessible"]:
+                    raise HTTPException(
+                        status_code=403, 
+                        detail=company_access["message"] or "Company subscription has expired. Contact administrator."
+                    )
 
             # Resolve permissions: prefer role table, fallback to legacy
             if role_permissions:
