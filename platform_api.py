@@ -282,7 +282,7 @@ def list_companies(
                     "updated_at": r[15].isoformat() if r[15] else None,
                     # Expiration fields
                     "expires_at": r[16].isoformat() if r[16] else None,
-                    "grace_period_days": r[17] or 7,
+                    "grace_period_days": r[17] if r[17] is not None else 7,
                     # Device counts
                     "device_count": r[20] or 0,
                     "devices_online": r[21] or 0,
@@ -293,7 +293,7 @@ def list_companies(
                 
                 # Calculate expiration status and days
                 expires_at = r[16]
-                grace_period_days = r[17] or 7
+                grace_period_days = r[17] if r[17] is not None else 7
                 suspended_at = r[19]
                 
                 if suspended_at:
