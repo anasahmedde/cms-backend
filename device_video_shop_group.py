@@ -2393,6 +2393,32 @@ def list_videos_for_device(mobile_id: str, limit: int = Query(200, ge=1, le=1000
 @app.get("/device/{mobile_id}/videos/downloads", response_model=PresignedURLListOut)
 def list_download_urls_for_device(mobile_id: str, limit: int = Query(200, ge=1, le=1000), offset: int = Query(0, ge=0)):
     with pg_conn() as conn:
+        # First check if device exists and get tenant_id
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, is_active, tenant_id 
+                FROM public.device 
+                WHERE mobile_id = %s LIMIT 1;
+            """, (mobile_id,))
+            device_row = cur.fetchone()
+            if not device_row:
+                raise HTTPException(status_code=404, detail="Device not found")
+            
+            device_id, is_active, tenant_id = device_row
+            
+            # Check if device is active
+            if not is_active:
+                raise HTTPException(status_code=404, detail="Device is deactivated")
+            
+            # Check company expiration
+            if tenant_id:
+                company_access = check_company_access(tenant_id)
+                if not company_access["accessible"]:
+                    raise HTTPException(
+                        status_code=403, 
+                        detail=f"Company subscription expired: {company_access['message']}"
+                    )
+        
         rows = fetch_links_for_mobile(conn, mobile_id, limit, offset)
         
         # Get device layout
@@ -3106,7 +3132,7 @@ def get_device_online_status(mobile_id: str):
             cur.execute("""
                 SELECT id, is_online, last_online_at,
                        EXTRACT(EPOCH FROM (NOW() - last_online_at)) as seconds_ago,
-                       is_active
+                       is_active, tenant_id
                 FROM public.device WHERE mobile_id = %s LIMIT 1;
             """, (mobile_id,))
             row = cur.fetchone()
@@ -3117,10 +3143,20 @@ def get_device_online_status(mobile_id: str):
             is_online = row[1]
             seconds_ago = row[3]
             is_active = row[4] if row[4] is not None else True
+            tenant_id = row[5]
             
             # If device is inactive, return 404 to show "not enrolled" screen on device
             if not is_active:
                 raise HTTPException(status_code=404, detail="Device is deactivated")
+            
+            # NEW: Check company expiration - if expired, device shows "not enrolled"
+            if tenant_id:
+                company_access = check_company_access(tenant_id)
+                if not company_access["accessible"]:
+                    raise HTTPException(
+                        status_code=404, 
+                        detail=f"Company expired: {company_access['message']}"
+                    )
             
             # If last heartbeat was more than threshold seconds ago, mark offline
             if seconds_ago is not None and seconds_ago > ONLINE_THRESHOLD_SECONDS and is_online:
