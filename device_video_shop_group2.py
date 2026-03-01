@@ -2,6 +2,7 @@
 # Run: uvicorn device_video_shop_group:app --host 0.0.0.0 --port 8005 --reload
 # Enhanced with: rotation, fit_mode, content_type, logs, counter reset, online threshold
 # UPDATED: Connection pooling + WebSocket real-time updates + Background offline checker
+# UPDATED: Client requirements - Storage 80%, Status Duration, Expiration, Content Approval
 
 import os
 import io
@@ -53,6 +54,14 @@ from tenant_context import (
     active_sessions, log_audit, ROLE_PERMISSIONS,
 )
 from platform_api import router as platform_router
+
+# NEW: Client Requirements - Storage, Status Duration, Expiration, Content Approval
+from migrations.client_requirements_schema import ensure_client_requirements_schema
+from client_requirements_api import router as client_requirements_router
+from background_tasks import (
+    start_background_tasks, stop_background_tasks,
+    update_device_status_duration
+)
 
 load_dotenv()
 
@@ -171,7 +180,19 @@ async def startup_event():
     await startup_db_pools()
     await ws_manager.start()
     asyncio.create_task(offline_checker_task())
-    print("[APP] Startup complete - pools, WebSocket, and offline checker ready")
+    
+    # NEW: Start client requirements background tasks (expiration, approval)
+    await start_background_tasks()
+    
+    # NEW: Apply client requirements schema migration (idempotent)
+    try:
+        with pg_conn() as conn:
+            ensure_client_requirements_schema(conn)
+        print("[APP] Client requirements schema verified")
+    except Exception as e:
+        print(f"[APP] Client requirements schema warning: {e}")
+    
+    print("[APP] Startup complete - pools, WebSocket, offline checker, and client features ready")
     print(f"[APP] Offline threshold: {ONLINE_THRESHOLD_SECONDS}s, check interval: {OFFLINE_CHECK_INTERVAL_SECONDS}s")
 
 
@@ -180,6 +201,10 @@ async def shutdown_event():
     """Clean up all resources."""
     global _offline_checker_running
     _offline_checker_running = False
+    
+    # NEW: Stop client requirements background tasks
+    await stop_background_tasks()
+    
     await ws_manager.stop()
     await shutdown_db_pools()
     print("[APP] Shutdown complete")
@@ -188,6 +213,8 @@ async def shutdown_event():
 # Include routers
 app.include_router(ws_router, tags=["WebSocket"])
 app.include_router(platform_router, prefix="/platform", tags=["Platform"])
+# NEW: Include client requirements router
+app.include_router(client_requirements_router, tags=["Client Requirements"])
 
 
 # ===========================================================
@@ -3162,6 +3189,9 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                         INSERT INTO public.device_online_history (did, event_type, event_at)
                         VALUES (%s, %s, NOW());
                     """, (did, event_type))
+                    
+                    # NEW: Update status duration tracking
+                    update_device_status_duration(conn, did, body.is_online, previous_status)
                 
             conn.commit()
             
