@@ -90,14 +90,18 @@ def calculate_expiration_status(expires_at: Optional[datetime], grace_period_day
         days_until = (expires_at - now).days
         return "active", True, days_until, None
     
-    # Past expiration date
-    days_since = (now - expires_at).days
+    # Past expiration date - calculate total seconds for more precise comparison
+    time_since = now - expires_at
+    days_since = time_since.days
     
-    if days_since <= grace_period_days:
+    # Grace period check: 
+    # - If grace_period_days is 0, no grace period at all
+    # - Otherwise, allow grace_period_days FULL days after expiration
+    if grace_period_days > 0 and days_since < grace_period_days:
         # In grace period - still accessible but with warning
         return "grace_period", True, None, days_since
     
-    # Fully expired
+    # Fully expired (including when grace_period_days is 0)
     return "expired", False, None, days_since
 
 

@@ -320,7 +320,10 @@ def list_companies(
                         item["days_since_expiration"] = days_since
                         item["days_until_expiration"] = None
                         
-                        if days_since <= grace_period_days:
+                        # Grace period check:
+                        # - If grace_period_days is 0, no grace period at all
+                        # - Otherwise, allow grace_period_days FULL days after expiration
+                        if grace_period_days > 0 and days_since < grace_period_days:
                             item["expiration_status"] = "grace_period"
                         else:
                             item["expiration_status"] = "expired"
