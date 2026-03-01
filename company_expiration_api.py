@@ -22,7 +22,7 @@ from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel, Field
 
 from database import pg_conn
-from tenant_context import get_current_user, require_platform_user, log_audit
+from tenant_context import get_current_user, require_platform_user, log_audit, TenantContext
 
 router = APIRouter()
 
@@ -195,7 +195,7 @@ def get_company_access_status(company_id: int):
 @router.get("/platform/companies/expiration", response_model=List[CompanyExpirationOut])
 def list_companies_expiration(
     status: Optional[str] = Query(None, description="Filter by status: active, grace_period, expired, suspended, all"),
-    user: Dict = Depends(require_platform_user)
+    user: TenantContext = Depends(require_platform_user)
 ):
     """
     List all companies with their expiration status.
@@ -262,7 +262,7 @@ def list_companies_expiration(
 
 
 @router.get("/platform/companies/expired", response_model=List[CompanyExpirationOut])
-def list_expired_companies(user: Dict = Depends(require_platform_user)):
+def list_expired_companies(user: TenantContext = Depends(require_platform_user)):
     """
     List only expired and suspended companies.
     Platform admin only.
@@ -274,7 +274,7 @@ def list_expired_companies(user: Dict = Depends(require_platform_user)):
 @router.get("/platform/companies/expiring-soon", response_model=List[CompanyExpirationOut])
 def list_companies_expiring_soon(
     days: int = Query(30, ge=1, le=90, description="Companies expiring within N days"),
-    user: Dict = Depends(require_platform_user)
+    user: TenantContext = Depends(require_platform_user)
 ):
     """
     List companies expiring within N days.
@@ -330,7 +330,7 @@ def list_companies_expiring_soon(
 def set_company_expiration(
     company_id: int,
     body: SetExpirationIn,
-    user: Dict = Depends(require_platform_user)
+    user: TenantContext = Depends(require_platform_user)
 ):
     """
     Set expiration date for a company.
@@ -373,7 +373,7 @@ def set_company_expiration(
                 cur, company_id, "expiration_set",
                 old_expires_at=old_expires_at, new_expires_at=body.expires_at,
                 old_status=old_status, new_status=new_status,
-                performed_by=user.get("user_id"), notes=body.notes
+                performed_by=user.user_id, notes=body.notes
             )
             
         conn.commit()
@@ -392,7 +392,7 @@ def set_company_expiration(
 def extend_company_expiration(
     company_id: int,
     body: ExtendExpirationIn,
-    user: Dict = Depends(require_platform_user)
+    user: TenantContext = Depends(require_platform_user)
 ):
     """
     Extend company expiration by N days.
@@ -442,7 +442,7 @@ def extend_company_expiration(
                 cur, company_id, "renewed",
                 old_expires_at=old_expires_at, new_expires_at=new_expires_at,
                 old_status=old_status, new_status=new_status,
-                performed_by=user.get("user_id"), notes=body.notes
+                performed_by=user.user_id, notes=body.notes
             )
             
         conn.commit()
@@ -461,7 +461,7 @@ def extend_company_expiration(
 @router.delete("/platform/company/{company_id}/expiration")
 def remove_company_expiration(
     company_id: int,
-    user: Dict = Depends(require_platform_user)
+    user: TenantContext = Depends(require_platform_user)
 ):
     """
     Remove expiration date (make company never expire).
@@ -493,7 +493,7 @@ def remove_company_expiration(
                 cur, company_id, "expiration_removed",
                 old_expires_at=old_expires_at, new_expires_at=None,
                 old_status=old_status, new_status="active",
-                performed_by=user.get("user_id"), notes="Expiration removed - never expires"
+                performed_by=user.user_id, notes="Expiration removed - never expires"
             )
             
         conn.commit()
@@ -515,7 +515,7 @@ def remove_company_expiration(
 def suspend_company(
     company_id: int,
     body: SuspendCompanyIn,
-    user: Dict = Depends(require_platform_user)
+    user: TenantContext = Depends(require_platform_user)
 ):
     """
     Manually suspend a company (immediate block, regardless of expiration).
@@ -550,7 +550,7 @@ def suspend_company(
             log_expiration_event(
                 cur, company_id, "suspended",
                 old_status=old_status, new_status="suspended",
-                performed_by=user.get("user_id"), notes=body.reason
+                performed_by=user.user_id, notes=body.reason
             )
             
         conn.commit()
@@ -569,7 +569,7 @@ def suspend_company(
 def reactivate_company(
     company_id: int,
     extend_days: int = Query(None, ge=1, le=365, description="Optionally extend by N days"),
-    user: Dict = Depends(require_platform_user)
+    user: TenantContext = Depends(require_platform_user)
 ):
     """
     Reactivate a suspended or expired company.
@@ -616,7 +616,7 @@ def reactivate_company(
                 cur, company_id, "reactivated",
                 old_expires_at=old_expires_at, new_expires_at=new_expires_at,
                 old_status=old_status, new_status=new_status,
-                performed_by=user.get("user_id"), 
+                performed_by=user.user_id, 
                 notes=f"Reactivated with {extend_days or 30} days extension"
             )
             
@@ -639,7 +639,7 @@ def reactivate_company(
 def get_company_expiration_history(
     company_id: int,
     limit: int = Query(50, ge=1, le=200),
-    user: Dict = Depends(require_platform_user)
+    user: TenantContext = Depends(require_platform_user)
 ):
     """
     Get expiration history for a company.
