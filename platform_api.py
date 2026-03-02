@@ -799,10 +799,6 @@ def platform_dashboard(ctx: TenantContext = Depends(require_platform_user)):
     totals["notifications"] = notifications
     return totals
 
-            totals["companies"] = companies
-            return totals
-
-
 # ══════════════════════════════════════════════════════════════
 # IMPERSONATION
 # ══════════════════════════════════════════════════════════════
