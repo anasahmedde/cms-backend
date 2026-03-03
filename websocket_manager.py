@@ -24,6 +24,9 @@ class MessageType(str, Enum):
     DEVICE_DOWNLOAD = "device_download"
     HEARTBEAT = "heartbeat"
     ERROR = "error"
+    # Platform announcements
+    ANNOUNCEMENT = "announcement"
+    ANNOUNCEMENT_CLEARED = "announcement_cleared"
     
     # Client -> Server
     SUBSCRIBE = "subscribe"
@@ -286,6 +289,37 @@ class ConnectionManager:
             }
         )
         await self._broadcast_to_tenant(tenant_id, mobile_id, message)
+    
+    async def broadcast_announcement(self, announcement: dict):
+        """Broadcast platform announcement to ALL connected users."""
+        message = WebSocketMessage(
+            type=MessageType.ANNOUNCEMENT,
+            data=announcement
+        )
+        await self._broadcast_to_all(message)
+    
+    async def broadcast_announcement_cleared(self):
+        """Broadcast that announcement has been cleared to ALL connected users."""
+        message = WebSocketMessage(
+            type=MessageType.ANNOUNCEMENT_CLEARED,
+            data={"cleared": True, "timestamp": datetime.now().isoformat()}
+        )
+        await self._broadcast_to_all(message)
+    
+    async def _broadcast_to_all(self, message: WebSocketMessage):
+        """Send message to ALL connected users (for platform-wide announcements)."""
+        tasks = []
+        
+        async with self._lock:
+            for ws in list(self._global_connections.keys()):
+                tasks.append(self._send(ws, message))
+            
+            for tenant_connections in self._connections.values():
+                for ws in list(tenant_connections.keys()):
+                    tasks.append(self._send(ws, message))
+        
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
     
     # ===========================================
     # Internal Methods
