@@ -4,6 +4,7 @@
 
 import os
 import asyncio
+import time
 from contextlib import asynccontextmanager, contextmanager
 from typing import Optional, AsyncGenerator, Generator
 from datetime import datetime
@@ -156,7 +157,9 @@ class SyncDatabasePool:
     @contextmanager
     def connection(cls) -> Generator:
         """
-        Get a connection from the pool.
+        Get a connection from the pool with retry on exhaustion.
+        Retries up to 3 times with 200 ms backoff before giving up.
+
         Usage:
             with SyncDatabasePool.connection() as conn:
                 with conn.cursor() as cur:
@@ -164,11 +167,24 @@ class SyncDatabasePool:
         """
         pool = cls.get_pool()
         conn = None
+        max_retries = 3
+        retry_delay = 0.2  # seconds
+
+        for attempt in range(max_retries):
+            try:
+                conn = pool.getconn()
+                break
+            except PoolError:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))
+                else:
+                    raise Exception(
+                        "Database connection pool exhausted. "
+                        "Try again later. "
+                        f"(pool max={POOL_CONFIG['max_size']})"
+                    )
         try:
-            conn = pool.getconn()
             yield conn
-        except PoolError:
-            raise Exception("Database connection pool exhausted. Try again later.")
         finally:
             if conn is not None:
                 try:
