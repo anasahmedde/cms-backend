@@ -1367,7 +1367,18 @@ def create_link_by_names(conn, payload: LinkCreate) -> Dict[str, Any]:
             if not grow:
                 raise HTTPException(status_code=404, detail=f"Group not found: {gname_in}")
             gid = int(grow[0])
-        
+
+            # Enforce: video must already be linked to this group
+            cur.execute("""
+                SELECT 1 FROM public.group_video WHERE gid = %s AND vid = %s LIMIT 1;
+            """, (gid, vid))
+            if not cur.fetchone():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f'Video "{payload.video_name}" is not linked to group "{gname_in}". '
+                           f'Add it to the group\'s linked content first.'
+                )
+
         _enforce_single_group_shop_for_device(conn, did, gid, sid)
         
         if gid is None:
