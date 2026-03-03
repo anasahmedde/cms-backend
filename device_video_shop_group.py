@@ -1,6 +1,9 @@
 # device_video_shop_group.py
 # Run: uvicorn device_video_shop_group:app --host 0.0.0.0 --port 8005 --reload
 # Enhanced with: rotation, fit_mode, content_type, logs, counter reset, online threshold
+# UPDATED: Connection pooling + WebSocket real-time updates + Background offline checker
+# UPDATED: Client requirements - Storage 80%, Status Duration, Expiration, Content Approval
+# UPDATED: Company expiration - Block login/devices when company expires
 
 import os
 import io
@@ -8,21 +11,65 @@ import csv
 import json
 import hashlib
 import secrets
+import asyncio
 from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 
 from migrations.dvsg_schema import ensure_dvsg_schema
+from migrations.multitenant_schema import ensure_multitenant_schema
 from pydantic import BaseModel, Field
 
 from fastapi import FastAPI, HTTPException, Query, Path, Depends, Header, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse
+from starlette.requests import Request
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2 import sql
-from psycopg2.pool import ThreadedConnectionPool, PoolError
 import boto3
+import traceback as _tb
+
+# NEW: Import from database module (connection pooling)
+from database import (
+    pg_conn, pg_init_pool, pg_close_pool,
+    AsyncDatabasePool, startup_db_pools, shutdown_db_pools,
+    check_database_health
+)
+
+# NEW: Import WebSocket components
+from websocket_manager import ws_manager, DeviceStatus
+from websocket_routes import (
+    router as ws_router,
+    notify_device_online, notify_device_offline,
+    notify_device_status, notify_device_temperature,
+    notify_download_progress
+)
+
+# Multi-tenant auth (replaces old inline auth)
+from tenant_context import (
+    TenantContext, get_tenant_context, get_current_user,
+    require_permission, require_platform_user, require_tenant_context,
+    hash_password, verify_password, generate_token, create_session,
+    invalidate_user_sessions, invalidate_tenant_sessions,
+    active_sessions, log_audit, ROLE_PERMISSIONS,
+)
+from platform_api import router as platform_router
+
+# NEW: Client Requirements - Storage, Status Duration, Expiration, Content Approval
+from migrations.client_requirements_schema import ensure_client_requirements_schema
+from client_requirements_api import router as client_requirements_router
+from background_tasks import (
+    start_background_tasks, stop_background_tasks,
+    update_device_status_duration
+)
+
+# NEW: Company Expiration
+from migrations.company_expiration_schema import ensure_company_expiration_schema
+from company_expiration_api import router as company_expiration_router, check_company_access
+
+# NEW: Platform Announcements (visible to all users)
+from announcement_api import router as announcement_router
 
 load_dotenv()
 
@@ -38,22 +85,29 @@ DB_MAX_CONN = int(os.getenv("PG_MAX_CONN", "50"))
 AWS_REGION = os.getenv("AWS_REGION")
 PRESIGN_EXPIRES = int(os.getenv("PRESIGN_EXPIRES", "900"))  # 15 min
 
-# Online threshold in seconds (2 minutes - allows for network delays)
-ONLINE_THRESHOLD_SECONDS = 120
+# CHANGED: Reduced from 120 to 45 seconds for faster offline detection
+ONLINE_THRESHOLD_SECONDS = 45
 
-# Session tokens (in-memory)
-active_sessions: Dict[str, Dict] = {}
+# Background task check interval (30 seconds)
+OFFLINE_CHECK_INTERVAL_SECONDS = 30
 
-# Download progress tracking (in-memory) - stores real-time download progress per device
-# Format: { "mobile_id": { "current_file": 1, "total_files": 3, "file_name": "video.mp4", "progress": 65, "downloaded_bytes": 5242880, "total_bytes": 8388608, "updated_at": datetime } }
+# NOTE: active_sessions is now imported from tenant_context
+
+# Download progress tracking (in-memory)
 download_progress_store: Dict[str, Dict] = {}
 
 # Treat any of these as "no group"
 NO_GROUP_SENTINELS = {"_none", "none", "null", "(none)", ""}
 
+# Flag to control background task
+_offline_checker_running = False
+
+# ===========================================================
+# CREATE APP
+# ===========================================================
 app = FastAPI(title="Device-Video-Shop-Group Service", version="3.0.0")
 
-# --- CORS (frontend runs on different origin/port) ---
+# --- CORS ---
 _CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
 if _CORS_ORIGINS.strip() == "*":
     _origins = ["*"]
@@ -67,6 +121,186 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ===========================================================
+# BACKGROUND TASK: Check for offline devices every 30 seconds
+# Memory: ~0 KB (just a coroutine in existing event loop)
+# ===========================================================
+async def offline_checker_task():
+    """Background task to mark stale devices as offline."""
+    global _offline_checker_running
+    _offline_checker_running = True
+    
+    while _offline_checker_running:
+        try:
+            await asyncio.sleep(OFFLINE_CHECK_INTERVAL_SECONDS)
+            
+            if not _offline_checker_running:
+                break
+            
+            marked_devices = []
+            with pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(f"""
+                        UPDATE public.device
+                        SET is_online = FALSE, updated_at = NOW()
+                        WHERE is_online = TRUE
+                          AND (last_online_at IS NULL 
+                               OR last_online_at < NOW() - INTERVAL '{ONLINE_THRESHOLD_SECONDS} seconds')
+                        RETURNING id, mobile_id, device_name, tenant_id;
+                    """)
+                    marked_devices = cur.fetchall()
+                    
+                    for did, mobile_id, device_name, tenant_id in marked_devices:
+                        cur.execute("""
+                            INSERT INTO public.device_online_history (did, event_type, event_at)
+                            VALUES (%s, 'offline', NOW());
+                        """, (did,))
+                
+                conn.commit()
+            
+            # Broadcast via WebSocket
+            for did, mobile_id, device_name, tenant_id in marked_devices:
+                if tenant_id:
+                    try:
+                        asyncio.create_task(
+                            notify_device_offline(tenant_id, mobile_id, device_name)
+                        )
+                    except Exception:
+                        pass
+            
+            if marked_devices:
+                print(f"[OFFLINE] Marked {len(marked_devices)} devices offline: {[d[1] for d in marked_devices]}")
+                
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[OFFLINE] Checker error: {e}")
+
+
+# ===========================================================
+# LIFECYCLE EVENTS
+# ===========================================================
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database pools, WebSocket manager, and background tasks."""
+    await startup_db_pools()
+    await ws_manager.start()
+    asyncio.create_task(offline_checker_task())
+    
+    # NEW: Start client requirements background tasks (expiration, approval)
+    await start_background_tasks()
+    
+    # NEW: Apply schema migrations (idempotent)
+    try:
+        with pg_conn() as conn:
+            ensure_client_requirements_schema(conn)
+            ensure_company_expiration_schema(conn)
+        print("[APP] All schema migrations verified")
+    except Exception as e:
+        print(f"[APP] Schema migration warning: {e}")
+    
+    print("[APP] Startup complete - pools, WebSocket, offline checker, and client features ready")
+    print(f"[APP] Offline threshold: {ONLINE_THRESHOLD_SECONDS}s, check interval: {OFFLINE_CHECK_INTERVAL_SECONDS}s")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up all resources."""
+    global _offline_checker_running
+    _offline_checker_running = False
+    
+    # NEW: Stop client requirements background tasks
+    await stop_background_tasks()
+    
+    await ws_manager.stop()
+    await shutdown_db_pools()
+    print("[APP] Shutdown complete")
+
+
+# Include routers
+app.include_router(ws_router, tags=["WebSocket"])
+# NEW: Include company expiration router FIRST (has /platform/companies/expiration routes)
+# Must be before platform_router to avoid route conflicts
+app.include_router(company_expiration_router, tags=["Company Expiration"])
+app.include_router(platform_router, prefix="/platform", tags=["Platform"])
+# NEW: Include client requirements router
+app.include_router(client_requirements_router, tags=["Client Requirements"])
+# NEW: Platform Announcements (visible to all users)
+app.include_router(announcement_router, tags=["Platform Announcements"])
+
+
+# ===========================================================
+# Exception handler
+# ===========================================================
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    error_detail = str(exc)
+    tb = _tb.format_exc()
+    print(f"[UNHANDLED ERROR] {request.method} {request.url.path}: {error_detail}\n{tb}", flush=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": error_detail, "traceback": tb.split("\n")[-4:]},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
+
+
+# ===========================================================
+# Health endpoints
+# ===========================================================
+@app.get("/db/health")
+async def database_health():
+    """Check database connectivity and pool status."""
+    health = await check_database_health()
+    health["offline_checker"] = {
+        "running": _offline_checker_running,
+        "threshold_seconds": ONLINE_THRESHOLD_SECONDS,
+        "check_interval_seconds": OFFLINE_CHECK_INTERVAL_SECONDS,
+    }
+    return health
+
+
+@app.get("/debug/health")
+def debug_health():
+    """Quick health check with migration status."""
+    try:
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT column_default FROM information_schema.columns 
+                    WHERE table_schema='public' AND table_name='device' AND column_name='tenant_id';
+                """)
+                device_default = cur.fetchone()
+                
+                cur.execute("SELECT COUNT(*) FROM public.company;")
+                company_count = cur.fetchone()[0]
+                
+                cur.execute("SELECT COUNT(*) FROM public.role;")
+                role_count = cur.fetchone()[0]
+                
+                cur.execute("SELECT id, slug, name, status FROM public.company ORDER BY id LIMIT 5;")
+                companies = [{"id": r[0], "slug": r[1], "name": r[2], "status": r[3]} for r in cur.fetchall()]
+                
+                cur.execute("SELECT COUNT(*) FROM public.device WHERE is_online = TRUE;")
+                online_count = cur.fetchone()[0]
+                
+                return {
+                    "status": "ok",
+                    "device_tenant_id_default": str(device_default) if device_default else "NO DEFAULT",
+                    "companies": company_count,
+                    "roles": role_count,
+                    "company_list": companies,
+                    "active_sessions": len(active_sessions),
+                    "online_devices": online_count,
+                    "offline_threshold_seconds": ONLINE_THRESHOLD_SECONDS,
+                }
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
 
 
 # ---------- Pydantic models ----------
@@ -104,6 +338,7 @@ class UserCreateIn(BaseModel):
     full_name: Optional[str] = None
     role: str = "viewer"
     permissions: List[str] = []
+    company_slug: Optional[str] = None  # Platform admins can assign user to a specific company
 
 class UserUpdateIn(BaseModel):
     email: Optional[str] = None
@@ -126,51 +361,19 @@ class UserOut(BaseModel):
     created_at: datetime
     last_login: Optional[datetime]
     permissions: List[str] = []
+    user_type: Optional[str] = None
+    tenant_id: Optional[int] = None
+    company_slug: Optional[str] = None
+    company_name: Optional[str] = None
 
 class UserListOut(BaseModel):
     items: List[UserOut]
     total: int
 
-ROLE_PERMISSIONS = {
-    "admin": ["view_dashboard", "manage_devices", "manage_groups", "manage_shops", "upload_videos", "manage_videos", "manage_links", "manage_users", "view_reports", "export_data"],
-    "manager": ["view_dashboard", "manage_devices", "manage_groups", "manage_shops", "upload_videos", "manage_videos", "manage_links", "view_reports", "export_data"],
-    "editor": ["view_dashboard", "upload_videos", "manage_videos", "manage_links", "view_reports"],
-    "viewer": ["view_dashboard", "view_reports"],
-}
+ROLE_PERMISSIONS_LEGACY = ROLE_PERMISSIONS  # backward compat alias
 
-def hash_password(password: str) -> str:
-    return hashlib.sha256(f"digix_salt_{password}".encode()).hexdigest()
-
-def verify_password(password: str, password_hash: str) -> bool:
-    return hash_password(password) == password_hash
-
-def generate_token() -> str:
-    return secrets.token_urlsafe(32)
-
-def invalidate_user_sessions(user_id: int):
-    """Remove all active sessions for a specific user."""
-    tokens_to_remove = [token for token, session in active_sessions.items() if session.get("user_id") == user_id]
-    for token in tokens_to_remove:
-        del active_sessions[token]
-
-def get_current_user(authorization: Optional[str] = Header(None)) -> Dict:
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
-    if token not in active_sessions:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-    session = active_sessions[token]
-    if datetime.now() > session.get("expires_at", datetime.min):
-        del active_sessions[token]
-        raise HTTPException(status_code=401, detail="Token expired")
-    return session
-
-def require_permission(permission: str):
-    def checker(user: Dict = Depends(get_current_user)):
-        if permission not in user.get("permissions", []) and user.get("role") != "admin":
-            raise HTTPException(status_code=403, detail=f"Permission denied: {permission}")
-        return user
-    return checker
+# NOTE: hash_password, verify_password, generate_token, invalidate_user_sessions,
+# get_current_user, require_permission are now imported from tenant_context
 
 
 class DeviceMonthlyCountUpdateIn(BaseModel):
@@ -370,55 +573,7 @@ class VideoOut(BaseModel):
 
 
 
-# ---------- PG pool ----------
-pg_pool: Optional[ThreadedConnectionPool] = None
-
-
-def pg_init_pool():
-    global pg_pool
-    if pg_pool is None:
-        pg_pool = ThreadedConnectionPool(
-            DB_MIN_CONN, DB_MAX_CONN,
-            host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
-            user=DB_USER, password=DB_PASS, connect_timeout=5,
-        )
-
-
-def pg_close_pool():
-    global pg_pool
-    if pg_pool:
-        pg_pool.closeall()
-        pg_pool = None
-
-
-@contextmanager
-def pg_conn():
-    global pg_pool
-    if pg_pool is None:
-        pg_init_pool()
-    conn = None
-    try:
-        try:
-            conn = pg_pool.getconn()
-        except PoolError:
-            raise HTTPException(status_code=503, detail="Database connection pool exhausted")
-        yield conn
-    finally:
-        if conn is not None:
-            if pg_pool is not None:
-                try:
-                    pg_pool.putconn(conn)
-                except PoolError:
-                    try:
-                        conn.close()
-                    except:
-                        pass
-            else:
-                try:
-                    conn.close()
-                except:
-                    pass
-
+# NOTE: pg_conn, pg_init_pool, pg_close_pool are now imported from database.py
 
 # ---------- Counter reset logic ----------
 def _check_and_reset_counters(conn, did: int) -> Tuple[bool, bool]:
@@ -661,7 +816,7 @@ def fetch_links_for_mobile(conn, mobile_id: str, limit: int, offset: int) -> Lis
         return [_row_to_link_dict(r) for r in rows]
 
 
-def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid, limit, offset):
+def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid, limit, offset, tenant_id=None):
     """
     List all device-video-shop-group links.
     Also includes:
@@ -669,6 +824,10 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
     - Completely unassigned devices (not in any group) - shown with gname="Unassigned"
     """
     where, params = [], []
+    # Tenant scoping
+    if tenant_id:
+        where.append("l.tenant_id = %s")
+        params.append(tenant_id)
     if mobile_id:
         where.append("(d.mobile_id ILIKE %s OR d.device_name ILIKE %s)")
         params.append(f"%{mobile_id}%")
@@ -757,6 +916,10 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
                         SELECT 1 FROM public.device_video_shop_group l WHERE l.did = da.did
                     )
                 """
+                # Tenant scoping for device_assignment query
+                if tenant_id:
+                    assignment_sql += " AND d.tenant_id = %s"
+                    assignment_params.append(tenant_id)
                 if assignment_where:
                     assignment_sql += " AND " + " AND ".join(assignment_where)
                 assignment_sql += " ORDER BY da.id DESC LIMIT %s OFFSET %s;"
@@ -803,6 +966,10 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
                         SELECT 1 FROM public.device_assignment da WHERE da.did = d.id
                     )
                 """
+                # Tenant scoping for unassigned devices query
+                if tenant_id:
+                    unassigned_sql += " AND d.tenant_id = %s"
+                    unassigned_params.append(tenant_id)
                 if unassigned_where:
                     unassigned_sql += " AND " + " AND ".join(unassigned_where)
                 unassigned_sql += " ORDER BY d.is_online DESC, d.id DESC LIMIT %s OFFSET %s;"
@@ -1204,21 +1371,43 @@ def create_link_by_names(conn, payload: LinkCreate) -> Dict[str, Any]:
         _enforce_single_group_shop_for_device(conn, did, gid, sid)
         
         if gid is None:
+            # Try insert first, if duplicate exists update it
             cur.execute("""
                 INSERT INTO public.device_video_shop_group (did, vid, sid, gid, display_order)
                 VALUES (%s, %s, %s, NULL, %s)
-                ON CONFLICT (did, vid, sid) WHERE (gid IS NULL)
-                DO UPDATE SET updated_at = NOW(), display_order = EXCLUDED.display_order
-                RETURNING id;
+                ON CONFLICT DO NOTHING;
             """, (did, vid, sid, payload.display_order))
+            if cur.rowcount == 0:
+                # Already exists, update and fetch
+                cur.execute("""
+                    UPDATE public.device_video_shop_group SET updated_at = NOW(), display_order = %s
+                    WHERE did = %s AND vid = %s AND sid = %s AND gid IS NULL
+                    RETURNING id;
+                """, (payload.display_order, did, vid, sid))
+            else:
+                cur.execute("""
+                    SELECT id FROM public.device_video_shop_group
+                    WHERE did = %s AND vid = %s AND sid = %s AND gid IS NULL
+                    ORDER BY id DESC LIMIT 1;
+                """, (did, vid, sid))
         else:
             cur.execute("""
                 INSERT INTO public.device_video_shop_group (did, vid, sid, gid, display_order)
                 VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (did, vid, sid, gid) WHERE (gid IS NOT NULL)
-                DO UPDATE SET updated_at = NOW(), display_order = EXCLUDED.display_order
-                RETURNING id;
+                ON CONFLICT DO NOTHING;
             """, (did, vid, sid, gid, payload.display_order))
+            if cur.rowcount == 0:
+                cur.execute("""
+                    UPDATE public.device_video_shop_group SET updated_at = NOW(), display_order = %s
+                    WHERE did = %s AND vid = %s AND sid = %s AND gid = %s
+                    RETURNING id;
+                """, (payload.display_order, did, vid, sid, gid))
+            else:
+                cur.execute("""
+                    SELECT id FROM public.device_video_shop_group
+                    WHERE did = %s AND vid = %s AND sid = %s AND gid = %s
+                    ORDER BY id DESC LIMIT 1;
+                """, (did, vid, sid, gid))
             
             # Also add to group_video table to ensure group-level association exists
             # This ensures future device assignments will get this video
@@ -1242,11 +1431,15 @@ def on_startup():
     pg_init_pool()
     with pg_conn() as conn:
         ensure_dvsg_schema(conn)
+        ensure_multitenant_schema(conn)
 
 
 @app.on_event("shutdown")
 def on_shutdown():
     pg_close_pool()
+
+# Mount platform router
+app.include_router(platform_router, prefix="/platform", tags=["platform"])
 
 
 # ---------- health endpoints ----------
@@ -1561,15 +1754,19 @@ def get_group_attachments(gname: str):
 
 # ---------- Temperature, daily, monthly updates ----------
 @app.post("/device/{mobile_id}/temperature_update")
-def set_temperature(mobile_id: str, body: DeviceTemperatureUpdateIn):
+async def set_temperature(mobile_id: str, body: DeviceTemperatureUpdateIn):
+    """Update device temperature and broadcast via WebSocket."""
+    tenant_id = None
+    
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM public.device WHERE mobile_id = %s LIMIT 1;", (mobile_id,))
+                cur.execute("SELECT id, tenant_id FROM public.device WHERE mobile_id = %s LIMIT 1;", (mobile_id,))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Device not found")
                 did = row[0]
+                tenant_id = row[1]
                 
                 cur.execute("""
                     UPDATE public.device SET temperature = %s, updated_at = NOW()
@@ -1584,6 +1781,16 @@ def set_temperature(mobile_id: str, body: DeviceTemperatureUpdateIn):
                 # Store time-series point for line graph
                 _insert_temperature_point(conn, did, float(body.temperature))
             conn.commit()
+            
+            # NEW: Broadcast via WebSocket
+            if tenant_id:
+                try:
+                    asyncio.create_task(
+                        notify_device_temperature(tenant_id, mobile_id, float(body.temperature))
+                    )
+                except Exception as e:
+                    print(f"[WS] Broadcast error: {e}")
+            
             return {"mobile_id": mobile_id, "temperature": float(temp)}
         except HTTPException:
             conn.rollback()
@@ -1821,9 +2028,11 @@ def list_links_route(
     gid: Optional[int] = Query(None, ge=1),
     limit: int = Query(200, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    user: Dict = Depends(get_current_user),
 ):
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
-        rows = list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid, limit, offset)
+        rows = list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid, limit, offset, tenant_id=tenant_id)
         return {"count": len(rows), "items": rows, "limit": limit, "offset": offset}
 
 
@@ -1990,14 +2199,18 @@ def link_device_to_group(body: DeviceToGroupIn):
                 created_links = []
                 if group_videos:
                     for vid, video_name in group_videos:
-                        # Use explicit conflict target for clarity
                         cur.execute("""
                             INSERT INTO public.device_video_shop_group (did, vid, sid, gid)
                             VALUES (%s, %s, %s, %s)
-                            ON CONFLICT (did, vid, sid, gid) WHERE gid IS NOT NULL
-                            DO UPDATE SET updated_at = NOW()
-                            RETURNING id;
+                            ON CONFLICT DO NOTHING;
                         """, (did, vid, sid, gid))
+                        if cur.rowcount > 0:
+                            cur.execute("SELECT id FROM public.device_video_shop_group WHERE did=%s AND vid=%s AND sid=%s AND gid=%s ORDER BY id DESC LIMIT 1;", (did, vid, sid, gid))
+                        else:
+                            cur.execute("""
+                                UPDATE public.device_video_shop_group SET updated_at = NOW()
+                                WHERE did=%s AND vid=%s AND sid=%s AND gid=%s RETURNING id;
+                            """, (did, vid, sid, gid))
                         link_row = cur.fetchone()
                         if link_row:
                             created_links.append({"link_id": link_row[0], "video_name": video_name})
@@ -2114,22 +2327,24 @@ def sync_group_devices(gname: str, body: GroupSyncIn):
                             INSERT INTO public.device_video_shop_group 
                                 (did, vid, sid, gid, display_order, device_rotation, device_resolution, grid_position, grid_size)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (did, vid, sid, gid) WHERE (gid IS NOT NULL)
-                            DO UPDATE SET 
-                                display_order = EXCLUDED.display_order,
-                                device_rotation = EXCLUDED.device_rotation,
-                                device_resolution = EXCLUDED.device_resolution,
-                                grid_position = EXCLUDED.grid_position,
-                                grid_size = EXCLUDED.grid_size,
-                                updated_at = NOW()
-                            RETURNING id, (xmax = 0) as inserted;
+                            ON CONFLICT DO NOTHING;
                         """, (target_did, vid, target_sid, gid, display_order, device_rotation, device_resolution, grid_position, grid_size))
-                        link_row = cur.fetchone()
+                        inserted = cur.rowcount > 0
+                        if not inserted:
+                            cur.execute("""
+                                UPDATE public.device_video_shop_group SET 
+                                    display_order = %s, device_rotation = %s, device_resolution = %s,
+                                    grid_position = %s, grid_size = %s, updated_at = NOW()
+                                WHERE did = %s AND vid = %s AND sid = %s AND gid = %s
+                                RETURNING id;
+                            """, (display_order, device_rotation, device_resolution, grid_position, grid_size,
+                                  target_did, vid, target_sid, gid))
+                        link_row = True
                         if link_row:
-                            if link_row[1]:  # inserted
+                            if inserted:
                                 device_result["links_created"] += 1
                                 results["links_created"] += 1
-                            else:  # updated
+                            else:
                                 device_result["links_updated"] += 1
                                 results["links_updated"] += 1
                     
@@ -2183,6 +2398,32 @@ def list_videos_for_device(mobile_id: str, limit: int = Query(200, ge=1, le=1000
 @app.get("/device/{mobile_id}/videos/downloads", response_model=PresignedURLListOut)
 def list_download_urls_for_device(mobile_id: str, limit: int = Query(200, ge=1, le=1000), offset: int = Query(0, ge=0)):
     with pg_conn() as conn:
+        # First check if device exists and get tenant_id
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, is_active, tenant_id 
+                FROM public.device 
+                WHERE mobile_id = %s LIMIT 1;
+            """, (mobile_id,))
+            device_row = cur.fetchone()
+            if not device_row:
+                raise HTTPException(status_code=404, detail="Device not found")
+            
+            device_id, is_active, tenant_id = device_row
+            
+            # Check if device is active
+            if not is_active:
+                raise HTTPException(status_code=404, detail="Device is deactivated")
+            
+            # Check company expiration
+            if tenant_id:
+                company_access = check_company_access(tenant_id)
+                if not company_access["accessible"]:
+                    raise HTTPException(
+                        status_code=403, 
+                        detail=f"Company subscription expired: {company_access['message']}"
+                    )
+        
         rows = fetch_links_for_mobile(conn, mobile_id, limit, offset)
         
         # Get device layout
@@ -2896,7 +3137,7 @@ def get_device_online_status(mobile_id: str):
             cur.execute("""
                 SELECT id, is_online, last_online_at,
                        EXTRACT(EPOCH FROM (NOW() - last_online_at)) as seconds_ago,
-                       is_active
+                       is_active, tenant_id
                 FROM public.device WHERE mobile_id = %s LIMIT 1;
             """, (mobile_id,))
             row = cur.fetchone()
@@ -2907,10 +3148,20 @@ def get_device_online_status(mobile_id: str):
             is_online = row[1]
             seconds_ago = row[3]
             is_active = row[4] if row[4] is not None else True
+            tenant_id = row[5]
             
             # If device is inactive, return 404 to show "not enrolled" screen on device
             if not is_active:
                 raise HTTPException(status_code=404, detail="Device is deactivated")
+            
+            # NEW: Check company expiration - if expired, device shows "not enrolled"
+            if tenant_id:
+                company_access = check_company_access(tenant_id)
+                if not company_access["accessible"]:
+                    raise HTTPException(
+                        status_code=404, 
+                        detail=f"Company expired: {company_access['message']}"
+                    )
             
             # If last heartbeat was more than threshold seconds ago, mark offline
             if seconds_ago is not None and seconds_ago > ONLINE_THRESHOLD_SECONDS and is_online:
@@ -2927,7 +3178,12 @@ def get_device_online_status(mobile_id: str):
 
 
 @app.post("/device/{mobile_id}/online_update")
-def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
+async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
+    """Update device online status and broadcast via WebSocket."""
+    tenant_id = None
+    device_name = None
+    previous_status = None
+    
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
@@ -2935,7 +3191,7 @@ def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                 cur.execute("""
                     SELECT id, is_online, is_active, 
                            COALESCE(needs_refresh, FALSE) as needs_refresh,
-                           download_status
+                           download_status, tenant_id, device_name
                     FROM public.device WHERE mobile_id = %s LIMIT 1;
                 """, (mobile_id,))
                 device_row = cur.fetchone()
@@ -2947,11 +3203,25 @@ def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                 is_active = device_row[2] if device_row[2] is not None else True
                 needs_refresh = device_row[3] if device_row[3] is not None else False
                 download_status = device_row[4] if device_row[4] is not None else False
+                tenant_id = device_row[5]
+                device_name = device_row[6]
+                
+                # NEW: Check company expiration - if expired, device shows "Not Enrolled"
+                if tenant_id:
+                    company_access = check_company_access(tenant_id)
+                    if not company_access["accessible"]:
+                        return {
+                            "mobile_id": mobile_id,
+                            "is_online": False,
+                            "is_active": False,  # This makes device show "Not Enrolled"
+                            "force_refresh": True,
+                            "download_status": False,
+                            "company_expired": True,
+                            "message": company_access["message"]
+                        }
                 
                 # If device is deactivated, return response with is_active=false and force_refresh=true
-                # This tells the app to show enrollment screen
                 if not is_active:
-                    # Clear the needs_refresh flag since we're handling it
                     cur.execute("""
                         UPDATE public.device 
                         SET needs_refresh = FALSE, updated_at = NOW()
@@ -2983,8 +3253,26 @@ def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                         INSERT INTO public.device_online_history (did, event_type, event_at)
                         VALUES (%s, %s, NOW());
                     """, (did, event_type))
+                    
+                    # NEW: Update status duration tracking
+                    update_device_status_duration(conn, did, body.is_online, previous_status)
                 
             conn.commit()
+            
+            # NEW: Broadcast via WebSocket
+            if tenant_id and previous_status != body.is_online:
+                try:
+                    if body.is_online:
+                        asyncio.create_task(
+                            notify_device_online(tenant_id, mobile_id, device_name)
+                        )
+                    else:
+                        asyncio.create_task(
+                            notify_device_offline(tenant_id, mobile_id, device_name)
+                        )
+                except Exception as e:
+                    print(f"[WS] Broadcast error: {e}")
+            
             return {
                 "mobile_id": mobile_id, 
                 "is_online": bool(row[0]),
@@ -3050,13 +3338,14 @@ def get_shop_devices(shop_name: str):
 
 # ---------- Device creation with group/shop linking ----------
 @app.post("/device/create")
-def create_device_with_linking(body: DeviceCreateIn):
+def create_device_with_linking(body: DeviceCreateIn, user: Dict = Depends(get_current_user)):
     """Create a new device and optionally link to group and shop."""
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                # Check if device exists
-                cur.execute("SELECT id FROM public.device WHERE mobile_id = %s ORDER BY id DESC LIMIT 1;", (body.mobile_id,))
+                # Check if device exists within tenant
+                cur.execute("SELECT id FROM public.device WHERE mobile_id = %s AND tenant_id = %s ORDER BY id DESC LIMIT 1;", (body.mobile_id, tenant_id))
                 existing = cur.fetchone()
                 
                 if existing:
@@ -3076,10 +3365,10 @@ def create_device_with_linking(body: DeviceCreateIn):
                 else:
                     # Create new device with resolution and device_name
                     cur.execute("""
-                        INSERT INTO public.device (mobile_id, download_status, is_online, last_online_at, resolution, device_name)
-                        VALUES (%s, FALSE, FALSE, NOW(), %s, %s)
+                        INSERT INTO public.device (mobile_id, download_status, is_online, last_online_at, resolution, device_name, tenant_id)
+                        VALUES (%s, FALSE, FALSE, NOW(), %s, %s, %s)
                         RETURNING id;
-                    """, (body.mobile_id, body.resolution, body.device_name))
+                    """, (body.mobile_id, body.resolution, body.device_name, tenant_id))
                     did = cur.fetchone()[0]
                 
                 result = {
@@ -3156,8 +3445,6 @@ def create_device_with_linking(body: DeviceCreateIn):
                         cur.execute("""
                             INSERT INTO public.device_video_shop_group (did, vid, sid, gid)
                             VALUES (%s, %s, %s, %s)
-                            ON CONFLICT (did, vid, sid, gid) WHERE (gid IS NOT NULL)
-                            DO UPDATE SET updated_at = NOW()
                             RETURNING id;
                         """, (did, vid, sid, gid))
                         if cur.fetchone():
@@ -3177,9 +3464,16 @@ def create_device_with_linking(body: DeviceCreateIn):
         except HTTPException:
             conn.rollback()
             raise
-        except:
+        except Exception as e:
             conn.rollback()
-            raise
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[DEVICE CREATE ERROR] {str(e)}\n{tb}", flush=True)
+            return JSONResponse(
+                status_code=500,
+                content={"detail": f"Device create failed: {str(e)}", "traceback": tb.split("\n")[-6:]},
+                headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "*", "Access-Control-Allow-Headers": "*"},
+            )
 
 
 # ---------- Group video endpoints ----------
@@ -3895,8 +4189,10 @@ def download_all_devices_logs_summary(
 
 # ---------- Admin: Mark offline devices ----------
 @app.post("/admin/mark_offline_devices")
-def mark_offline_devices():
-    """Mark devices as offline if their last_online_at is older than threshold. For cron job."""
+async def mark_offline_devices():
+    """Mark devices as offline if stale. Broadcasts via WebSocket."""
+    marked_devices = []
+    
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
@@ -3906,20 +4202,30 @@ def mark_offline_devices():
                     WHERE is_online = TRUE
                       AND (last_online_at IS NULL 
                            OR last_online_at < NOW() - INTERVAL '{ONLINE_THRESHOLD_SECONDS} seconds')
-                    RETURNING id, mobile_id;
+                    RETURNING id, mobile_id, device_name, tenant_id;
                 """)
-                rows = cur.fetchall()
-                marked = [r[1] for r in rows]
+                marked_devices = cur.fetchall()
                 
                 # Log offline events for all marked devices
-                for row in rows:
+                for row in marked_devices:
                     cur.execute("""
                         INSERT INTO public.device_online_history (did, event_type, event_at)
                         VALUES (%s, 'offline', NOW());
                     """, (row[0],))
                 
             conn.commit()
-            return {"marked_offline": len(marked), "devices": marked}
+            
+            # NEW: Broadcast via WebSocket
+            for did, mobile_id, device_name, tenant_id in marked_devices:
+                if tenant_id:
+                    try:
+                        asyncio.create_task(
+                            notify_device_offline(tenant_id, mobile_id, device_name)
+                        )
+                    except Exception as e:
+                        print(f"[WS] Broadcast error: {e}")
+            
+            return {"marked_offline": len(marked_devices), "devices": [d[1] for d in marked_devices]}
         except:
             conn.rollback()
             raise
@@ -4151,82 +4457,383 @@ def get_device_uptime_report(
 
 # ========== USER MANAGEMENT ENDPOINTS ==========
 
-@app.post("/auth/login", response_model=UserLoginOut)
+@app.post("/auth/login")
 def login(body: UserLoginIn):
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, username, password_hash, full_name, role, is_active FROM public.users WHERE username = %s LIMIT 1;", (body.username.lower(),))
+            # Fetch user with company and role info
+            cur.execute("""
+                SELECT u.id, u.username, u.password_hash, u.full_name, u.role, u.is_active,
+                       u.user_type, u.tenant_id, u.role_id, u.must_change_password,
+                       c.slug as company_slug, c.name as company_name, c.status as company_status,
+                       r.name as role_name, r.permissions as role_permissions
+                FROM public.users u
+                LEFT JOIN public.company c ON u.tenant_id = c.id
+                LEFT JOIN public.role r ON u.role_id = r.id
+                WHERE u.username = %s LIMIT 1;
+            """, (body.username.lower(),))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=401, detail="Invalid username or password")
-            user_id, username, password_hash, full_name, role, is_active = row
+
+            (user_id, username, password_hash, full_name, legacy_role, is_active,
+             user_type, tenant_id, role_id, must_change_password,
+             company_slug, company_name, company_status,
+             role_name, role_permissions) = row
+
             if not is_active:
                 raise HTTPException(status_code=401, detail="Account is disabled")
             if not verify_password(body.password, password_hash):
                 raise HTTPException(status_code=401, detail="Invalid username or password")
+
+            # Company users: check company status AND expiration
+            if user_type == "company" and tenant_id:
+                if company_status == "suspended":
+                    raise HTTPException(status_code=403, detail="Company account suspended. Contact platform administrator.")
+                if company_status == "cancelled":
+                    raise HTTPException(status_code=403, detail="Company account cancelled.")
+                
+                # NEW: Check company expiration
+                company_access = check_company_access(tenant_id)
+                if not company_access["accessible"]:
+                    raise HTTPException(
+                        status_code=403, 
+                        detail=company_access["message"] or "Company subscription has expired. Contact administrator."
+                    )
+
+            # Resolve permissions: prefer role table, fallback to legacy
+            if role_permissions:
+                if isinstance(role_permissions, str):
+                    permissions = json.loads(role_permissions)
+                elif isinstance(role_permissions, list):
+                    permissions = role_permissions
+                else:
+                    permissions = list(role_permissions)
+            else:
+                # Fallback to legacy ROLE_PERMISSIONS
+                permissions = list(ROLE_PERMISSIONS.get(legacy_role, []))
+
+            # Also merge any custom permissions from user_permissions table
             cur.execute("SELECT permission FROM public.user_permissions WHERE user_id = %s;", (user_id,))
-            custom_permissions = [r[0] for r in cur.fetchall()]
-            permissions = list(set(ROLE_PERMISSIONS.get(role, []) + custom_permissions))
+            custom_perms = [r[0] for r in cur.fetchall()]
+            permissions = list(set(permissions + custom_perms))
+
+            # Effective role name
+            effective_role = role_name or legacy_role or "viewer"
+
             cur.execute("UPDATE public.users SET last_login = NOW() WHERE id = %s;", (user_id,))
             conn.commit()
-            token = generate_token()
-            active_sessions[token] = {"user_id": user_id, "username": username, "full_name": full_name, "role": role, "permissions": permissions, "expires_at": datetime.now() + timedelta(hours=24)}
-            return UserLoginOut(token=token, user_id=user_id, username=username, full_name=full_name, role=role, permissions=permissions)
+
+            token = create_session(
+                user_id=user_id,
+                username=username,
+                full_name=full_name,
+                user_type=user_type or "company",
+                tenant_id=tenant_id,
+                role_name=effective_role,
+                role_id=role_id,
+                permissions=permissions,
+                company_slug=company_slug,
+                company_name=company_name,
+            )
+
+            # Audit log
+            log_audit(conn, tenant_id, user_id, "user.login", "user", user_id)
+
+            # Track user session
+            try:
+                # Close any stale active sessions for this user first
+                cur.execute("""
+                    UPDATE public.user_session
+                    SET is_active = FALSE, logout_at = NOW(),
+                        duration_sec = EXTRACT(EPOCH FROM (NOW() - login_at))::INT
+                    WHERE user_id = %s AND is_active = TRUE;
+                """, (user_id,))
+                cur.execute("""
+                    INSERT INTO public.user_session (user_id, tenant_id, username, login_at, is_active)
+                    VALUES (%s, %s, %s, NOW(), TRUE) RETURNING id;
+                """, (user_id, tenant_id, username))
+                session_row = cur.fetchone()
+                session_id = session_row[0] if session_row else None
+            except Exception:
+                session_id = None
+
+            conn.commit()
+
+            result = {
+                "token": token,
+                "user_id": user_id,
+                "username": username,
+                "full_name": full_name,
+                "role": effective_role,
+                "permissions": permissions,
+                "user_type": user_type or "company",
+                "must_change_password": must_change_password or False,
+                "session_id": session_id,
+            }
+
+            # Include company info for company users
+            if tenant_id:
+                result["company"] = {
+                    "id": tenant_id,
+                    "slug": company_slug,
+                    "name": company_name,
+                }
+
+            return result
 
 @app.post("/auth/logout")
 def logout(authorization: Optional[str] = Header(None)):
+    user_id = None
+    tenant_id = None
     if authorization:
         token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
         if token in active_sessions:
+            session_data = active_sessions[token]
+            user_id = session_data.get("user_id")
+            tenant_id = session_data.get("tenant_id")
             del active_sessions[token]
+
+    # Close the most recent active session for this user
+    if user_id:
+        try:
+            with pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE public.user_session
+                        SET logout_at = NOW(), is_active = FALSE,
+                            duration_sec = EXTRACT(EPOCH FROM (NOW() - login_at))::INT
+                        WHERE user_id = %s AND is_active = TRUE
+                        ORDER BY login_at DESC LIMIT 1;
+                    """, (user_id,))
+                    log_audit(conn, tenant_id, user_id, "user.logout", "user", user_id)
+                conn.commit()
+        except Exception:
+            pass
     return {"message": "Logged out successfully"}
 
-@app.get("/auth/me", response_model=UserOut)
+@app.get("/auth/me")
 def get_current_user_info(user: Dict = Depends(get_current_user)):
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, username, email, full_name, role, is_active, created_at, last_login FROM public.users WHERE id = %s LIMIT 1;", (user["user_id"],))
+            cur.execute("""
+                SELECT u.id, u.username, u.email, u.full_name, u.role, u.is_active, u.created_at, u.last_login,
+                       u.user_type, u.tenant_id, u.must_change_password,
+                       c.slug as company_slug, c.name as company_name
+                FROM public.users u
+                LEFT JOIN public.company c ON u.tenant_id = c.id
+                WHERE u.id = %s LIMIT 1;
+            """, (user["user_id"],))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="User not found")
-            return UserOut(id=row[0], username=row[1], email=row[2], full_name=row[3], role=row[4], is_active=row[5], created_at=row[6], last_login=row[7], permissions=user.get("permissions", []))
+            result = {
+                "id": row[0], "username": row[1], "email": row[2], "full_name": row[3],
+                "role": row[4], "is_active": row[5], "created_at": row[6], "last_login": row[7],
+                "permissions": user.get("permissions", []),
+                "user_type": row[8] or "company",
+                "tenant_id": row[9],
+                "must_change_password": row[10] or False,
+            }
+            if row[9]:
+                result["company"] = {"id": row[9], "slug": row[11], "name": row[12]}
+            return result
+
+
+# ─── User Activity Tracking ─────────────────────────────────
+
+class PageTrackIn(BaseModel):
+    page: str
+    session_id: Optional[int] = None
+    prev_page: Optional[str] = None
+    prev_duration_sec: Optional[int] = None
+
+@app.post("/track/page")
+def track_page_visit(body: PageTrackIn, user: Dict = Depends(get_current_user)):
+    """Track which page/tab a user visits. Called by frontend on navigation."""
+    user_id = user.get("user_id")
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
+    try:
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                # If prev_page duration provided, update the last visit
+                if body.prev_page and body.prev_duration_sec is not None:
+                    cur.execute("""
+                        UPDATE public.user_page_visit
+                        SET duration_sec = %s
+                        WHERE id = (
+                            SELECT id FROM public.user_page_visit
+                            WHERE user_id = %s AND page = %s AND duration_sec IS NULL
+                            ORDER BY visited_at DESC LIMIT 1
+                        );
+                    """, (body.prev_duration_sec, user_id, body.prev_page))
+
+                # Insert new page visit
+                cur.execute("""
+                    INSERT INTO public.user_page_visit (session_id, user_id, tenant_id, page, visited_at)
+                    VALUES (%s, %s, %s, %s, NOW()) RETURNING id;
+                """, (body.session_id, user_id, tenant_id, body.page))
+            conn.commit()
+        return {"ok": True}
+    except Exception:
+        return {"ok": True}  # Never fail silently
+
+
+@app.post("/track/heartbeat")
+def track_heartbeat(user: Dict = Depends(get_current_user)):
+    """Keep user session alive — update last activity timestamp.
+    Also re-creates session if none active (e.g. after page reload)."""
+    user_id = user.get("user_id")
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
+    username = user.get("username")
+    try:
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                # Try to update existing active session
+                cur.execute("""
+                    UPDATE public.user_session
+                    SET duration_sec = EXTRACT(EPOCH FROM (NOW() - login_at))::INT,
+                        last_heartbeat = NOW()
+                    WHERE user_id = %s AND is_active = TRUE;
+                """, (user_id,))
+                if cur.rowcount == 0:
+                    # No active session — create one (page was reloaded)
+                    cur.execute("""
+                        INSERT INTO public.user_session (user_id, tenant_id, username, login_at, is_active, last_heartbeat)
+                        VALUES (%s, %s, %s, NOW(), TRUE, NOW()) RETURNING id;
+                    """, (user_id, tenant_id, username))
+            conn.commit()
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+@app.post("/track/unload")
+def track_unload(user: Dict = Depends(get_current_user)):
+    """Called on beforeunload — marks DB session inactive but does NOT delete auth token.
+    This way page reloads still work. The heartbeat timeout (2 min) is a fallback."""
+    user_id = user.get("user_id")
+    try:
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE public.user_session
+                    SET is_active = FALSE, logout_at = NOW(),
+                        duration_sec = EXTRACT(EPOCH FROM (NOW() - login_at))::INT
+                    WHERE user_id = %s AND is_active = TRUE;
+                """, (user_id,))
+            conn.commit()
+    except Exception:
+        pass
+    return {"ok": True}
+
 
 @app.get("/users", response_model=UserListOut)
 def list_users(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), user: Dict = Depends(require_permission("manage_users"))):
+    # Resolve tenant scope
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM public.users;")
-            total = cur.fetchone()[0]
-            cur.execute("SELECT u.id, u.username, u.email, u.full_name, u.role, u.is_active, u.created_at, u.last_login, ARRAY_AGG(up.permission) FILTER (WHERE up.permission IS NOT NULL) as permissions FROM public.users u LEFT JOIN public.user_permissions up ON u.id = up.user_id GROUP BY u.id ORDER BY u.created_at DESC LIMIT %s OFFSET %s;", (limit, offset))
+            if user.get("user_type") == "platform" and tenant_id is None:
+                # Platform admin without impersonation: show all users with company info
+                cur.execute("SELECT COUNT(*) FROM public.users;")
+                total = cur.fetchone()[0]
+                cur.execute("""SELECT u.id, u.username, u.email, u.full_name, u.role, u.is_active, u.created_at, u.last_login,
+                    ARRAY_AGG(up.permission) FILTER (WHERE up.permission IS NOT NULL) as permissions,
+                    u.user_type, u.tenant_id, c.slug as company_slug, c.name as company_name
+                    FROM public.users u LEFT JOIN public.user_permissions up ON u.id = up.user_id
+                    LEFT JOIN public.company c ON u.tenant_id = c.id
+                    GROUP BY u.id, c.slug, c.name ORDER BY u.created_at DESC LIMIT %s OFFSET %s;""", (limit, offset))
+            else:
+                # Scoped to tenant
+                cur.execute("SELECT COUNT(*) FROM public.users WHERE tenant_id = %s;", (tenant_id,))
+                total = cur.fetchone()[0]
+                cur.execute("""SELECT u.id, u.username, u.email, u.full_name, u.role, u.is_active, u.created_at, u.last_login,
+                    ARRAY_AGG(up.permission) FILTER (WHERE up.permission IS NOT NULL) as permissions,
+                    u.user_type, u.tenant_id, c.slug as company_slug, c.name as company_name
+                    FROM public.users u LEFT JOIN public.user_permissions up ON u.id = up.user_id
+                    LEFT JOIN public.company c ON u.tenant_id = c.id
+                    WHERE u.tenant_id = %s
+                    GROUP BY u.id, c.slug, c.name ORDER BY u.created_at DESC LIMIT %s OFFSET %s;""", (tenant_id, limit, offset))
             items = []
             for row in cur.fetchall():
                 permissions = row[8] if row[8] else []
                 all_perms = list(set(ROLE_PERMISSIONS.get(row[4], []) + permissions))
-                items.append(UserOut(id=row[0], username=row[1], email=row[2], full_name=row[3], role=row[4], is_active=row[5], created_at=row[6], last_login=row[7], permissions=all_perms))
+                items.append(UserOut(id=row[0], username=row[1], email=row[2], full_name=row[3], role=row[4], is_active=row[5], created_at=row[6], last_login=row[7], permissions=all_perms,
+                    user_type=row[9], tenant_id=row[10], company_slug=row[11], company_name=row[12]))
             return UserListOut(items=items, total=total)
 
 @app.post("/users", response_model=UserOut)
 def create_user(body: UserCreateIn, user: Dict = Depends(require_permission("manage_users"))):
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
+
+    # Platform admin can assign user to a specific company via company_slug
+    target_company_slug = None
+    target_company_name = None
+    if body.company_slug and user.get("user_type") == "platform":
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, slug, name FROM public.company WHERE slug = %s", (body.company_slug,))
+                c = cur.fetchone()
+                if not c:
+                    raise HTTPException(status_code=404, detail=f"Company '{body.company_slug}' not found")
+                tenant_id = c[0]
+                target_company_slug = c[1]
+                target_company_name = c[2]
+
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM public.users WHERE username = %s;", (body.username.lower(),))
-                if cur.fetchone():
-                    raise HTTPException(status_code=400, detail="Username already exists")
+                # Check uniqueness globally - same username cannot exist in any company
+                cur.execute("""SELECT u.id, c.name FROM public.users u 
+                    LEFT JOIN public.company c ON u.tenant_id = c.id 
+                    WHERE u.username = %s;""", (body.username.lower(),))
+                existing = cur.fetchone()
+                if existing:
+                    company_name = existing[1] or "Platform"
+                    raise HTTPException(status_code=400, detail=f"Username '{body.username.lower()}' is already assigned to '{company_name}'. Please use another username.")
                 if body.email:
-                    cur.execute("SELECT id FROM public.users WHERE email = %s;", (body.email.lower(),))
-                    if cur.fetchone():
-                        raise HTTPException(status_code=400, detail="Email already exists")
+                    cur.execute("""SELECT u.id, c.name FROM public.users u 
+                        LEFT JOIN public.company c ON u.tenant_id = c.id 
+                        WHERE u.email = %s;""", (body.email.lower(),))
+                    existing_email = cur.fetchone()
+                    if existing_email:
+                        company_name = existing_email[1] or "Platform"
+                        raise HTTPException(status_code=400, detail=f"Email '{body.email.lower()}' is already assigned to '{company_name}'. Please use another email.")
                 if body.role not in ROLE_PERMISSIONS:
                     raise HTTPException(status_code=400, detail=f"Invalid role")
+
+                # Check quota for company users
+                if tenant_id:
+                    cur.execute("SELECT max_users FROM public.company WHERE id = %s;", (tenant_id,))
+                    company_row = cur.fetchone()
+                    if company_row:
+                        cur.execute("SELECT COUNT(*) FROM public.users WHERE tenant_id = %s;", (tenant_id,))
+                        current_count = cur.fetchone()[0]
+                        if current_count >= company_row[0]:
+                            raise HTTPException(status_code=400, detail=f"User limit reached ({company_row[0]})")
+
                 password_hash = hash_password(body.password)
-                cur.execute("INSERT INTO public.users (username, email, password_hash, full_name, role, created_by) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id, created_at;", (body.username.lower(), body.email.lower() if body.email else None, password_hash, body.full_name, body.role, user["user_id"]))
+                user_type = "platform" if tenant_id is None and user.get("user_type") == "platform" else "company"
+                cur.execute("""INSERT INTO public.users (username, email, password_hash, full_name, role, created_by, tenant_id, user_type)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id, created_at;""",
+                    (body.username.lower(), body.email.lower() if body.email else None, password_hash, body.full_name, body.role, user["user_id"], tenant_id, user_type))
                 new_user_id, created_at = cur.fetchone()
                 for perm in body.permissions:
                     cur.execute("INSERT INTO public.user_permissions (user_id, permission) VALUES (%s, %s) ON CONFLICT DO NOTHING;", (new_user_id, perm))
+
+                # Fetch company info if we don't have it yet
+                if tenant_id and not target_company_slug:
+                    cur.execute("SELECT slug, name FROM public.company WHERE id = %s", (tenant_id,))
+                    cr = cur.fetchone()
+                    if cr:
+                        target_company_slug = cr[0]
+                        target_company_name = cr[1]
+
                 conn.commit()
                 all_perms = list(set(ROLE_PERMISSIONS.get(body.role, []) + body.permissions))
-                return UserOut(id=new_user_id, username=body.username.lower(), email=body.email, full_name=body.full_name, role=body.role, is_active=True, created_at=created_at, last_login=None, permissions=all_perms)
+                return UserOut(id=new_user_id, username=body.username.lower(), email=body.email, full_name=body.full_name, role=body.role, is_active=True, created_at=created_at, last_login=None, permissions=all_perms,
+                    user_type=user_type, tenant_id=tenant_id, company_slug=target_company_slug, company_name=target_company_name)
         except HTTPException:
             conn.rollback()
             raise
@@ -4395,9 +5002,11 @@ def _ad_slug(s: str) -> str:
     s = re.sub(r"[^\w\-.]+", "-", s, flags=re.UNICODE)
     return re.sub(r"-{2,}", "-", s).strip("-").lower()
 
-def _make_ad_s3_key(ad_name: str, ext: str = ".jpg") -> str:
+def _make_ad_s3_key(ad_name: str, ext: str = ".jpg", tenant_slug: str = None) -> str:
     base = _ad_slug(ad_name)
     filename = f"{base}{ext}"
+    if tenant_slug:
+        return f"tenants/{tenant_slug}/advertisements/{filename}"
     return f"{S3_AD_PREFIX}/{filename}".strip("/") if S3_AD_PREFIX else filename
 
 def _to_ad_s3_uri(key: str) -> str:
@@ -4437,20 +5046,37 @@ def ad_presign_get_object(s3_uri: str, expires_in: int = AD_PRESIGN_EXPIRES) -> 
 
 # --- Advertisement CRUD ---
 @app.get("/advertisements")
-def list_advertisements(q: Optional[str] = Query(None), limit: int = Query(50, ge=1, le=1000), offset: int = Query(0, ge=0)):
-    """List all advertisements."""
+def list_advertisements(q: Optional[str] = Query(None), limit: int = Query(50, ge=1, le=1000), offset: int = Query(0, ge=0), user: Dict = Depends(get_current_user)):
+    """List all advertisements for the current tenant."""
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            sql = """SELECT id, ad_name, s3_link, rotation, fit_mode, display_duration, created_at, updated_at
-                     FROM public.advertisement"""
-            if q:
-                cur.execute(sql + " WHERE ad_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s", (f"%{q}%", limit, offset))
+            if tenant_id:
+                base = """SELECT id, ad_name, s3_link, rotation, fit_mode, display_duration, created_at, updated_at
+                         FROM public.advertisement"""
+                if q:
+                    cur.execute(base + " WHERE tenant_id = %s AND ad_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s", (tenant_id, f"%{q}%", limit, offset))
+                else:
+                    cur.execute(base + " WHERE tenant_id = %s ORDER BY id DESC LIMIT %s OFFSET %s", (tenant_id, limit, offset))
+                rows = cur.fetchall()
+                items = [{"id": r[0], "ad_name": r[1], "s3_link": r[2], "rotation": r[3],
+                          "fit_mode": r[4], "display_duration": r[5], "created_at": r[6], "updated_at": r[7]} 
+                         for r in rows]
             else:
-                cur.execute(sql + " ORDER BY id DESC LIMIT %s OFFSET %s", (limit, offset))
-            rows = cur.fetchall()
-            items = [{"id": r[0], "ad_name": r[1], "s3_link": r[2], "rotation": r[3],
-                      "fit_mode": r[4], "display_duration": r[5], "created_at": r[6], "updated_at": r[7]} 
-                     for r in rows]
+                # Platform admin: include company name
+                base = """SELECT a.id, a.ad_name, a.s3_link, a.rotation, a.fit_mode, a.display_duration,
+                                 a.created_at, a.updated_at, c.name as company_name, c.slug as company_slug
+                          FROM public.advertisement a
+                          LEFT JOIN public.company c ON c.id = a.tenant_id"""
+                if q:
+                    cur.execute(base + " WHERE a.ad_name ILIKE %s ORDER BY a.id DESC LIMIT %s OFFSET %s", (f"%{q}%", limit, offset))
+                else:
+                    cur.execute(base + " ORDER BY a.id DESC LIMIT %s OFFSET %s", (limit, offset))
+                rows = cur.fetchall()
+                items = [{"id": r[0], "ad_name": r[1], "s3_link": r[2], "rotation": r[3],
+                          "fit_mode": r[4], "display_duration": r[5], "created_at": r[6], "updated_at": r[7],
+                          "company_name": r[8], "company_slug": r[9]} 
+                         for r in rows]
             return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
 
 @app.get("/advertisement/{ad_name}")
@@ -4498,12 +5124,17 @@ async def upload_advertisement(
     rotation: int = Form(0),
     fit_mode: str = Form("cover"),
     display_duration: int = Form(10),
+    user: Dict = Depends(get_current_user),
 ):
     """Upload an image advertisement to S3 and create database record."""
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     try:
         # Detect file extension
         ext = _detect_image_extension(file.filename or ad_name)
-        key = _make_ad_s3_key(ad_name, ext)
+        tenant_slug = _get_tenant_slug(tenant_id)
+        # Append company suffix for tenant isolation
+        stored_name = f"{ad_name}-{tenant_slug}" if tenant_slug and tenant_slug != "default" else ad_name
+        key = _make_ad_s3_key(stored_name, ext, tenant_slug=tenant_slug)
         content_type = _get_content_type_for_image(ext)
         
         # Check if exists (if not overwriting)
@@ -4529,14 +5160,34 @@ async def upload_advertisement(
         # Upsert to database
         with pg_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO public.advertisement (ad_name, s3_link, rotation, fit_mode, display_duration)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (ad_name)
-                    DO UPDATE SET s3_link = EXCLUDED.s3_link, rotation = EXCLUDED.rotation,
-                        fit_mode = EXCLUDED.fit_mode, display_duration = EXCLUDED.display_duration, updated_at = NOW()
-                    RETURNING id;
-                """, (ad_name, s3_uri, rotation, fit_mode, display_duration))
+                if tenant_id:
+                    cur.execute("""
+                        INSERT INTO public.advertisement (ad_name, s3_link, rotation, fit_mode, display_duration, tenant_id)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT DO NOTHING;
+                    """, (stored_name, s3_uri, rotation, fit_mode, display_duration, tenant_id))
+                    if cur.rowcount == 0:
+                        cur.execute("""
+                            UPDATE public.advertisement SET s3_link = %s, rotation = %s,
+                                fit_mode = %s, display_duration = %s, updated_at = NOW()
+                            WHERE ad_name = %s AND tenant_id = %s RETURNING id;
+                        """, (s3_uri, rotation, fit_mode, display_duration, stored_name, tenant_id))
+                    else:
+                        cur.execute("SELECT id FROM public.advertisement WHERE ad_name = %s AND tenant_id = %s ORDER BY id DESC LIMIT 1;", (stored_name, tenant_id))
+                else:
+                    cur.execute("""
+                        INSERT INTO public.advertisement (ad_name, s3_link, rotation, fit_mode, display_duration)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT DO NOTHING;
+                    """, (ad_name, s3_uri, rotation, fit_mode, display_duration))
+                    if cur.rowcount == 0:
+                        cur.execute("""
+                            UPDATE public.advertisement SET s3_link = %s, rotation = %s,
+                                fit_mode = %s, display_duration = %s, updated_at = NOW()
+                            WHERE ad_name = %s RETURNING id;
+                        """, (s3_uri, rotation, fit_mode, display_duration, ad_name))
+                    else:
+                        cur.execute("SELECT id FROM public.advertisement WHERE ad_name = %s ORDER BY id DESC LIMIT 1;", (ad_name,))
                 new_id = cur.fetchone()[0]
                 conn.commit()
         
@@ -4638,20 +5289,54 @@ def set_advertisement_fit_mode(ad_name: str, body: AdvertisementFitModeUpdate):
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/advertisement/{ad_name}")
-def delete_advertisement(ad_name: str):
-    """Delete an advertisement."""
+def delete_advertisement(ad_name: str, force: bool = Query(False)):
+    """Delete an advertisement. Returns 409 with linked info if linked and force=false."""
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM public.advertisement WHERE ad_name = %s RETURNING id;", (ad_name,))
-                rows = cur.fetchall()
-                conn.commit()
-                if not rows:
+                cur.execute("SELECT id FROM public.advertisement WHERE ad_name = %s LIMIT 1;", (ad_name,))
+                row = cur.fetchone()
+                if not row:
                     raise HTTPException(status_code=404, detail="Advertisement not found")
-                return {"deleted_count": len(rows)}
+                aid = row[0]
+
+                linked = {}
+                cur.execute("SELECT COUNT(*) FROM public.device_advertisement_shop_group WHERE aid = %s", (aid,))
+                cnt = cur.fetchone()[0]
+                if cnt: linked["device_links"] = cnt
+                cur.execute("SELECT COUNT(*) FROM public.group_advertisement WHERE aid = %s", (aid,))
+                cnt = cur.fetchone()[0]
+                if cnt: linked["group_links"] = cnt
+
+                if linked and not force:
+                    raise HTTPException(status_code=409, detail={
+                        "message": f"Advertisement '{ad_name}' is linked to other resources. Delete will unlink everything.",
+                        "linked": linked,
+                        "ad_name": ad_name,
+                    })
+
+                unlinked = {}
+                cur.execute("DELETE FROM public.device_advertisement_shop_group WHERE aid = %s", (aid,))
+                if cur.rowcount: unlinked["device_links"] = cur.rowcount
+                cur.execute("DELETE FROM public.group_advertisement WHERE aid = %s", (aid,))
+                if cur.rowcount: unlinked["group_links"] = cur.rowcount
+
+                # Get S3 link before deleting DB record
+                cur.execute("SELECT s3_link FROM public.advertisement WHERE id = %s;", (aid,))
+                s3_row = cur.fetchone()
+                s3_key = _s3_key_from_uri(s3_row[0]) if s3_row and s3_row[0] else None
+
+                cur.execute("DELETE FROM public.advertisement WHERE id = %s RETURNING id;", (aid,))
+                rows = cur.fetchall()
+            conn.commit()
+
+            # Delete from S3 after DB commit
+            if s3_key:
+                _s3_delete_key(s3_key)
+
+            return {"deleted_count": len(rows), "unlinked": unlinked}
         except HTTPException:
-            conn.rollback()
-            raise
+            conn.rollback(); raise
         except Exception as e:
             conn.rollback()
             raise HTTPException(status_code=500, detail=str(e))
@@ -5133,15 +5818,58 @@ class StandaloneFitModeUpdate(BaseModel):
 S3_VIDEO_PREFIX = os.getenv("S3_PREFIX", "myvideos").strip("/")
 S3_VIDEO_FORCED_EXT = ".mp4"
 
+# Cache tenant slugs to avoid repeated DB lookups
+_tenant_slug_cache: Dict[int, str] = {}
+
+def _get_tenant_slug(tenant_id) -> Optional[str]:
+    """Get company slug for tenant-scoped S3 paths."""
+    if not tenant_id:
+        return None
+    tid = int(tenant_id)
+    if tid in _tenant_slug_cache:
+        return _tenant_slug_cache[tid]
+    try:
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT slug FROM public.company WHERE id = %s;", (tid,))
+                row = cur.fetchone()
+                if row:
+                    _tenant_slug_cache[tid] = row[0]
+                    return row[0]
+    except Exception:
+        pass
+    return None
+
+def _s3_delete_key(key: str):
+    """Delete a single S3 object. Silently ignores errors."""
+    if not key:
+        return
+    try:
+        s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else boto3.client("s3")
+        s3.delete_object(Bucket=S3_BUCKET, Key=key)
+    except Exception as e:
+        print(f"[S3 delete] Warning: failed to delete {key}: {e}")
+
+def _s3_key_from_uri(s3_uri: str) -> Optional[str]:
+    """Extract S3 key from s3://bucket/key URI."""
+    if not s3_uri:
+        return None
+    if s3_uri.startswith("s3://"):
+        parts = s3_uri.replace("s3://", "").split("/", 1)
+        return parts[1] if len(parts) > 1 else None
+    return s3_uri
+
 def _video_slug(s: str) -> str:
     import re as _re
     s = s.strip()
     s = _re.sub(r"[^\w\-.]+", "-", s, flags=_re.UNICODE)
     return _re.sub(r"-{2,}", "-", s).strip("-").lower()
 
-def _make_video_s3_key(video_name: str) -> str:
+def _make_video_s3_key(video_name: str, tenant_slug: str = None) -> str:
     base = _video_slug(video_name)
     filename = f"{base}{S3_VIDEO_FORCED_EXT}"
+    if tenant_slug:
+        return f"tenants/{tenant_slug}/videos/{filename}"
     return f"{S3_VIDEO_PREFIX}/{filename}".strip("/") if S3_VIDEO_PREFIX else filename
 
 def _to_video_s3_uri(key: str) -> str:
@@ -5185,17 +5913,35 @@ def _parse_video_s3_link(s3_link: str):
 # ═══════════════ DEVICE CRUD ═══════════════
 
 @app.post("/insert_device")
-def standalone_insert_device(req: StandaloneDeviceRequest):
+def standalone_insert_device(req: StandaloneDeviceRequest, user: Dict = Depends(get_current_user)):
     mobile = (req.mobile_id or "").strip()
     if not mobile:
         raise HTTPException(status_code=400, detail="mobile_id is required")
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
     with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO public.device (mobile_id, download_status) VALUES (%s, %s) RETURNING id;",
-                        (mobile, bool(req.download_status)))
-            new_id = cur.fetchone()[0]
-        conn.commit()
-    return {"id": new_id, "message": "Device inserted successfully"}
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO public.device (mobile_id, download_status, tenant_id) VALUES (%s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    RETURNING id;
+                """, (mobile, bool(req.download_status), tenant_id))
+                row = cur.fetchone()
+                if row:
+                    new_id = row[0]
+                    conn.commit()
+                    return {"id": new_id, "message": "Device inserted successfully"}
+                else:
+                    cur.execute("SELECT id FROM public.device WHERE mobile_id = %s AND tenant_id = %s LIMIT 1;", (mobile, tenant_id))
+                    existing = cur.fetchone()
+                    if existing:
+                        return {"id": existing[0], "message": "Device already exists", "existed": True}
+                    raise HTTPException(status_code=409, detail=f"Device '{mobile}' already exists")
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail=f"Device '{mobile}' already exists")
 
 @app.get("/device/{mobile_id}")
 def standalone_get_device(mobile_id: str = Path(...)):
@@ -5212,19 +5958,43 @@ def standalone_list_devices(
     q: Optional[str] = Query(None, description="Search mobile_id or device_name (ILIKE)"),
     limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    user: Dict = Depends(get_current_user),
 ):
+    """
+    List devices with enhanced status information:
+    - is_online: Whether device is currently online
+    - last_online_at: Last time device reported online
+    - temperature: Last reported temperature
+    - content_status: 'synced' | 'syncing' | 'pending' | 'unknown'
+    - video_count: Number of videos assigned to device
+    - downloaded_count: Number of videos downloaded on device
+    """
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
+            # Build tenant filter
+            tenant_filter = "d.tenant_id = %s" if tenant_id else "TRUE"
+            tenant_params = [tenant_id] if tenant_id else []
+
             if q:
-                cur.execute("SELECT COUNT(*) FROM public.device WHERE mobile_id ILIKE %s OR device_name ILIKE %s;", (f"%{q}%", f"%{q}%"))
+                cur.execute(f"SELECT COUNT(*) FROM public.device d WHERE {tenant_filter} AND (d.mobile_id ILIKE %s OR d.device_name ILIKE %s);",
+                            tenant_params + [f"%{q}%", f"%{q}%"])
             else:
-                cur.execute("SELECT COUNT(*) FROM public.device;")
+                cur.execute(f"SELECT COUNT(*) FROM public.device d WHERE {tenant_filter};", tenant_params)
             total = int(cur.fetchone()[0])
 
-            base_sql = """
+            # Enhanced query with online status, temperature, and content counts
+            base_sql = f"""
                 SELECT d.id, d.mobile_id, d.download_status, d.created_at, d.updated_at,
                        d.resolution, d.device_name,
-                       COALESCE(g1.gname, g2.gname) as group_name, d.is_active
+                       COALESCE(g1.gname, g2.gname) as group_name, d.is_active,
+                       d.is_online, d.last_online_at, d.temperature,
+                       -- Count assigned videos
+                       COALESCE(vc.video_count, 0) as video_count,
+                       -- Count downloaded videos (from download_progress JSON if available)
+                       COALESCE(dc.downloaded_count, 0) as downloaded_count,
+                       -- Last content update time
+                       COALESCE(lc.last_content_update, d.updated_at) as last_content_update
                 FROM public.device d
                 LEFT JOIN public.device_assignment da ON da.did = d.id
                 LEFT JOIN public."group" g1 ON g1.id = da.gid
@@ -5234,21 +6004,78 @@ def standalone_list_devices(
                     JOIN public."group" g ON g.id = dvsg.gid
                     WHERE dvsg.gid IS NOT NULL
                 ) g2 ON g2.did = d.id AND g1.gname IS NULL
+                -- Video count subquery
+                LEFT JOIN (
+                    SELECT did, COUNT(DISTINCT vid) as video_count
+                    FROM public.device_video_shop_group
+                    GROUP BY did
+                ) vc ON vc.did = d.id
+                -- Downloaded count (estimate from download_status)
+                LEFT JOIN (
+                    SELECT did, COUNT(*) as downloaded_count
+                    FROM public.device_video_shop_group
+                    WHERE vid IS NOT NULL
+                    GROUP BY did
+                ) dc ON dc.did = d.id AND d.download_status = TRUE
+                -- Last content update
+                LEFT JOIN (
+                    SELECT did, MAX(updated_at) as last_content_update
+                    FROM public.device_video_shop_group
+                    GROUP BY did
+                ) lc ON lc.did = d.id
+                WHERE {tenant_filter}
             """
             if q:
-                cur.execute(base_sql + " WHERE d.mobile_id ILIKE %s OR d.device_name ILIKE %s ORDER BY d.id DESC LIMIT %s OFFSET %s;",
-                            (f"%{q}%", f"%{q}%", limit, offset))
+                cur.execute(base_sql + " AND (d.mobile_id ILIKE %s OR d.device_name ILIKE %s) ORDER BY d.id DESC LIMIT %s OFFSET %s;",
+                            tenant_params + [f"%{q}%", f"%{q}%", limit, offset])
             else:
-                cur.execute(base_sql + " ORDER BY d.id DESC LIMIT %s OFFSET %s;", (limit, offset))
+                cur.execute(base_sql + " ORDER BY d.id DESC LIMIT %s OFFSET %s;", tenant_params + [limit, offset])
             rows = cur.fetchall()
 
-    items = [
-        {"id": r[0], "mobile_id": r[1], "download_status": r[2], "created_at": r[3], "updated_at": r[4],
-         "resolution": r[5] if len(r) > 5 else None, "device_name": r[6] if len(r) > 6 else None,
-         "group_name": r[7] if len(r) > 7 else None,
-         "is_active": r[8] if len(r) > 8 and r[8] is not None else True}
-        for r in rows
-    ]
+    items = []
+    for r in rows:
+        is_online = r[9] if len(r) > 9 else False
+        last_online_at = r[10] if len(r) > 10 else None
+        download_status = r[2]
+        video_count = r[12] if len(r) > 12 else 0
+        downloaded_count = r[13] if len(r) > 13 else 0
+        
+        # Determine content_status
+        # - synced: All videos downloaded, device has checked in recently
+        # - syncing: Device is online and downloading
+        # - pending: Content assigned but not yet downloaded
+        # - unknown: No content assigned or device hasn't checked in
+        if video_count == 0:
+            content_status = "no_content"
+        elif download_status and is_online:
+            content_status = "synced"
+        elif is_online and not download_status:
+            content_status = "syncing"
+        elif download_status and not is_online:
+            content_status = "synced"  # Was synced, now offline
+        else:
+            content_status = "pending"
+        
+        items.append({
+            "id": r[0], 
+            "mobile_id": r[1], 
+            "download_status": r[2], 
+            "created_at": r[3], 
+            "updated_at": r[4],
+            "resolution": r[5] if len(r) > 5 else None, 
+            "device_name": r[6] if len(r) > 6 else None,
+            "group_name": r[7] if len(r) > 7 else None,
+            "is_active": r[8] if len(r) > 8 and r[8] is not None else True,
+            # Enhanced fields
+            "is_online": is_online,
+            "last_online_at": last_online_at,
+            "temperature": r[11] if len(r) > 11 else None,
+            "video_count": video_count,
+            "downloaded_count": downloaded_count if download_status else 0,
+            "content_status": content_status,
+            "last_content_update": r[14] if len(r) > 14 else None,
+        })
+    
     return {"items": items, "total": total, "count": len(items), "limit": limit, "offset": offset, "query": q}
 
 @app.put("/device/{mobile_id}")
@@ -5271,34 +6098,97 @@ def standalone_update_device(mobile_id: str, patch: StandaloneDeviceUpdate):
     return {"message": "Device updated", "item": {"id": row[0], "mobile_id": row[1], "download_status": row[2], "created_at": row[3], "updated_at": row[4]}}
 
 @app.delete("/device/{mobile_id}")
-def standalone_delete_device(mobile_id: str):
-    # Check for links first
+def standalone_delete_device(mobile_id: str, force: bool = Query(False)):
     with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id FROM public.device WHERE mobile_id = %s ORDER BY id DESC;", (mobile_id,))
-            device_ids = [r[0] for r in cur.fetchall()]
-            if not device_ids:
-                raise HTTPException(status_code=404, detail="Device not found")
-            cur.execute("SELECT COUNT(*) FROM public.device_video_shop_group WHERE did = ANY(%s::bigint[]);", (device_ids,))
-            linked_count = int(cur.fetchone()[0])
-            if linked_count > 0:
-                raise HTTPException(status_code=409, detail=f"Device '{mobile_id}' has {linked_count} link(s). Remove links first.")
-            cur.execute("DELETE FROM public.device WHERE mobile_id = %s RETURNING id;", (mobile_id,))
-            deleted = cur.fetchall()
-        conn.commit()
-    return {"deleted_count": len(deleted)}
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM public.device WHERE mobile_id = %s ORDER BY id DESC;", (mobile_id,))
+                device_ids = [r[0] for r in cur.fetchall()]
+                if not device_ids:
+                    raise HTTPException(status_code=404, detail="Device not found")
+
+                # Check all FK references
+                linked = {}
+                for tbl, col, label in [
+                    ("device_video_shop_group", "did", "video_links"),
+                    ("device_advertisement_shop_group", "did", "ad_links"),
+                    ("device_assignment", "did", "group_assignments"),
+                    ("device_layout", "did", "layouts"),
+                    ("device_logs", "did", "logs"),
+                ]:
+                    try:
+                        cur.execute(f"SELECT COUNT(*) FROM public.{tbl} WHERE {col} = ANY(%s::bigint[]);", (device_ids,))
+                        cnt = cur.fetchone()[0]
+                        if cnt: linked[label] = cnt
+                    except Exception:
+                        pass
+
+                if linked and not force:
+                    raise HTTPException(status_code=409, detail={
+                        "message": f"Device '{mobile_id}' has linked resources. Use force=true to unlink and delete.",
+                        "linked": linked,
+                        "mobile_id": mobile_id,
+                    })
+
+                # Unlink everything
+                unlinked = {}
+                for tbl, col, label in [
+                    ("device_video_shop_group", "did", "video_links"),
+                    ("device_advertisement_shop_group", "did", "ad_links"),
+                    ("device_assignment", "did", "group_assignments"),
+                    ("device_layout", "did", "layouts"),
+                    ("device_logs", "did", "logs"),
+                    ("device_temperature", "did", "temperatures"),
+                    ("device_online_history", "did", "online_history"),
+                ]:
+                    try:
+                        cur.execute(f"SAVEPOINT sp_{label}")
+                        cur.execute(f"DELETE FROM public.{tbl} WHERE {col} = ANY(%s::bigint[]);", (device_ids,))
+                        if cur.rowcount: unlinked[label] = cur.rowcount
+                        cur.execute(f"RELEASE SAVEPOINT sp_{label}")
+                    except Exception:
+                        cur.execute(f"ROLLBACK TO SAVEPOINT sp_{label}")
+
+                cur.execute("DELETE FROM public.device WHERE mobile_id = %s RETURNING id;", (mobile_id,))
+                deleted = cur.fetchall()
+            conn.commit()
+            return {"deleted_count": len(deleted), "unlinked": unlinked}
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 # ═══════════════ GROUP CRUD ═══════════════
 
 @app.post("/insert_group")
-def standalone_insert_group(req: StandaloneGroupCreate):
+def standalone_insert_group(req: StandaloneGroupCreate, user: Dict = Depends(get_current_user)):
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
     with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute('INSERT INTO public."group" (gname) VALUES (%s) RETURNING id;', (req.gname,))
-            new_id = cur.fetchone()[0]
-        conn.commit()
-    return {"id": new_id, "message": "Group inserted successfully"}
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO public."group" (gname, tenant_id) VALUES (%s, %s)
+                    ON CONFLICT DO NOTHING
+                    RETURNING id;
+                """, (req.gname, tenant_id))
+                row = cur.fetchone()
+                if row:
+                    new_id = row[0]
+                    conn.commit()
+                    return {"id": new_id, "message": "Group inserted successfully"}
+                else:
+                    cur.execute('SELECT id FROM public."group" WHERE gname = %s AND tenant_id = %s LIMIT 1;', (req.gname, tenant_id))
+                    existing = cur.fetchone()
+                    if existing:
+                        return {"id": existing[0], "message": "Group already exists", "existed": True}
+                    raise HTTPException(status_code=409, detail=f"Group '{req.gname}' already exists")
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail=f"Group '{req.gname}' already exists")
 
 @app.get("/group/{gname}")
 def standalone_get_group(gname: str = Path(...)):
@@ -5315,14 +6205,22 @@ def standalone_list_groups(
     q: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    user: Dict = Depends(get_current_user),
 ):
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
+            t_filter = 'tenant_id = %s AND' if tenant_id else ''
+            t_params = [tenant_id] if tenant_id else []
             if q:
-                cur.execute('SELECT id, gname, created_at, updated_at FROM public."group" WHERE gname ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s;',
-                            (f"%{q}%", limit, offset))
+                cur.execute(f'SELECT id, gname, created_at, updated_at FROM public."group" WHERE {t_filter} gname ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s;',
+                            t_params + [f"%{q}%", limit, offset])
             else:
-                cur.execute('SELECT id, gname, created_at, updated_at FROM public."group" ORDER BY id DESC LIMIT %s OFFSET %s;', (limit, offset))
+                if tenant_id:
+                    cur.execute(f'SELECT id, gname, created_at, updated_at FROM public."group" WHERE tenant_id = %s ORDER BY id DESC LIMIT %s OFFSET %s;',
+                                (tenant_id, limit, offset))
+                else:
+                    cur.execute('SELECT id, gname, created_at, updated_at FROM public."group" ORDER BY id DESC LIMIT %s OFFSET %s;', (limit, offset))
             rows = cur.fetchall()
     items = [{"id": r[0], "gname": r[1], "created_at": r[2], "updated_at": r[3]} for r in rows]
     return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
@@ -5343,27 +6241,63 @@ def standalone_update_group(gname: str, patch: StandaloneGroupUpdate):
 @app.delete("/group/{gname}")
 def standalone_delete_group(gname: str, force: bool = Query(False)):
     with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (gname,))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Group not found")
-            gid = row[0]
-            # Check device attachments
-            cur.execute("SELECT COUNT(*) FROM public.device_assignment WHERE gid = %s;", (gid,))
-            dev_count = int(cur.fetchone()[0])
-            if dev_count > 0 and not force:
-                raise HTTPException(status_code=409, detail=f"Group has {dev_count} device(s) attached. Use ?force=true to delete.")
-            if force:
-                cur.execute("DELETE FROM public.device_assignment WHERE gid = %s;", (gid,))
-                cur.execute("DELETE FROM public.device_video_shop_group WHERE gid = %s;", (gid,))
-                cur.execute("DELETE FROM public.group_video WHERE gid = %s;", (gid,))
-                cur.execute("DELETE FROM public.group_advertisement WHERE gid = %s;", (gid,))
-            cur.execute("DELETE FROM public.group_video WHERE gid = %s;", (gid,))
-            cur.execute('DELETE FROM public."group" WHERE gname = %s RETURNING id;', (gname,))
-            deleted = cur.fetchall()
-        conn.commit()
-    return {"deleted_count": len(deleted), "devices_unassigned": dev_count if force else 0}
+        try:
+            with conn.cursor() as cur:
+                cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (gname,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="Group not found")
+                gid = row[0]
+
+                # Check all FK references
+                linked = {}
+                for tbl, col, label in [
+                    ("device_assignment", "gid", "device_assignments"),
+                    ("device_video_shop_group", "gid", "video_links"),
+                    ("device_advertisement_shop_group", "gid", "ad_links"),
+                    ("group_video", "gid", "group_videos"),
+                    ("group_advertisement", "gid", "group_ads"),
+                ]:
+                    try:
+                        cur.execute(f"SELECT COUNT(*) FROM public.{tbl} WHERE {col} = %s;", (gid,))
+                        cnt = cur.fetchone()[0]
+                        if cnt: linked[label] = cnt
+                    except Exception:
+                        pass
+
+                if linked and not force:
+                    raise HTTPException(status_code=409, detail={
+                        "message": f"Group '{gname}' has linked resources. Use force=true to unlink and delete.",
+                        "linked": linked,
+                        "gname": gname,
+                    })
+
+                # Unlink everything
+                unlinked = {}
+                for tbl, col, label in [
+                    ("device_video_shop_group", "gid", "video_links"),
+                    ("device_advertisement_shop_group", "gid", "ad_links"),
+                    ("device_assignment", "gid", "device_assignments"),
+                    ("group_video", "gid", "group_videos"),
+                    ("group_advertisement", "gid", "group_ads"),
+                ]:
+                    try:
+                        cur.execute(f"SAVEPOINT sp_{label}")
+                        cur.execute(f"DELETE FROM public.{tbl} WHERE {col} = %s;", (gid,))
+                        if cur.rowcount: unlinked[label] = cur.rowcount
+                        cur.execute(f"RELEASE SAVEPOINT sp_{label}")
+                    except Exception:
+                        cur.execute(f"ROLLBACK TO SAVEPOINT sp_{label}")
+
+                cur.execute('DELETE FROM public."group" WHERE id = %s RETURNING id;', (gid,))
+                deleted = cur.fetchall()
+            conn.commit()
+            return {"deleted_count": len(deleted), "unlinked": unlinked}
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/group/{gname}/unassign-devices")
 def standalone_unassign_group_devices(gname: str):
@@ -5385,13 +6319,34 @@ def standalone_unassign_group_devices(gname: str):
 # ═══════════════ SHOP CRUD ═══════════════
 
 @app.post("/insert_shop")
-def standalone_insert_shop(req: StandaloneShopCreate):
+def standalone_insert_shop(req: StandaloneShopCreate, user: Dict = Depends(get_current_user)):
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
     with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO public.shop (shop_name) VALUES (%s) RETURNING id;", (req.shop_name,))
-            new_id = cur.fetchone()[0]
-        conn.commit()
-    return {"id": new_id, "message": "Shop inserted successfully"}
+        try:
+            with conn.cursor() as cur:
+                # Try insert, handle any unique violation gracefully
+                cur.execute("""
+                    INSERT INTO public.shop (shop_name, tenant_id) VALUES (%s, %s)
+                    ON CONFLICT DO NOTHING
+                    RETURNING id;
+                """, (req.shop_name, tenant_id))
+                row = cur.fetchone()
+                if row:
+                    new_id = row[0]
+                    conn.commit()
+                    return {"id": new_id, "message": "Shop inserted successfully"}
+                else:
+                    # Already exists - return it
+                    cur.execute("SELECT id FROM public.shop WHERE shop_name = %s AND tenant_id = %s LIMIT 1;", (req.shop_name, tenant_id))
+                    existing = cur.fetchone()
+                    if existing:
+                        return {"id": existing[0], "message": "Shop already exists", "existed": True}
+                    raise HTTPException(status_code=409, detail=f"Shop '{req.shop_name}' already exists")
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=409, detail=f"Shop '{req.shop_name}' already exists")
 
 @app.get("/shop/{shop_name}")
 def standalone_get_shop(shop_name: str = Path(...)):
@@ -5408,14 +6363,23 @@ def standalone_list_shops(
     q: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    user: Dict = Depends(get_current_user),
 ):
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            if q:
-                cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop WHERE shop_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s;",
-                            (f"%{q}%", limit, offset))
+            if tenant_id:
+                if q:
+                    cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop WHERE tenant_id = %s AND shop_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s;",
+                                (tenant_id, f"%{q}%", limit, offset))
+                else:
+                    cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop WHERE tenant_id = %s ORDER BY id DESC LIMIT %s OFFSET %s;", (tenant_id, limit, offset))
             else:
-                cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop ORDER BY id DESC LIMIT %s OFFSET %s;", (limit, offset))
+                if q:
+                    cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop WHERE shop_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s;",
+                                (f"%{q}%", limit, offset))
+                else:
+                    cur.execute("SELECT id, shop_name, created_at, updated_at FROM public.shop ORDER BY id DESC LIMIT %s OFFSET %s;", (limit, offset))
             rows = cur.fetchall()
     items = [{"id": r[0], "shop_name": r[1], "created_at": r[2], "updated_at": r[3]} for r in rows]
     return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
@@ -5435,15 +6399,59 @@ def standalone_update_shop(shop_name: str, patch: StandaloneShopUpdate):
     return {"message": "Shop updated", "item": {"id": row[0], "shop_name": row[1], "created_at": row[2], "updated_at": row[3]}}
 
 @app.delete("/shop/{shop_name}")
-def standalone_delete_shop(shop_name: str):
+def standalone_delete_shop(shop_name: str, force: bool = Query(False)):
     with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM public.shop WHERE shop_name = %s RETURNING id;", (shop_name,))
-            deleted = cur.fetchall()
-        conn.commit()
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Shop not found")
-    return {"deleted_count": len(deleted)}
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM public.shop WHERE shop_name = %s LIMIT 1;", (shop_name,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="Shop not found")
+                sid = row[0]
+
+                # Check FK references
+                linked = {}
+                for tbl, col, label in [
+                    ("device_video_shop_group", "sid", "video_links"),
+                    ("device_advertisement_shop_group", "sid", "ad_links"),
+                ]:
+                    try:
+                        cur.execute(f"SELECT COUNT(*) FROM public.{tbl} WHERE {col} = %s;", (sid,))
+                        cnt = cur.fetchone()[0]
+                        if cnt: linked[label] = cnt
+                    except Exception:
+                        pass
+
+                if linked and not force:
+                    raise HTTPException(status_code=409, detail={
+                        "message": f"Shop '{shop_name}' is linked to other resources. Use force=true to unlink and delete.",
+                        "linked": linked,
+                        "shop_name": shop_name,
+                    })
+
+                # Unlink
+                unlinked = {}
+                for tbl, col, label in [
+                    ("device_video_shop_group", "sid", "video_links"),
+                    ("device_advertisement_shop_group", "sid", "ad_links"),
+                ]:
+                    try:
+                        cur.execute(f"SAVEPOINT sp_{label}")
+                        cur.execute(f"DELETE FROM public.{tbl} WHERE {col} = %s;", (sid,))
+                        if cur.rowcount: unlinked[label] = cur.rowcount
+                        cur.execute(f"RELEASE SAVEPOINT sp_{label}")
+                    except Exception:
+                        cur.execute(f"ROLLBACK TO SAVEPOINT sp_{label}")
+
+                cur.execute("DELETE FROM public.shop WHERE id = %s RETURNING id;", (sid,))
+                deleted = cur.fetchall()
+            conn.commit()
+            return {"deleted_count": len(deleted), "unlinked": unlinked}
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 # ═══════════════ VIDEO CRUD ═══════════════
@@ -5456,8 +6464,13 @@ async def standalone_upload_video(
     rotation: int = Form(0),
     fit_mode: str = Form("cover"),
     display_duration: int = Form(10),
+    user: Dict = Depends(get_current_user),
 ):
-    key = _make_video_s3_key(video_name)
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
+    tenant_slug = _get_tenant_slug(tenant_id)
+    # Append company suffix for tenant isolation
+    stored_name = f"{video_name}-{tenant_slug}" if tenant_slug and tenant_slug != "default" else video_name
+    key = _make_video_s3_key(stored_name, tenant_slug=tenant_slug)
     if not overwrite and _video_s3_key_exists(key):
         raise HTTPException(status_code=409, detail="Video exists. Use overwrite=true.")
     content_type = _detect_video_content_type(file.filename or video_name)
@@ -5468,15 +6481,36 @@ async def standalone_upload_video(
     s3_uri = _to_video_s3_uri(key)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO public.video (video_name, s3_link, rotation, content_type, fit_mode, display_duration)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (video_name)
-                DO UPDATE SET s3_link = EXCLUDED.s3_link, rotation = EXCLUDED.rotation,
-                    content_type = EXCLUDED.content_type, fit_mode = EXCLUDED.fit_mode,
-                    display_duration = EXCLUDED.display_duration, updated_at = NOW()
-                RETURNING id;
-            """, (video_name, s3_uri, rotation, content_type, fit_mode, display_duration))
+            if tenant_id:
+                cur.execute("""
+                    INSERT INTO public.video (video_name, s3_link, rotation, content_type, fit_mode, display_duration, tenant_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING;
+                """, (stored_name, s3_uri, rotation, content_type, fit_mode, display_duration, tenant_id))
+                if cur.rowcount == 0:
+                    cur.execute("""
+                        UPDATE public.video SET s3_link = %s, rotation = %s,
+                            content_type = %s, fit_mode = %s,
+                            display_duration = %s, updated_at = NOW()
+                        WHERE video_name = %s AND tenant_id = %s RETURNING id;
+                    """, (s3_uri, rotation, content_type, fit_mode, display_duration, stored_name, tenant_id))
+                else:
+                    cur.execute("SELECT id FROM public.video WHERE video_name = %s AND tenant_id = %s ORDER BY id DESC LIMIT 1;", (stored_name, tenant_id))
+            else:
+                cur.execute("""
+                    INSERT INTO public.video (video_name, s3_link, rotation, content_type, fit_mode, display_duration)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING;
+                """, (video_name, s3_uri, rotation, content_type, fit_mode, display_duration))
+                if cur.rowcount == 0:
+                    cur.execute("""
+                        UPDATE public.video SET s3_link = %s, rotation = %s,
+                            content_type = %s, fit_mode = %s,
+                            display_duration = %s, updated_at = NOW()
+                        WHERE video_name = %s RETURNING id;
+                    """, (s3_uri, rotation, content_type, fit_mode, display_duration, video_name))
+                else:
+                    cur.execute("SELECT id FROM public.video WHERE video_name = %s ORDER BY id DESC LIMIT 1;", (video_name,))
             new_id = cur.fetchone()[0]
         conn.commit()
     return {"id": new_id, "video_name": video_name, "s3_link": s3_uri, "key": key,
@@ -5488,18 +6522,36 @@ def standalone_list_videos(
     q: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=1000),
     offset: int = Query(0, ge=0),
+    user: Dict = Depends(get_current_user),
 ):
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            sql = "SELECT id, video_name, s3_link, rotation, content_type, fit_mode, display_duration, created_at, updated_at FROM public.video"
-            if q:
-                cur.execute(sql + " WHERE video_name ILIKE %s ORDER BY id DESC LIMIT %s OFFSET %s", (f"%{q}%", limit, offset))
+            if tenant_id:
+                base = "SELECT v.id, v.video_name, v.s3_link, v.rotation, v.content_type, v.fit_mode, v.display_duration, v.created_at, v.updated_at FROM public.video v"
+                if q:
+                    cur.execute(base + " WHERE v.tenant_id = %s AND v.video_name ILIKE %s ORDER BY v.id DESC LIMIT %s OFFSET %s", (tenant_id, f"%{q}%", limit, offset))
+                else:
+                    cur.execute(base + " WHERE v.tenant_id = %s ORDER BY v.id DESC LIMIT %s OFFSET %s", (tenant_id, limit, offset))
+                rows = cur.fetchall()
+                items = [{"id": r[0], "video_name": r[1], "s3_link": r[2], "rotation": r[3],
+                          "content_type": r[4], "fit_mode": r[5], "display_duration": r[6],
+                          "created_at": r[7], "updated_at": r[8]} for r in rows]
             else:
-                cur.execute(sql + " ORDER BY id DESC LIMIT %s OFFSET %s", (limit, offset))
-            rows = cur.fetchall()
-    items = [{"id": r[0], "video_name": r[1], "s3_link": r[2], "rotation": r[3],
-              "content_type": r[4], "fit_mode": r[5], "display_duration": r[6],
-              "created_at": r[7], "updated_at": r[8]} for r in rows]
+                # Platform admin: include company name
+                base = """SELECT v.id, v.video_name, v.s3_link, v.rotation, v.content_type, v.fit_mode,
+                                 v.display_duration, v.created_at, v.updated_at, c.name as company_name, c.slug as company_slug
+                          FROM public.video v
+                          LEFT JOIN public.company c ON c.id = v.tenant_id"""
+                if q:
+                    cur.execute(base + " WHERE v.video_name ILIKE %s ORDER BY v.id DESC LIMIT %s OFFSET %s", (f"%{q}%", limit, offset))
+                else:
+                    cur.execute(base + " ORDER BY v.id DESC LIMIT %s OFFSET %s", (limit, offset))
+                rows = cur.fetchall()
+                items = [{"id": r[0], "video_name": r[1], "s3_link": r[2], "rotation": r[3],
+                          "content_type": r[4], "fit_mode": r[5], "display_duration": r[6],
+                          "created_at": r[7], "updated_at": r[8],
+                          "company_name": r[9], "company_slug": r[10]} for r in rows]
     return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
 
 @app.put("/video/{video_name}")
@@ -5525,15 +6577,58 @@ def standalone_update_video(video_name: str, patch: StandaloneVideoUpdate):
             "content_type": row[4], "fit_mode": row[5], "display_duration": row[6], "created_at": row[7], "updated_at": row[8]}}
 
 @app.delete("/video/{video_name}")
-def standalone_delete_video(video_name: str):
+def standalone_delete_video(video_name: str, force: bool = Query(False)):
     with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM public.video WHERE video_name = %s RETURNING id;", (video_name,))
-            deleted = cur.fetchall()
-        conn.commit()
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Video not found")
-    return {"deleted_count": len(deleted)}
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM public.video WHERE video_name = %s LIMIT 1;", (video_name,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="Video not found")
+                vid = row[0]
+
+                # Check what's linked
+                linked = {}
+                cur.execute("SELECT COUNT(*) FROM public.device_video_shop_group WHERE vid = %s", (vid,))
+                cnt = cur.fetchone()[0]
+                if cnt: linked["device_links"] = cnt
+                cur.execute("SELECT COUNT(*) FROM public.group_video WHERE vid = %s", (vid,))
+                cnt = cur.fetchone()[0]
+                if cnt: linked["group_links"] = cnt
+
+                if linked and not force:
+                    raise HTTPException(status_code=409, detail={
+                        "message": f"Video '{video_name}' is linked to other resources. Delete will unlink everything.",
+                        "linked": linked,
+                        "video_name": video_name,
+                    })
+
+                # Unlink first, then delete
+                unlinked = {}
+                cur.execute("DELETE FROM public.device_video_shop_group WHERE vid = %s", (vid,))
+                if cur.rowcount: unlinked["device_links"] = cur.rowcount
+                cur.execute("DELETE FROM public.group_video WHERE vid = %s", (vid,))
+                if cur.rowcount: unlinked["group_links"] = cur.rowcount
+
+                # Get S3 link before deleting DB record
+                cur.execute("SELECT s3_link FROM public.video WHERE id = %s;", (vid,))
+                s3_row = cur.fetchone()
+                s3_key = _s3_key_from_uri(s3_row[0]) if s3_row and s3_row[0] else None
+
+                cur.execute("DELETE FROM public.video WHERE id = %s RETURNING id;", (vid,))
+                deleted = cur.fetchall()
+            conn.commit()
+
+            # Delete from S3 after DB commit
+            if s3_key:
+                _s3_delete_key(s3_key)
+
+            return {"deleted_count": len(deleted), "unlinked": unlinked}
+        except HTTPException:
+            conn.rollback(); raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
