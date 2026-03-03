@@ -798,6 +798,26 @@ def create_content_change_request(body: ContentChangeRequestIn, user: Dict = Dep
             status = "approved" if auto_approved else "pending"
             expires_at = datetime.now() + timedelta(hours=body.expires_in_hours) if not auto_approved else None
 
+            # Duplicate guard: reject if a pending request for the same
+            # request_type + target already exists from this user
+            if not auto_approved:
+                dup_target_name = target_name or str(body.target_id)
+                cur.execute("""
+                    SELECT id FROM public.content_change_request
+                    WHERE tenant_id = %s
+                      AND request_type = %s
+                      AND target_name = %s
+                      AND requested_by = %s
+                      AND status = 'pending'
+                    LIMIT 1;
+                """, (tenant_id, body.request_type, dup_target_name, user_id))
+                existing = cur.fetchone()
+                if existing:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"A pending approval request for '{dup_target_name}' already exists (#{existing[0]}). Wait for it to be reviewed before submitting again."
+                    )
+
             cur.execute("""
                 INSERT INTO public.content_change_request (
                     tenant_id, request_type, target_type, target_id, target_name,
