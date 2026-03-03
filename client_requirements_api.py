@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 from database import pg_conn
 from tenant_context import get_current_user, require_permission, log_audit, active_sessions
-from websocket_routes import notify_device_status
+from websocket_routes import notify_device_status, notify_pending_approvals
 from video_service import presign_get_object, _parse_s3_link
 
 router = APIRouter()
@@ -744,7 +744,7 @@ def update_approval_settings(
 
 
 @router.post("/content-changes", response_model=ContentChangeRequestOut)
-def create_content_change_request(body: ContentChangeRequestIn, user: Dict = Depends(get_current_user)):
+def create_content_change_request(body: ContentChangeRequestIn, background_tasks: BackgroundTasks, user: Dict = Depends(get_current_user)):
     """
     Request a content change. 
     If approval is required and user doesn't have auto-approve role, 
@@ -851,6 +851,17 @@ def create_content_change_request(body: ContentChangeRequestIn, user: Dict = Dep
         conn.commit()
     # Connection is released back to pool here, before building the response
 
+    # If the request is pending (needs approval), push the new count to admins via WS
+    if status == "pending":
+        with pg_conn() as conn2:
+            with conn2.cursor() as cur2:
+                cur2.execute("""
+                    SELECT COUNT(*) FROM public.content_change_request
+                    WHERE tenant_id = %s AND status = 'pending';
+                """, (tenant_id,))
+                pending_count = cur2.fetchone()[0]
+        background_tasks.add_task(notify_pending_approvals, tenant_id, pending_count)
+
     return ContentChangeRequestOut(
         id=request_id,
         tenant_id=tenant_id,
@@ -947,6 +958,7 @@ def list_content_change_requests(
 def review_content_change_request(
     request_id: int,
     body: ContentChangeReviewIn,
+    background_tasks: BackgroundTasks,
     user: Dict = Depends(get_current_user)
 ):
     """Approve or reject a content change request."""
@@ -1010,7 +1022,18 @@ def review_content_change_request(
                 """, (request_id,))
             
         conn.commit()
-        
+
+        # Count remaining pending requests for this tenant to push via WS
+        with pg_conn() as conn2:
+            with conn2.cursor() as cur2:
+                cur2.execute("""
+                    SELECT COUNT(*) FROM public.content_change_request
+                    WHERE tenant_id = %s AND status = 'pending';
+                """, (tenant_id,))
+                pending_count = cur2.fetchone()[0]
+
+    background_tasks.add_task(notify_pending_approvals, tenant_id, pending_count)
+
     return {
         "request_id": request_id,
         "status": new_status,
