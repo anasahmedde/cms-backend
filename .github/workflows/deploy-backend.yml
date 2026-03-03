@@ -15,6 +15,12 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # Skip auto-merge commits that GitHub creates when syncing staging with main
+    # (e.g. "Merge branch 'main' into staging" during a PR). These are not real
+    # deployable changes — only deploy on actual feature/fix pushes.
+    if: |
+      !(github.ref == 'refs/heads/staging' &&
+        startsWith(github.event.head_commit.message, 'Merge branch ''main'''))
 
     steps:
       - uses: actions/checkout@v4
