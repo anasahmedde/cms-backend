@@ -190,3 +190,13 @@ async def notify_device_temperature(tenant_id: int, mobile_id: str, temperature:
 async def notify_download_progress(tenant_id: int, mobile_id: str, progress: dict):
     """Call this when download progress updates."""
     await ws_manager.broadcast_download_progress(tenant_id, mobile_id, progress)
+
+
+async def notify_announcement(announcement: dict):
+    """Call this when a new announcement is published - broadcasts to ALL users."""
+    await ws_manager.broadcast_announcement(announcement)
+
+
+async def notify_announcement_cleared():
+    """Call this when announcement is cleared - broadcasts to ALL users."""
+    await ws_manager.broadcast_announcement_cleared()

@@ -5,20 +5,23 @@ Platform Announcement API
 =========================
 Endpoints for super admin to create announcements visible to all company users.
 Announcements are stored in the database and fetched by all logged-in users.
+Now with WebSocket broadcast for real-time updates!
 
 Include this router in device_video_shop_group.py:
     from announcement_api import router as announcement_router
     app.include_router(announcement_router, tags=["Platform Announcements"])
 """
 
+import asyncio
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from pydantic import BaseModel, Field
 
 from database import pg_conn
 from tenant_context import get_current_user, require_platform_user, TenantContext
+from websocket_routes import notify_announcement, notify_announcement_cleared
 
 router = APIRouter()
 
@@ -118,8 +121,9 @@ def get_active_announcement(user: dict = Depends(get_current_user)):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @router.post("/platform/announcement", response_model=dict)
-def create_or_update_announcement(
+async def create_or_update_announcement(
     body: AnnouncementIn,
+    background_tasks: BackgroundTasks,
     user: TenantContext = Depends(require_platform_user)
 ):
     """
@@ -127,6 +131,7 @@ def create_or_update_announcement(
     Platform admin only.
     
     This deactivates any existing active announcements and creates a new one.
+    Broadcasts via WebSocket to all connected users for immediate display.
     """
     if body.type not in ("info", "warning", "critical"):
         raise HTTPException(status_code=400, detail="Type must be: info, warning, or critical")
@@ -155,7 +160,7 @@ def create_or_update_announcement(
         
         conn.commit()
     
-    return {
+    announcement_data = {
         "id": announcement_id,
         "message": body.message,
         "type": body.type,
@@ -164,15 +169,27 @@ def create_or_update_announcement(
         "created_by_username": user.username,
         "created_at": created_at.isoformat(),
         "updated_at": updated_at.isoformat(),
+    }
+    
+    # Broadcast to all connected users via WebSocket
+    if body.is_active:
+        background_tasks.add_task(notify_announcement, announcement_data)
+    
+    return {
+        **announcement_data,
         "status": "published"
     }
 
 
 @router.delete("/platform/announcement")
-def clear_announcement(user: TenantContext = Depends(require_platform_user)):
+async def clear_announcement(
+    background_tasks: BackgroundTasks,
+    user: TenantContext = Depends(require_platform_user)
+):
     """
     Clear/deactivate the current announcement.
     Platform admin only.
+    Broadcasts via WebSocket to all connected users for immediate removal.
     """
     with pg_conn() as conn:
         # Ensure table exists
@@ -188,6 +205,10 @@ def clear_announcement(user: TenantContext = Depends(require_platform_user)):
             deactivated = cur.fetchall()
         
         conn.commit()
+    
+    # Broadcast to all connected users via WebSocket
+    if deactivated:
+        background_tasks.add_task(notify_announcement_cleared)
     
     return {
         "cleared": len(deactivated),
