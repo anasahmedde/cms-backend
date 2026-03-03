@@ -1367,7 +1367,18 @@ def create_link_by_names(conn, payload: LinkCreate) -> Dict[str, Any]:
             if not grow:
                 raise HTTPException(status_code=404, detail=f"Group not found: {gname_in}")
             gid = int(grow[0])
-        
+
+            # Enforce: video must already be linked to this group
+            cur.execute("""
+                SELECT 1 FROM public.group_video WHERE gid = %s AND vid = %s LIMIT 1;
+            """, (gid, vid))
+            if not cur.fetchone():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f'Video "{payload.video_name}" is not linked to group "{gname_in}". '
+                           f'Add it to the group\'s linked content first.'
+                )
+
         _enforce_single_group_shop_for_device(conn, did, gid, sid)
         
         if gid is None:
@@ -1408,16 +1419,19 @@ def create_link_by_names(conn, payload: LinkCreate) -> Dict[str, Any]:
                     WHERE did = %s AND vid = %s AND sid = %s AND gid = %s
                     ORDER BY id DESC LIMIT 1;
                 """, (did, vid, sid, gid))
-            
-            # Also add to group_video table to ensure group-level association exists
-            # This ensures future device assignments will get this video
+
+        # Capture the link row ID before any further queries overwrite the cursor result
+        lrow = cur.fetchone()
+
+        if gid is not None:
+            # Also add to group_video table to ensure group-level association exists.
+            # This must come AFTER lrow is fetched — ON CONFLICT DO NOTHING returns
+            # no rows and would cause "no results to fetch" if fetched afterwards.
             cur.execute("""
                 INSERT INTO public.group_video (gid, vid, display_order)
                 VALUES (%s, %s, COALESCE(%s, 0))
                 ON CONFLICT (gid, vid) DO NOTHING;
             """, (gid, vid, payload.display_order))
-        
-        lrow = cur.fetchone()
         cur.execute(READ_JOIN_SQL + " WHERE l.id = %s;", (lrow[0],))
         full = cur.fetchone()
         _write_device_flag(conn, did, False)
