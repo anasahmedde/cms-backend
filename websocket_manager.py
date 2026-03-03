@@ -28,6 +28,9 @@ class MessageType(str, Enum):
     ANNOUNCEMENT = "announcement"
     ANNOUNCEMENT_CLEARED = "announcement_cleared"
     
+    # Content approval
+    PENDING_APPROVALS = "pending_approvals"
+
     # Client -> Server
     SUBSCRIBE = "subscribe"
     UNSUBSCRIBE = "unsubscribe"
@@ -315,6 +318,18 @@ class ConnectionManager:
             data={"cleared": True, "timestamp": datetime.now().isoformat()}
         )
         await self._broadcast_to_all(message)
+
+    async def broadcast_pending_approvals(self, tenant_id: int, pending_count: int):
+        """
+        Push the current pending approval count to all connections of a tenant.
+        Called after any create/approve/reject so admins/managers see the badge
+        update instantly without polling.
+        """
+        message = WebSocketMessage(
+            type=MessageType.PENDING_APPROVALS,
+            data={"pending_count": pending_count, "timestamp": datetime.now().isoformat()}
+        )
+        await self._broadcast_to_tenant_all(tenant_id, message)
     
     async def _broadcast_to_all(self, message: WebSocketMessage):
         """Send message to ALL connected users (for platform-wide announcements)."""

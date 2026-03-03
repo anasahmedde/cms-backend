@@ -200,3 +200,11 @@ async def notify_announcement(announcement: dict):
 async def notify_announcement_cleared():
     """Call this when announcement is cleared - broadcasts to ALL users."""
     await ws_manager.broadcast_announcement_cleared()
+
+
+async def notify_pending_approvals(tenant_id: int, pending_count: int):
+    """
+    Push updated pending approval count to all connections of a tenant.
+    Call this after any approval request is created, approved, or rejected.
+    """
+    await ws_manager.broadcast_pending_approvals(tenant_id, pending_count)
