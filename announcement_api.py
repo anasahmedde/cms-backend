@@ -35,6 +35,8 @@ class AnnouncementIn(BaseModel):
     type: str = Field("info", description="Banner type: info, warning, critical")
     is_active: bool = Field(True, description="Whether the announcement is currently active")
     expires_at: Optional[datetime] = Field(None, description="When the announcement auto-expires (None = never)")
+    target_type: str = Field("all", description="Who sees this: 'all' or 'company'")
+    target_company_id: Optional[int] = Field(None, description="Company ID when target_type='company'")
 
 
 class AnnouncementOut(BaseModel):
@@ -47,6 +49,8 @@ class AnnouncementOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     expires_at: Optional[datetime]
+    target_type: str
+    target_company_id: Optional[int]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -63,6 +67,8 @@ def ensure_announcement_schema(conn):
         is_active BOOLEAN NOT NULL DEFAULT TRUE,
         created_by INTEGER,
         expires_at TIMESTAMPTZ,
+        target_type VARCHAR(20) NOT NULL DEFAULT 'all',
+        target_company_id INTEGER,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
@@ -72,10 +78,18 @@ def ensure_announcement_schema(conn):
     """
     with conn.cursor() as cur:
         cur.execute(ddl)
-        # Add expires_at column if it doesn't exist (migration for existing tables)
+        # Idempotent migrations for existing tables
         cur.execute("""
             ALTER TABLE public.platform_announcement
             ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+        """)
+        cur.execute("""
+            ALTER TABLE public.platform_announcement
+            ADD COLUMN IF NOT EXISTS target_type VARCHAR(20) NOT NULL DEFAULT 'all';
+        """)
+        cur.execute("""
+            ALTER TABLE public.platform_announcement
+            ADD COLUMN IF NOT EXISTS target_company_id INTEGER;
         """)
     conn.commit()
 
@@ -87,32 +101,58 @@ def ensure_announcement_schema(conn):
 @router.get("/announcement/active")
 def get_active_announcement(user: dict = Depends(get_current_user)):
     """
-    Get the currently active platform announcement.
-    Available to all logged-in users (company users and platform users).
-    Returns null if no active announcement exists or if it has expired.
+    Get the currently active platform announcement for this user.
+    - Platform users see all announcements.
+    - Company users see global ('all') announcements AND announcements targeted to their company.
     Auto-deactivates expired announcements.
     """
+    # Determine the caller's company id (company users have tenant_id)
+    caller_company_id = user.get("tenant_id") or user.get("company_id")
+    is_platform = user.get("user_type") == "platform" or user.get("is_platform_user")
+
     with pg_conn() as conn:
-        # Ensure table exists
         ensure_announcement_schema(conn)
         
         with conn.cursor() as cur:
-            # Auto-deactivate any announcements that have passed their expires_at
+            # Auto-deactivate expired announcements
             cur.execute("""
                 UPDATE public.platform_announcement
                 SET is_active = FALSE, updated_at = NOW()
                 WHERE is_active = TRUE AND expires_at IS NOT NULL AND expires_at <= NOW();
             """)
             
-            cur.execute("""
-                SELECT a.id, a.message, a.type, a.is_active, a.created_by, 
-                       u.username as created_by_username, a.created_at, a.updated_at, a.expires_at
-                FROM public.platform_announcement a
-                LEFT JOIN public.users u ON u.id = a.created_by
-                WHERE a.is_active = TRUE
-                ORDER BY a.updated_at DESC
-                LIMIT 1;
-            """)
+            if is_platform:
+                # Platform admins see the most recent active announcement (any target)
+                cur.execute("""
+                    SELECT a.id, a.message, a.type, a.is_active, a.created_by,
+                           u.username, a.created_at, a.updated_at, a.expires_at,
+                           a.target_type, a.target_company_id
+                    FROM public.platform_announcement a
+                    LEFT JOIN public.users u ON u.id = a.created_by
+                    WHERE a.is_active = TRUE
+                    ORDER BY a.updated_at DESC
+                    LIMIT 1;
+                """)
+            else:
+                # Company users: show global OR announcements targeted to their company
+                cur.execute("""
+                    SELECT a.id, a.message, a.type, a.is_active, a.created_by,
+                           u.username, a.created_at, a.updated_at, a.expires_at,
+                           a.target_type, a.target_company_id
+                    FROM public.platform_announcement a
+                    LEFT JOIN public.users u ON u.id = a.created_by
+                    WHERE a.is_active = TRUE
+                      AND (
+                        a.target_type = 'all'
+                        OR (a.target_type = 'company' AND a.target_company_id = %s)
+                      )
+                    ORDER BY
+                      -- Prioritise company-specific announcements over global ones
+                      CASE WHEN a.target_type = 'company' THEN 0 ELSE 1 END,
+                      a.updated_at DESC
+                    LIMIT 1;
+                """, (caller_company_id,))
+            
             row = cur.fetchone()
         conn.commit()
         
@@ -130,6 +170,8 @@ def get_active_announcement(user: dict = Depends(get_current_user)):
                 "created_at": row[6].isoformat() if row[6] else None,
                 "updated_at": row[7].isoformat() if row[7] else None,
                 "expires_at": row[8].isoformat() if row[8] else None,
+                "target_type": row[9],
+                "target_company_id": row[10],
             }
         }
 
@@ -148,30 +190,48 @@ async def create_or_update_announcement(
     Create or update the platform announcement.
     Platform admin only.
     
-    This deactivates any existing active announcements and creates a new one.
-    Broadcasts via WebSocket to all connected users for immediate display.
+    - target_type='all'     → visible to every company user (global)
+    - target_type='company' → visible only to users of target_company_id
+    
+    Broadcasts via WebSocket for immediate display.
     """
     if body.type not in ("info", "warning", "critical"):
         raise HTTPException(status_code=400, detail="Type must be: info, warning, or critical")
+    if body.target_type not in ("all", "company"):
+        raise HTTPException(status_code=400, detail="target_type must be 'all' or 'company'")
+    if body.target_type == "company" and not body.target_company_id:
+        raise HTTPException(status_code=400, detail="target_company_id is required when target_type='company'")
     
     with pg_conn() as conn:
-        # Ensure table exists
         ensure_announcement_schema(conn)
         
         with conn.cursor() as cur:
-            # Deactivate all existing announcements
-            cur.execute("""
-                UPDATE public.platform_announcement 
-                SET is_active = FALSE, updated_at = NOW()
-                WHERE is_active = TRUE;
-            """)
+            # Deactivate existing active announcements with the same scope:
+            # - A new global announcement clears all active announcements
+            # - A new company-specific one clears only that company's active announcements
+            if body.target_type == "all":
+                cur.execute("""
+                    UPDATE public.platform_announcement 
+                    SET is_active = FALSE, updated_at = NOW()
+                    WHERE is_active = TRUE;
+                """)
+            else:
+                cur.execute("""
+                    UPDATE public.platform_announcement
+                    SET is_active = FALSE, updated_at = NOW()
+                    WHERE is_active = TRUE
+                      AND (target_type = 'all' OR (target_type = 'company' AND target_company_id = %s));
+                """, (body.target_company_id,))
             
-            # Create new announcement
             cur.execute("""
-                INSERT INTO public.platform_announcement (message, type, is_active, created_by, expires_at)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO public.platform_announcement
+                    (message, type, is_active, created_by, expires_at, target_type, target_company_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING id, created_at, updated_at, expires_at;
-            """, (body.message, body.type, body.is_active, user.user_id, body.expires_at))
+            """, (
+                body.message, body.type, body.is_active, user.user_id,
+                body.expires_at, body.target_type, body.target_company_id
+            ))
             
             row = cur.fetchone()
             announcement_id, created_at, updated_at, expires_at = row
@@ -188,9 +248,10 @@ async def create_or_update_announcement(
         "created_at": created_at.isoformat(),
         "updated_at": updated_at.isoformat(),
         "expires_at": expires_at.isoformat() if expires_at else None,
+        "target_type": body.target_type,
+        "target_company_id": body.target_company_id,
     }
     
-    # Broadcast to all connected users via WebSocket
     if body.is_active:
         background_tasks.add_task(notify_announcement, announcement_data)
     
@@ -251,7 +312,8 @@ def list_announcements(
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT a.id, a.message, a.type, a.is_active, a.created_by,
-                       u.username as created_by_username, a.created_at, a.updated_at, a.expires_at
+                       u.username as created_by_username, a.created_at, a.updated_at, a.expires_at,
+                       a.target_type, a.target_company_id
                 FROM public.platform_announcement a
                 LEFT JOIN public.users u ON u.id = a.created_by
                 ORDER BY a.created_at DESC
@@ -272,6 +334,8 @@ def list_announcements(
                 "created_at": r[6].isoformat() if r[6] else None,
                 "updated_at": r[7].isoformat() if r[7] else None,
                 "expires_at": r[8].isoformat() if r[8] else None,
+                "target_type": r[9],
+                "target_company_id": r[10],
             }
             for r in rows
         ],
