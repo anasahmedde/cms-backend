@@ -291,12 +291,22 @@ class ConnectionManager:
         await self._broadcast_to_tenant(tenant_id, mobile_id, message)
     
     async def broadcast_announcement(self, announcement: dict):
-        """Broadcast platform announcement to ALL connected users."""
+        """
+        Broadcast a platform announcement.
+        - target_type='all'     → sends to every connected user
+        - target_type='company' → sends only to that tenant's connections
+        """
         message = WebSocketMessage(
             type=MessageType.ANNOUNCEMENT,
             data=announcement
         )
-        await self._broadcast_to_all(message)
+        target_type = announcement.get("target_type", "all")
+        target_company_id = announcement.get("target_company_id")
+
+        if target_type == "company" and target_company_id:
+            await self._broadcast_to_tenant_all(target_company_id, message)
+        else:
+            await self._broadcast_to_all(message)
     
     async def broadcast_announcement_cleared(self):
         """Broadcast that announcement has been cleared to ALL connected users."""
@@ -316,6 +326,18 @@ class ConnectionManager:
             
             for tenant_connections in self._connections.values():
                 for ws in list(tenant_connections.keys()):
+                    tasks.append(self._send(ws, message))
+        
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+    
+    async def _broadcast_to_tenant_all(self, tenant_id: int, message: WebSocketMessage):
+        """Send message to ALL connections of a specific tenant (for company-targeted announcements)."""
+        tasks = []
+        
+        async with self._lock:
+            if tenant_id in self._connections:
+                for ws in list(self._connections[tenant_id].keys()):
                     tasks.append(self._send(ws, message))
         
         if tasks:
