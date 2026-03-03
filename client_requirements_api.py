@@ -627,6 +627,55 @@ class ContentChangeReviewIn(BaseModel):
     review_note: Optional[str] = None
 
 
+@router.post("/content-changes/media-preview")
+def get_media_preview_urls(
+    body: Dict,
+    user: Dict = Depends(get_current_user)
+):
+    """
+    Given lists of video_names and ad_names, return presigned S3 URLs
+    and content_type for each so the frontend can render previews.
+    body: { "video_names": [...], "ad_names": [...] }
+    """
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
+    video_names = body.get("video_names", [])
+    ad_names = body.get("ad_names", [])
+
+    results = {"videos": [], "ads": []}
+
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            if video_names:
+                cur.execute("""
+                    SELECT video_name, s3_link, content_type
+                    FROM public.video
+                    WHERE video_name = ANY(%s) AND tenant_id = %s;
+                """, (video_names, tenant_id))
+                for row in cur.fetchall():
+                    vname, s3_link, content_type = row
+                    results["videos"].append({
+                        "name": vname,
+                        "s3_link": s3_link,
+                        "content_type": content_type or "video",
+                    })
+
+            if ad_names:
+                cur.execute("""
+                    SELECT ad_name, s3_link, content_type
+                    FROM public.advertisement
+                    WHERE ad_name = ANY(%s) AND tenant_id = %s;
+                """, (ad_names, tenant_id))
+                for row in cur.fetchall():
+                    aname, s3_link, content_type = row
+                    results["ads"].append({
+                        "name": aname,
+                        "s3_link": s3_link,
+                        "content_type": content_type or "image",
+                    })
+
+    return results
+
+
 @router.get("/company/approval-settings")
 def get_approval_settings(user: Dict = Depends(get_current_user)):
     """Get content approval settings for the company."""
@@ -694,6 +743,17 @@ def create_content_change_request(body: ContentChangeRequestIn, user: Dict = Dep
     user_id = user.get("user_id")
     user_role = user.get("role", "")
     
+    import json
+
+    # Collect all data needed for the response outside the connection block
+    request_id = None
+    requested_at = None
+    target_name = None
+    status = None
+    expires_at = None
+    requested_by_name = None
+    auto_approved = False
+
     with pg_conn() as conn:
         with conn.cursor() as cur:
             # Check if approval is required
@@ -704,13 +764,14 @@ def create_content_change_request(body: ContentChangeRequestIn, user: Dict = Dep
             company_row = cur.fetchone()
             require_approval = company_row[0] if company_row else False
             auto_approve_roles = company_row[1] if company_row else ["admin", "manager"]
-            
-            # Get target name
-            target_name = None
-            if body.target_type == "device":
+
+            # Get target name — for link_content use gname from change_data directly
+            if body.request_type == "link_content":
+                target_name = body.change_data.get("gname")
+            elif body.target_type == "device":
                 cur.execute("SELECT device_name, mobile_id FROM public.device WHERE id = %s;", (body.target_id,))
                 row = cur.fetchone()
-                target_name = row[0] or row[1] if row else None
+                target_name = (row[0] or row[1]) if row else None
             elif body.target_type == "group":
                 cur.execute('SELECT gname FROM public."group" WHERE id = %s;', (body.target_id,))
                 row = cur.fetchone()
@@ -719,15 +780,13 @@ def create_content_change_request(body: ContentChangeRequestIn, user: Dict = Dep
                 cur.execute("SELECT shop_name FROM public.shop WHERE id = %s;", (body.target_id,))
                 row = cur.fetchone()
                 target_name = row[0] if row else None
-            
+
             # Platform users (including impersonation) are always auto-approved
             is_platform = user.get("user_type") == "platform"
-            # Determine if auto-approved
             auto_approved = is_platform or not require_approval or user_role in (auto_approve_roles or [])
             status = "approved" if auto_approved else "pending"
             expires_at = datetime.now() + timedelta(hours=body.expires_in_hours) if not auto_approved else None
-            
-            import json
+
             cur.execute("""
                 INSERT INTO public.content_change_request (
                     tenant_id, request_type, target_type, target_id, target_name,
@@ -741,44 +800,45 @@ def create_content_change_request(body: ContentChangeRequestIn, user: Dict = Dep
                 user_id if auto_approved else None,
                 datetime.now() if auto_approved else None
             ))
-            
+
             request_id, requested_at = cur.fetchone()
-            
+
             # If auto-approved, execute the change immediately
             if auto_approved:
-                _execute_content_change(cur, request_id, body.request_type, body.target_type, 
-                                       body.target_id, body.change_data, tenant_id)
+                _execute_content_change(cur, request_id, body.request_type, body.target_type,
+                                        body.target_id, body.change_data, tenant_id)
                 cur.execute("""
-                    UPDATE public.content_change_request 
+                    UPDATE public.content_change_request
                     SET executed_at = NOW() WHERE id = %s;
                 """, (request_id,))
-            
+
             # Fetch requester name while cursor is still open
             cur.execute("SELECT full_name, username FROM public.users WHERE id = %s;", (user_id,))
             user_row = cur.fetchone()
             requested_by_name = (user_row[0] or user_row[1]) if user_row else None
-            
+
         conn.commit()
-        
-        return ContentChangeRequestOut(
-            id=request_id,
-            tenant_id=tenant_id,
-            request_type=body.request_type,
-            target_type=body.target_type,
-            target_id=body.target_id,
-            target_name=target_name,
-            change_data=body.change_data,
-            requested_by=user_id,
-            requested_by_name=requested_by_name,
-            requested_at=requested_at,
-            request_note=body.request_note,
-            status=status,
-            reviewed_by=user_id if auto_approved else None,
-            reviewed_by_name=requested_by_name if auto_approved else None,
-            reviewed_at=datetime.now() if auto_approved else None,
-            review_note="Auto-approved" if auto_approved else None,
-            expires_at=expires_at
-        )
+    # Connection is released back to pool here, before building the response
+
+    return ContentChangeRequestOut(
+        id=request_id,
+        tenant_id=tenant_id,
+        request_type=body.request_type,
+        target_type=body.target_type,
+        target_id=body.target_id,
+        target_name=target_name,
+        change_data=body.change_data,
+        requested_by=user_id,
+        requested_by_name=requested_by_name,
+        requested_at=requested_at,
+        request_note=body.request_note,
+        status=status,
+        reviewed_by=user_id if auto_approved else None,
+        reviewed_by_name=requested_by_name if auto_approved else None,
+        reviewed_at=datetime.now() if auto_approved else None,
+        review_note="Auto-approved" if auto_approved else None,
+        expires_at=expires_at
+    )
 
 
 @router.get("/content-changes")
