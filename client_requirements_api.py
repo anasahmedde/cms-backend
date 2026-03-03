@@ -753,12 +753,12 @@ def create_content_change_request(body: ContentChangeRequestIn, user: Dict = Dep
                     SET executed_at = NOW() WHERE id = %s;
                 """, (request_id,))
             
+            # Fetch requester name while cursor is still open
+            cur.execute("SELECT full_name, username FROM public.users WHERE id = %s;", (user_id,))
+            user_row = cur.fetchone()
+            requested_by_name = (user_row[0] or user_row[1]) if user_row else None
+            
         conn.commit()
-        
-        # Get requester name
-        cur.execute("SELECT full_name, username FROM public.users WHERE id = %s;", (user_id,))
-        user_row = cur.fetchone()
-        requested_by_name = user_row[0] or user_row[1] if user_row else None
         
         return ContentChangeRequestOut(
             id=request_id,
