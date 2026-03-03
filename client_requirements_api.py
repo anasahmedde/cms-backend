@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from database import pg_conn
 from tenant_context import get_current_user, require_permission, log_audit, active_sessions
 from websocket_routes import notify_device_status
+from video_service import presign_get_object, _parse_s3_link
 
 router = APIRouter()
 
@@ -653,9 +654,14 @@ def get_media_preview_urls(
                 """, (video_names, tenant_id))
                 for row in cur.fetchall():
                     vname, s3_link, content_type = row
+                    try:
+                        bucket, key = _parse_s3_link(s3_link)
+                        presigned = presign_get_object(bucket, key) if key else None
+                    except Exception:
+                        presigned = None
                     results["videos"].append({
                         "name": vname,
-                        "s3_link": s3_link,
+                        "s3_link": presigned,
                         "content_type": content_type or "video",
                     })
 
@@ -667,9 +673,14 @@ def get_media_preview_urls(
                 """, (ad_names, tenant_id))
                 for row in cur.fetchall():
                     aname, s3_link, content_type = row
+                    try:
+                        bucket, key = _parse_s3_link(s3_link)
+                        presigned = presign_get_object(bucket, key) if key else None
+                    except Exception:
+                        presigned = None
                     results["ads"].append({
                         "name": aname,
-                        "s3_link": s3_link,
+                        "s3_link": presigned,
                         "content_type": content_type or "image",
                     })
 
