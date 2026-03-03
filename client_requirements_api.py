@@ -659,8 +659,8 @@ def update_approval_settings(
     """Update content approval settings for the company."""
     tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
     
-    # Only admin can change this
-    if user.get("role") not in ["admin", "platform_admin"]:
+    # Only admin/company_admin can change this
+    if user.get("user_type") != "platform" and user.get("role") not in ["admin", "platform_admin", "company_admin"]:
         raise HTTPException(status_code=403, detail="Only admin can change approval settings")
     
     with pg_conn() as conn:
@@ -720,8 +720,10 @@ def create_content_change_request(body: ContentChangeRequestIn, user: Dict = Dep
                 row = cur.fetchone()
                 target_name = row[0] if row else None
             
+            # Platform users (including impersonation) are always auto-approved
+            is_platform = user.get("user_type") == "platform"
             # Determine if auto-approved
-            auto_approved = not require_approval or user_role in auto_approve_roles
+            auto_approved = is_platform or not require_approval or user_role in (auto_approve_roles or [])
             status = "approved" if auto_approved else "pending"
             expires_at = datetime.now() + timedelta(hours=body.expires_in_hours) if not auto_approved else None
             
@@ -801,7 +803,8 @@ def list_content_change_requests(
                        ccr.change_data, ccr.requested_by, u1.full_name as requester_name,
                        ccr.requested_at, ccr.request_note, ccr.status,
                        ccr.reviewed_by, u2.full_name as reviewer_name, ccr.reviewed_at,
-                       ccr.review_note, ccr.expires_at
+                       ccr.review_note, ccr.expires_at,
+                       u1.role as requester_role, u1.username as requester_username
                 FROM public.content_change_request ccr
                 LEFT JOIN public.users u1 ON u1.id = ccr.requested_by
                 LEFT JOIN public.users u2 ON u2.id = ccr.reviewed_by
@@ -823,7 +826,7 @@ def list_content_change_requests(
                     "target_name": row[4],
                     "change_data": json.loads(row[5]) if isinstance(row[5], str) else row[5],
                     "requested_by": row[6],
-                    "requested_by_name": row[7],
+                    "requested_by_name": row[7] or row[17],  # full_name or username
                     "requested_at": row[8].isoformat() if row[8] else None,
                     "request_note": row[9],
                     "status": row[10],
@@ -832,6 +835,7 @@ def list_content_change_requests(
                     "reviewed_at": row[13].isoformat() if row[13] else None,
                     "review_note": row[14],
                     "expires_at": row[15].isoformat() if row[15] else None,
+                    "requested_by_role": row[16],
                 })
             
             # Count pending
@@ -858,9 +862,15 @@ def review_content_change_request(
     tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
     user_id = user.get("user_id")
     user_role = user.get("role", "")
-    
-    # Check if user can approve
-    if user_role not in ["admin", "manager", "platform_admin"]:
+    user_type = user.get("user_type", "")
+
+    # Roles that can approve: platform users (impersonating), company admins, managers
+    CAN_APPROVE_ROLES = {"admin", "manager", "platform_admin", "company_admin", "content_manager"}
+
+    if user_type == "platform":
+        # Platform users (including impersonation) can always approve
+        pass
+    elif user_role not in CAN_APPROVE_ROLES:
         # Check if user has can_approve_content flag
         with pg_conn() as conn:
             with conn.cursor() as cur:
@@ -984,7 +994,83 @@ def _execute_content_change(cur, request_id: int, request_type: str, target_type
                     UPDATE public.device SET download_status = FALSE, needs_refresh = TRUE, updated_at = NOW()
                     WHERE id IN (SELECT did FROM public.device_assignment WHERE gid = %s);
                 """, (target_id,))
-        
+
+        elif request_type == "link_content":
+            # Name-based linking: link video/ad names to a group by name
+            # change_data: { "gname": "...", "video_names": [...], "ad_names": [...] }
+            gname = change_data.get("gname", "")
+            video_names = change_data.get("video_names", [])
+            ad_names = change_data.get("ad_names", [])
+
+            if gname:
+                # Resolve group id
+                cur.execute('SELECT id FROM public."group" WHERE gname = %s AND tenant_id = %s LIMIT 1;',
+                            (gname, tenant_id))
+                g_row = cur.fetchone()
+                if g_row:
+                    gid = g_row[0]
+
+                    # Sync videos: replace all videos for this group with the new set
+                    if video_names is not None:
+                        # Resolve video ids
+                        if video_names:
+                            cur.execute(
+                                'SELECT id, video_name FROM public.video WHERE video_name = ANY(%s) AND tenant_id = %s;',
+                                (video_names, tenant_id)
+                            )
+                            vid_rows = cur.fetchall()
+                            vid_ids = [r[0] for r in vid_rows]
+                        else:
+                            vid_ids = []
+
+                        # Remove videos not in the new list
+                        if vid_ids:
+                            cur.execute(
+                                'DELETE FROM public.group_video WHERE gid = %s AND vid NOT IN %s;',
+                                (gid, tuple(vid_ids))
+                            )
+                        else:
+                            cur.execute('DELETE FROM public.group_video WHERE gid = %s;', (gid,))
+
+                        # Insert new ones
+                        for vid in vid_ids:
+                            cur.execute("""
+                                INSERT INTO public.group_video (gid, vid, tenant_id)
+                                VALUES (%s, %s, %s) ON CONFLICT DO NOTHING;
+                            """, (gid, vid, tenant_id))
+
+                    # Sync advertisements
+                    if ad_names is not None:
+                        if ad_names:
+                            cur.execute(
+                                'SELECT id FROM public.advertisement WHERE ad_name = ANY(%s) AND tenant_id = %s;',
+                                (ad_names, tenant_id)
+                            )
+                            aid_rows = cur.fetchall()
+                            aid_ids = [r[0] for r in aid_rows]
+                        else:
+                            aid_ids = []
+
+                        if aid_ids:
+                            cur.execute(
+                                'DELETE FROM public.group_advertisement WHERE gid = %s AND aid NOT IN %s;',
+                                (gid, tuple(aid_ids))
+                            )
+                        else:
+                            cur.execute('DELETE FROM public.group_advertisement WHERE gid = %s;', (gid,))
+
+                        for aid in aid_ids:
+                            cur.execute("""
+                                INSERT INTO public.group_advertisement (gid, aid, tenant_id)
+                                VALUES (%s, %s, %s) ON CONFLICT DO NOTHING;
+                            """, (gid, aid, tenant_id))
+
+                    # Mark all devices in this group for refresh
+                    cur.execute("""
+                        UPDATE public.device SET download_status = FALSE, needs_refresh = TRUE, updated_at = NOW()
+                        WHERE id IN (SELECT did FROM public.device_assignment WHERE gid = %s);
+                    """, (gid,))
+
         # Log success
         print(f"[APPROVAL] Executed content change request #{request_id}: {request_type} on {target_type}:{target_id}")
         
