@@ -68,6 +68,9 @@ from background_tasks import (
 from migrations.company_expiration_schema import ensure_company_expiration_schema
 from company_expiration_api import router as company_expiration_router, check_company_access
 
+# NEW: Platform Announcements (visible to all users)
+from announcement_api import router as announcement_router
+
 load_dotenv()
 
 # ---------- Settings ----------
@@ -224,6 +227,8 @@ app.include_router(company_expiration_router, tags=["Company Expiration"])
 app.include_router(platform_router, prefix="/platform", tags=["Platform"])
 # NEW: Include client requirements router
 app.include_router(client_requirements_router, tags=["Client Requirements"])
+# NEW: Platform Announcements (visible to all users)
+app.include_router(announcement_router, tags=["Platform Announcements"])
 
 
 # ===========================================================
