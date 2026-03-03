@@ -241,7 +241,7 @@ def get_my_company_expiration_status(user: TenantContext = Depends(require_tenan
             
             # Calculate days_remaining based on status
             if status == "active" and days_until is not None:
-                days_remaining = days_until
+                days_remaining = days_until  # always return it so frontend can show timer
                 message = f"Your subscription expires in {days_until} days" if days_until <= 30 else None
             elif status == "grace_period":
                 days_remaining = effective_grace - (days_since or 0)
