@@ -1124,9 +1124,10 @@ def _execute_content_change(cur, request_id: int, request_type: str, target_type
                 if g_row:
                     gid = g_row[0]
 
-                    # Sync videos: replace all videos for this group with the new set
+                    # Add the newly approved videos to the group (additive, not a full replace).
+                    # The frontend sends only the delta (newly added items), so we must not
+                    # delete existing videos — just insert the new ones.
                     if video_names is not None:
-                        # Resolve video ids
                         if video_names:
                             cur.execute(
                                 'SELECT id, video_name FROM public.video WHERE video_name = ANY(%s) AND tenant_id = %s;',
@@ -1137,23 +1138,13 @@ def _execute_content_change(cur, request_id: int, request_type: str, target_type
                         else:
                             vid_ids = []
 
-                        # Remove videos not in the new list
-                        if vid_ids:
-                            cur.execute(
-                                'DELETE FROM public.group_video WHERE gid = %s AND vid NOT IN %s;',
-                                (gid, tuple(vid_ids))
-                            )
-                        else:
-                            cur.execute('DELETE FROM public.group_video WHERE gid = %s;', (gid,))
-
-                        # Insert new ones
                         for vid in vid_ids:
                             cur.execute("""
                                 INSERT INTO public.group_video (gid, vid, tenant_id)
                                 VALUES (%s, %s, %s) ON CONFLICT DO NOTHING;
                             """, (gid, vid, tenant_id))
 
-                    # Sync advertisements
+                    # Add newly approved advertisements (additive, not a full replace).
                     if ad_names is not None:
                         if ad_names:
                             cur.execute(
@@ -1165,14 +1156,6 @@ def _execute_content_change(cur, request_id: int, request_type: str, target_type
                         else:
                             aid_ids = []
 
-                        if aid_ids:
-                            cur.execute(
-                                'DELETE FROM public.group_advertisement WHERE gid = %s AND aid NOT IN %s;',
-                                (gid, tuple(aid_ids))
-                            )
-                        else:
-                            cur.execute('DELETE FROM public.group_advertisement WHERE gid = %s;', (gid,))
-
                         for aid in aid_ids:
                             cur.execute("""
                                 INSERT INTO public.group_advertisement (gid, aid, tenant_id)
@@ -1180,17 +1163,7 @@ def _execute_content_change(cur, request_id: int, request_type: str, target_type
                             """, (gid, aid, tenant_id))
 
                     # Sync device_video_shop_group so Recent Links dashboard reflects the change.
-                    # Remove videos for this group that are no longer in the approved list.
-                    if vid_ids:
-                        cur.execute("""
-                            DELETE FROM public.device_video_shop_group
-                            WHERE gid = %s AND vid NOT IN %s;
-                        """, (gid, tuple(vid_ids)))
-                    else:
-                        cur.execute("""
-                            DELETE FROM public.device_video_shop_group WHERE gid = %s;
-                        """, (gid,))
-
+                    # Additive only — do not delete existing links since video_names is a delta.
                     # Insert a row for every (device, shop) pair already assigned to this group
                     # for each newly approved video.
                     if vid_ids:
