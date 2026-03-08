@@ -1199,7 +1199,8 @@ def _execute_content_change(cur, request_id: int, request_type: str, target_type
                                 (SELECT sid FROM public.device_video_shop_group
                                  WHERE did = da.did AND gid = %s LIMIT 1),
                                 (SELECT sid FROM public.device_video_shop_group
-                                 WHERE did = da.did LIMIT 1)
+                                 WHERE did = da.did LIMIT 1),
+                                da.sid
                             ) AS sid
                             FROM public.device_assignment da
                             WHERE da.gid = %s;
