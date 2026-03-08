@@ -2590,8 +2590,25 @@ def list_download_urls_for_device(mobile_id: str, limit: int = Query(200, ge=1, 
     
     # For single mode: if layout_config specifies content, return only that content
     if layout_mode == "single" and config_slots:
-        first_slot = config_slots[0] if config_slots else {}
-        if first_slot.get("content_type") == "image" and first_slot.get("ad_name"):
+        first_slot = next((s for s in config_slots if s.get("position") == 1), config_slots[0] if config_slots else {})
+
+        if first_slot.get("play_all_sequential"):
+            # Sequential mode: return videos in the user-defined order.
+            # sequential_videos is an ordered list of video_name strings.
+            seq_names = first_slot.get("sequential_videos") or []
+            if seq_names:
+                # Build a lookup for fast access
+                item_by_name = {item.video_name: item for item in all_items}
+                ordered = []
+                for pos, name in enumerate(seq_names, start=1):
+                    item = item_by_name.get(name)
+                    if item:
+                        ordered.append(item.model_copy(update={"grid_position": pos}))
+                if ordered:
+                    all_items = ordered
+                # If none of the named videos are linked to the device, fall through
+                # to the normal all_items (don't leave the device with nothing to play)
+        elif first_slot.get("content_type") == "image" and first_slot.get("ad_name"):
             # Single mode with image - return only the image
             all_items = [item for item in all_items if item.content_type == "image" and item.video_name == first_slot.get("ad_name")]
         elif first_slot.get("video_name"):
