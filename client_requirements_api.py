@@ -1179,6 +1179,41 @@ def _execute_content_change(cur, request_id: int, request_type: str, target_type
                                 VALUES (%s, %s, %s) ON CONFLICT DO NOTHING;
                             """, (gid, aid, tenant_id))
 
+                    # Sync device_video_shop_group so Recent Links dashboard reflects the change.
+                    # Remove videos for this group that are no longer in the approved list.
+                    if vid_ids:
+                        cur.execute("""
+                            DELETE FROM public.device_video_shop_group
+                            WHERE gid = %s AND vid NOT IN %s;
+                        """, (gid, tuple(vid_ids)))
+                    else:
+                        cur.execute("""
+                            DELETE FROM public.device_video_shop_group WHERE gid = %s;
+                        """, (gid,))
+
+                    # Insert a row for every (device, shop) pair already assigned to this group
+                    # for each newly approved video.
+                    if vid_ids:
+                        cur.execute("""
+                            SELECT DISTINCT da.did, COALESCE(
+                                (SELECT sid FROM public.device_video_shop_group
+                                 WHERE did = da.did AND gid = %s LIMIT 1),
+                                (SELECT sid FROM public.device_video_shop_group
+                                 WHERE did = da.did LIMIT 1)
+                            ) AS sid
+                            FROM public.device_assignment da
+                            WHERE da.gid = %s;
+                        """, (gid, gid))
+                        dev_shop_pairs = [(r[0], r[1]) for r in cur.fetchall() if r[1] is not None]
+
+                        for did_row, sid_row in dev_shop_pairs:
+                            for vid in vid_ids:
+                                cur.execute("""
+                                    INSERT INTO public.device_video_shop_group (did, vid, sid, gid)
+                                    VALUES (%s, %s, %s, %s)
+                                    ON CONFLICT DO NOTHING;
+                                """, (did_row, vid, sid_row, gid))
+
                     # Mark all devices in this group for refresh
                     cur.execute("""
                         UPDATE public.device SET download_status = FALSE, needs_refresh = TRUE, updated_at = NOW()
