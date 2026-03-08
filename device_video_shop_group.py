@@ -2548,24 +2548,36 @@ def list_download_urls_for_device(mobile_id: str, limit: int = Query(200, ge=1, 
     
     # If we have a layout_config, filter and order items according to it
     if config_slots and layout_mode != "single":
-        # Build ordered list based on layout_config positions
+        # Stamp each item with the grid_position from layout_config so Android
+        # places it in the correct slot even when some slots are empty.
+        # Empty slots are simply not included — Android only plays slots that
+        # have content — but the position value must reflect the actual slot
+        # number (1-based) so the Android sort puts it in the right place.
         ordered_items = []
         for slot in sorted(config_slots, key=lambda s: s.get("position", 0)):
+            slot_position = slot.get("position", 0)
             slot_video_name = slot.get("video_name")
             slot_ad_name = slot.get("ad_name")
             slot_content_type = slot.get("content_type", "video")
-            
+
+            if not slot_video_name and not slot_ad_name:
+                # Empty slot — skip, but position gap is preserved via the
+                # grid_position values stamped on the non-empty items below
+                continue
+
             if slot_content_type == "image" and slot_ad_name:
-                # Find matching advertisement
                 matching = [item for item in all_items if item.content_type == "image" and item.video_name == slot_ad_name]
                 if matching:
-                    ordered_items.append(matching[0])
+                    # Stamp the correct slot position so Android places it right
+                    ordered_items.append(matching[0].model_copy(update={"grid_position": slot_position}))
             elif slot_video_name:
-                # Find matching video
                 matching = [item for item in all_items if item.video_name == slot_video_name]
                 if matching:
-                    ordered_items.append(matching[0])
-        
+                    ordered_items.append(matching[0].model_copy(update={"grid_position": slot_position}))
+
+        # Sort by the stamped grid_position so Android receives items in slot order
+        ordered_items.sort(key=lambda x: (x.grid_position or 0))
+
         # Use ordered items if we found any, otherwise fall back to all_items sorted
         if ordered_items:
             all_items = ordered_items
