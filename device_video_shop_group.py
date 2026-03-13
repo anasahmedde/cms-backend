@@ -470,6 +470,13 @@ class DeviceDownloadStatusOut(BaseModel):
     downloaded_count: int
 
 
+class DeviceWipeVideosOut(BaseModel):
+    mobile_id: str
+    deleted_links: int
+    message: str
+    wipe_command_sent: bool = False
+
+
 class DeviceDownloadProgressIn(BaseModel):
     current_file: int = 0
     total_files: int = 0
@@ -3289,6 +3296,20 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                 """, (body.is_online, mobile_id))
                 row = cur.fetchone()
                 
+                # Check if device needs to wipe local files
+                wipe_pending = False
+                try:
+                    cur.execute("SELECT wipe_pending FROM public.device WHERE id = %s;", (did,))
+                    wipe_row = cur.fetchone()
+                    wipe_pending = wipe_row[0] if wipe_row and wipe_row[0] else False
+                    
+                    # If wipe was pending, clear the flag after this response
+                    if wipe_pending:
+                        cur.execute("UPDATE public.device SET wipe_pending = FALSE WHERE id = %s;", (did,))
+                except Exception as e:
+                    # Column might not exist yet - that's OK
+                    print(f"wipe_pending check skipped: {e}")
+                
                 # Log status change if it actually changed
                 if previous_status != body.is_online:
                     event_type = "online" if body.is_online else "offline"
@@ -3321,7 +3342,8 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                 "is_online": bool(row[0]),
                 "is_active": True,
                 "force_refresh": needs_refresh,
-                "download_status": download_status
+                "download_status": download_status,
+                "wipe_videos": wipe_pending
             }
         except HTTPException:
             conn.rollback()
@@ -6672,6 +6694,82 @@ def standalone_delete_video(video_name: str, force: bool = Query(False)):
         except Exception as e:
             conn.rollback()
             raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# WIPE ALL VIDEOS FROM DEVICE
+# ============================================================================
+
+@app.post("/device/{mobile_id}/wipe-videos", response_model=DeviceWipeVideosOut)
+def wipe_all_videos_from_device(mobile_id: str):
+    """
+    Delete all video links for a device AND send a command to the device 
+    to delete all locally stored video files.
+    
+    This endpoint:
+    1. Removes all entries from device_video_shop_group for this device
+    2. Sets download_status = false to trigger re-sync
+    3. Sets a 'wipe_pending' flag that the device will check on next heartbeat
+    
+    The Android app checks for this flag in the online_update response
+    and deletes all files in the local video directory when set.
+    """
+    with pg_conn() as conn:
+        try:
+            did = get_device_id_by_mobile(conn, mobile_id)
+            if did is None:
+                raise HTTPException(status_code=404, detail=f"Device not found: {mobile_id}")
+            
+            with conn.cursor() as cur:
+                # 1. Delete all links from device_video_shop_group
+                cur.execute(
+                    "DELETE FROM public.device_video_shop_group WHERE did = %s RETURNING id;",
+                    (did,)
+                )
+                deleted_count = cur.rowcount or 0
+                
+                # 2. Reset download_status and set wipe flag
+                # Try with wipe_pending column first
+                try:
+                    cur.execute("""
+                        UPDATE public.device 
+                        SET download_status = false, 
+                            wipe_pending = true,
+                            updated_at = NOW() 
+                        WHERE id = %s;
+                    """, (did,))
+                    wipe_command_sent = True
+                except Exception:
+                    # Column doesn't exist, just reset download_status
+                    cur.execute("""
+                        UPDATE public.device 
+                        SET download_status = false,
+                            updated_at = NOW() 
+                        WHERE id = %s;
+                    """, (did,))
+                    wipe_command_sent = False
+            
+            conn.commit()
+            
+            return DeviceWipeVideosOut(
+                mobile_id=mobile_id,
+                deleted_links=deleted_count,
+                message=f"Deleted {deleted_count} video link(s). Device will wipe local files on next sync.",
+                wipe_command_sent=wipe_command_sent
+            )
+            
+        except HTTPException:
+            conn.rollback()
+            raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/device/{mobile_id}/wipe-videos")
+def wipe_all_videos_from_device_delete(mobile_id: str):
+    """DELETE method alias for wipe-videos endpoint."""
+    return wipe_all_videos_from_device(mobile_id)
 
 
 if __name__ == "__main__":
