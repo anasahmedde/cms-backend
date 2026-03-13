@@ -6703,16 +6703,9 @@ def standalone_delete_video(video_name: str, force: bool = Query(False)):
 @app.post("/device/{mobile_id}/wipe-videos", response_model=DeviceWipeVideosOut)
 def wipe_all_videos_from_device(mobile_id: str):
     """
-    Delete all video links for a device AND send a command to the device 
-    to delete all locally stored video files.
-    
-    This endpoint:
-    1. Removes all entries from device_video_shop_group for this device
-    2. Sets download_status = false to trigger re-sync
-    3. Sets a 'wipe_pending' flag that the device will check on next heartbeat
-    
-    The Android app checks for this flag in the online_update response
-    and deletes all files in the local video directory when set.
+    Send a command to the device to delete all locally stored video files.
+    This does NOT delete videos from S3 or remove links from the database.
+    It only tells the device to clear its local storage.
     """
     with pg_conn() as conn:
         try:
@@ -6721,26 +6714,19 @@ def wipe_all_videos_from_device(mobile_id: str):
                 raise HTTPException(status_code=404, detail=f"Device not found: {mobile_id}")
             
             with conn.cursor() as cur:
-                # 1. Delete all links from device_video_shop_group
-                cur.execute(
-                    "DELETE FROM public.device_video_shop_group WHERE did = %s RETURNING id;",
-                    (did,)
-                )
-                deleted_count = cur.rowcount or 0
-                
-                # 2. Reset download_status and set wipe flag
-                # Try with wipe_pending column first
+                # Only set wipe flag - do NOT delete any links from database
+                # The videos remain on S3 and in the database, only device storage is cleared
                 try:
                     cur.execute("""
                         UPDATE public.device 
-                        SET download_status = false, 
-                            wipe_pending = true,
+                        SET wipe_pending = true,
+                            download_status = false,
                             updated_at = NOW() 
                         WHERE id = %s;
                     """, (did,))
                     wipe_command_sent = True
                 except Exception:
-                    # Column doesn't exist, just reset download_status
+                    # Column doesn't exist
                     cur.execute("""
                         UPDATE public.device 
                         SET download_status = false,
@@ -6753,8 +6739,8 @@ def wipe_all_videos_from_device(mobile_id: str):
             
             return DeviceWipeVideosOut(
                 mobile_id=mobile_id,
-                deleted_links=deleted_count,
-                message=f"Deleted {deleted_count} video link(s). Device will wipe local files on next sync.",
+                deleted_links=0,  # No links deleted - only device storage will be cleared
+                message=f"Wipe command sent. Device will delete local files on next sync and re-download videos.",
                 wipe_command_sent=wipe_command_sent
             )
             
