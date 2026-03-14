@@ -6758,6 +6758,153 @@ def wipe_all_videos_from_device_delete(mobile_id: str):
     return wipe_all_videos_from_device(mobile_id)
 
 
+# ============================================================================
+# DEVICE STORAGE REPORTING
+# ============================================================================
+
+class DeviceStorageReportIn(BaseModel):
+    total_bytes: int = 0
+    available_bytes: int = 0
+    used_bytes: int = 0
+    content_bytes: int = 0
+    storage_percent_used: int = 0
+    ram_total_bytes: int = 0
+    ram_available_bytes: int = 0
+    ram_used_bytes: int = 0
+    system_ram_total: int = 0
+    system_ram_available: int = 0
+    low_memory: bool = False
+    is_tv: bool = False
+
+
+@app.post("/device/{mobile_id}/storage/report")
+def report_device_storage(mobile_id: str, body: DeviceStorageReportIn):
+    """
+    Receive storage and RAM report from device.
+    This is called by the Android app on startup and after downloads.
+    """
+    with pg_conn() as conn:
+        try:
+            did = get_device_id_by_mobile(conn, mobile_id)
+            if did is None:
+                raise HTTPException(status_code=404, detail=f"Device not found: {mobile_id}")
+            
+            with conn.cursor() as cur:
+                # Update device with storage info
+                # Try to use storage columns if they exist
+                try:
+                    cur.execute("""
+                        UPDATE public.device 
+                        SET storage_total_bytes = %s,
+                            storage_available_bytes = %s,
+                            storage_used_bytes = %s,
+                            storage_content_bytes = %s,
+                            storage_percent_used = %s,
+                            ram_total_bytes = %s,
+                            ram_available_bytes = %s,
+                            low_memory = %s,
+                            is_tv = %s,
+                            storage_updated_at = NOW(),
+                            updated_at = NOW()
+                        WHERE id = %s;
+                    """, (
+                        body.total_bytes,
+                        body.available_bytes,
+                        body.used_bytes,
+                        body.content_bytes,
+                        body.storage_percent_used,
+                        body.ram_total_bytes,
+                        body.ram_available_bytes,
+                        body.low_memory,
+                        body.is_tv,
+                        did
+                    ))
+                except Exception as e:
+                    # Columns might not exist, just log and continue
+                    Log_msg = f"Storage columns not found, skipping update: {e}"
+                    print(Log_msg)
+            
+            conn.commit()
+            
+            return {
+                "status": "ok",
+                "mobile_id": mobile_id,
+                "storage_mb": body.total_bytes // (1024 * 1024),
+                "available_mb": body.available_bytes // (1024 * 1024),
+                "content_mb": body.content_bytes // (1024 * 1024)
+            }
+            
+        except HTTPException:
+            conn.rollback()
+            raise
+        except Exception as e:
+            conn.rollback()
+            # Don't fail if storage update fails - it's not critical
+            return {"status": "error", "message": str(e)}
+
+
+@app.get("/device/{mobile_id}/storage")
+def get_device_storage(mobile_id: str):
+    """
+    Get device storage and RAM info for dashboard display.
+    """
+    with pg_conn() as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT 
+                        storage_total_bytes,
+                        storage_available_bytes,
+                        storage_used_bytes,
+                        storage_content_bytes,
+                        storage_percent_used,
+                        ram_total_bytes,
+                        ram_available_bytes,
+                        low_memory,
+                        is_tv,
+                        storage_updated_at
+                    FROM public.device 
+                    WHERE mobile_id = %s;
+                """, (mobile_id,))
+                row = cur.fetchone()
+                
+                if not row:
+                    raise HTTPException(status_code=404, detail="Device not found")
+                
+                return {
+                    "mobile_id": mobile_id,
+                    "storage": {
+                        "total_bytes": row[0] or 0,
+                        "available_bytes": row[1] or 0,
+                        "used_bytes": row[2] or 0,
+                        "content_bytes": row[3] or 0,
+                        "percent_used": row[4] or 0,
+                        "total_mb": (row[0] or 0) // (1024 * 1024),
+                        "available_mb": (row[1] or 0) // (1024 * 1024),
+                        "content_mb": (row[3] or 0) // (1024 * 1024)
+                    },
+                    "ram": {
+                        "total_bytes": row[5] or 0,
+                        "available_bytes": row[6] or 0,
+                        "total_mb": (row[5] or 0) // (1024 * 1024),
+                        "available_mb": (row[6] or 0) // (1024 * 1024)
+                    },
+                    "low_memory": row[7] or False,
+                    "is_tv": row[8] or False,
+                    "last_updated": row[9].isoformat() if row[9] else None
+                }
+        except HTTPException:
+            raise
+        except Exception as e:
+            # Columns might not exist
+            return {
+                "mobile_id": mobile_id,
+                "storage": None,
+                "ram": None,
+                "error": "Storage info not available. Run migration to add storage columns."
+            }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
