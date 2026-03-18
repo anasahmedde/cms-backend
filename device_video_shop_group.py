@@ -543,6 +543,10 @@ class DeviceOnlineUpdateIn(BaseModel):
     resolution: Optional[str] = None  # e.g. "1920x1080" — auto-reported by Android app
 
 
+class DeviceMuteIn(BaseModel):
+    is_muted: bool
+
+
 class DeviceActiveStatusIn(BaseModel):
     """Request body for setting device active status"""
     is_active: bool
@@ -3331,13 +3335,22 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                     cur.execute("SELECT wipe_pending FROM public.device WHERE id = %s;", (did,))
                     wipe_row = cur.fetchone()
                     wipe_pending = wipe_row[0] if wipe_row and wipe_row[0] else False
-                    
+
                     # If wipe was pending, clear the flag after this response
                     if wipe_pending:
                         cur.execute("UPDATE public.device SET wipe_pending = FALSE WHERE id = %s;", (did,))
                 except Exception as e:
                     # Column might not exist yet - that's OK
                     print(f"wipe_pending check skipped: {e}")
+
+                # Read current mute state to send back to the device
+                is_muted = False
+                try:
+                    cur.execute("SELECT is_muted FROM public.device WHERE id = %s;", (did,))
+                    mute_row = cur.fetchone()
+                    is_muted = bool(mute_row[0]) if mute_row and mute_row[0] else False
+                except Exception as e:
+                    print(f"is_muted check skipped: {e}")
                 
                 # Log status change if it actually changed
                 if previous_status != body.is_online:
@@ -3367,12 +3380,13 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                     print(f"[WS] Broadcast error: {e}")
             
             return {
-                "mobile_id": mobile_id, 
+                "mobile_id": mobile_id,
                 "is_online": bool(row[0]),
                 "is_active": True,
                 "force_refresh": needs_refresh,
                 "download_status": download_status,
-                "wipe_videos": wipe_pending
+                "wipe_videos": wipe_pending,
+                "is_muted": is_muted,
             }
         except HTTPException:
             conn.rollback()
@@ -3428,6 +3442,20 @@ def get_shop_devices(shop_name: str):
                 "devices": devices,
                 "device_count": len(devices)
             }
+
+
+# ---------- Device audio mute ----------
+@app.post("/device/{mobile_id}/mute")
+def set_device_mute(mobile_id: str, body: DeviceMuteIn, user: Dict = Depends(get_current_user)):
+    """Mute or unmute a device. The Android app picks up the change on the next heartbeat (~30 s)."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE public.device SET is_muted = %s, updated_at = NOW() WHERE mobile_id = %s;",
+                (body.is_muted, mobile_id)
+            )
+        conn.commit()
+    return {"mobile_id": mobile_id, "is_muted": body.is_muted}
 
 
 # ---------- Auto-detected resolution lookup ----------
