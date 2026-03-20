@@ -6173,7 +6173,8 @@ def standalone_list_devices(
                        -- Count downloaded videos (from download_progress JSON if available)
                        COALESCE(dc.downloaded_count, 0) as downloaded_count,
                        -- Last content update time
-                       COALESCE(lc.last_content_update, d.updated_at) as last_content_update
+                       COALESCE(lc.last_content_update, d.updated_at) as last_content_update,
+                       d.is_muted
                 FROM public.device d
                 LEFT JOIN public.device_assignment da ON da.did = d.id
                 LEFT JOIN public."group" g1 ON g1.id = da.gid
@@ -6253,6 +6254,7 @@ def standalone_list_devices(
             "downloaded_count": downloaded_count if download_status else 0,
             "content_status": content_status,
             "last_content_update": r[14] if len(r) > 14 else None,
+            "is_muted": bool(r[15]) if len(r) > 15 and r[15] is not None else False,
         })
     
     return {"items": items, "total": total, "count": len(items), "limit": limit, "offset": offset, "query": q}
