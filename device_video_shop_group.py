@@ -752,7 +752,7 @@ SELECT l.id, l.did, l.vid, l.sid, l.gid, l.created_at, l.updated_at,
        v.rotation, v.content_type, v.fit_mode, v.display_duration,
        l.display_order, v.resolution,
        l.device_rotation, l.device_resolution, l.grid_position, l.grid_size,
-       d.device_name, d.is_active
+       d.device_name, d.is_active, d.is_muted
 FROM public.device_video_shop_group l
 JOIN public.device d ON d.id = l.did
 JOIN public.video  v ON v.id = l.vid
@@ -794,6 +794,7 @@ def _row_to_link_dict(row) -> Dict[str, Any]:
         "grid_size": row[25] if len(row) > 25 else None,
         "device_name": row[26] if len(row) > 26 else None,
         "is_active": row[27] if len(row) > 27 else True,
+        "is_muted": bool(row[28]) if len(row) > 28 else False,
     }
 
 
@@ -919,7 +920,7 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
                            0 as rotation, 'video' as content_type, 'cover' as fit_mode, 10 as display_duration,
                            0 as display_order, NULL as resolution,
                            NULL as device_rotation, NULL as device_resolution, 0 as grid_position, NULL as grid_size,
-                           d.device_name, d.is_active
+                           d.device_name, d.is_active, d.is_muted
                     FROM public.device_assignment da
                     JOIN public.device d ON d.id = da.did
                     LEFT JOIN public.shop s ON s.id = da.sid
@@ -969,7 +970,7 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
                            0 as rotation, 'video' as content_type, 'cover' as fit_mode, 10 as display_duration,
                            0 as display_order, NULL as resolution,
                            NULL as device_rotation, NULL as device_resolution, 0 as grid_position, NULL as grid_size,
-                           d.device_name, d.is_active
+                           d.device_name, d.is_active, d.is_muted
                     FROM public.device d
                     WHERE NOT EXISTS (
                         SELECT 1 FROM public.device_video_shop_group l WHERE l.did = d.id
