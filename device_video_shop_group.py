@@ -1920,6 +1920,7 @@ def get_temperature_series(
 
 @app.post("/device/{mobile_id}/daily_update")
 def set_device_daily_count(mobile_id: str, body: DeviceDailyCountUpdateIn):
+    """Atomically increment the daily count by 1. Ignores the value in body to prevent race conditions."""
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
@@ -1928,16 +1929,16 @@ def set_device_daily_count(mobile_id: str, body: DeviceDailyCountUpdateIn):
                 if not row:
                     raise HTTPException(status_code=404, detail="Device not found")
                 did = row[0]
-            
+
             _check_and_reset_counters(conn, did)
-            
+
             with conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE public.device SET daily_count = %s, updated_at = NOW()
+                    UPDATE public.device SET daily_count = daily_count + 1, updated_at = NOW()
                     WHERE id = %s RETURNING daily_count;
-                """, (body.daily_count, did))
+                """, (did,))
                 count = cur.fetchone()[0]
-            
+
             conn.commit()
             return {"mobile_id": mobile_id, "daily_count": int(count)}
         except HTTPException:
@@ -1950,6 +1951,7 @@ def set_device_daily_count(mobile_id: str, body: DeviceDailyCountUpdateIn):
 
 @app.post("/device/{mobile_id}/monthly_update")
 def set_device_monthly_count(mobile_id: str, body: DeviceMonthlyCountUpdateIn):
+    """Atomically increment the monthly count by 1. Ignores the value in body to prevent race conditions."""
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
@@ -1958,16 +1960,16 @@ def set_device_monthly_count(mobile_id: str, body: DeviceMonthlyCountUpdateIn):
                 if not row:
                     raise HTTPException(status_code=404, detail="Device not found")
                 did = row[0]
-            
+
             _check_and_reset_counters(conn, did)
-            
+
             with conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE public.device SET monthly_count = %s, updated_at = NOW()
+                    UPDATE public.device SET monthly_count = monthly_count + 1, updated_at = NOW()
                     WHERE id = %s RETURNING monthly_count;
-                """, (body.monthly_count, did))
+                """, (did,))
                 count = cur.fetchone()[0]
-            
+
             conn.commit()
             return {"mobile_id": mobile_id, "monthly_count": int(count)}
         except HTTPException:
