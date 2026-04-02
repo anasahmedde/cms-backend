@@ -540,6 +540,11 @@ class DeviceOnlineStatusOut(BaseModel):
 
 class DeviceOnlineUpdateIn(BaseModel):
     is_online: bool = True
+    resolution: Optional[str] = None  # e.g. "1920x1080" — auto-reported by Android app
+
+
+class DeviceMuteIn(BaseModel):
+    is_muted: bool
 
 
 class DeviceActiveStatusIn(BaseModel):
@@ -747,7 +752,7 @@ SELECT l.id, l.did, l.vid, l.sid, l.gid, l.created_at, l.updated_at,
        v.rotation, v.content_type, v.fit_mode, v.display_duration,
        l.display_order, v.resolution,
        l.device_rotation, l.device_resolution, l.grid_position, l.grid_size,
-       d.device_name, d.is_active
+       d.device_name, d.is_active, d.is_muted
 FROM public.device_video_shop_group l
 JOIN public.device d ON d.id = l.did
 JOIN public.video  v ON v.id = l.vid
@@ -789,6 +794,7 @@ def _row_to_link_dict(row) -> Dict[str, Any]:
         "grid_size": row[25] if len(row) > 25 else None,
         "device_name": row[26] if len(row) > 26 else None,
         "is_active": row[27] if len(row) > 27 else True,
+        "is_muted": bool(row[28]) if len(row) > 28 else False,
     }
 
 
@@ -914,7 +920,7 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
                            0 as rotation, 'video' as content_type, 'cover' as fit_mode, 10 as display_duration,
                            0 as display_order, NULL as resolution,
                            NULL as device_rotation, NULL as device_resolution, 0 as grid_position, NULL as grid_size,
-                           d.device_name, d.is_active
+                           d.device_name, d.is_active, d.is_muted
                     FROM public.device_assignment da
                     JOIN public.device d ON d.id = da.did
                     LEFT JOIN public.shop s ON s.id = da.sid
@@ -964,7 +970,7 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
                            0 as rotation, 'video' as content_type, 'cover' as fit_mode, 10 as display_duration,
                            0 as display_order, NULL as resolution,
                            NULL as device_rotation, NULL as device_resolution, 0 as grid_position, NULL as grid_size,
-                           d.device_name, d.is_active
+                           d.device_name, d.is_active, d.is_muted
                     FROM public.device d
                     WHERE NOT EXISTS (
                         SELECT 1 FROM public.device_video_shop_group l WHERE l.did = d.id
@@ -1914,6 +1920,7 @@ def get_temperature_series(
 
 @app.post("/device/{mobile_id}/daily_update")
 def set_device_daily_count(mobile_id: str, body: DeviceDailyCountUpdateIn):
+    """Atomically increment the daily count by 1. Ignores the value in body to prevent race conditions."""
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
@@ -1922,16 +1929,16 @@ def set_device_daily_count(mobile_id: str, body: DeviceDailyCountUpdateIn):
                 if not row:
                     raise HTTPException(status_code=404, detail="Device not found")
                 did = row[0]
-            
+
             _check_and_reset_counters(conn, did)
-            
+
             with conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE public.device SET daily_count = %s, updated_at = NOW()
+                    UPDATE public.device SET daily_count = daily_count + 1, updated_at = NOW()
                     WHERE id = %s RETURNING daily_count;
-                """, (body.daily_count, did))
+                """, (did,))
                 count = cur.fetchone()[0]
-            
+
             conn.commit()
             return {"mobile_id": mobile_id, "daily_count": int(count)}
         except HTTPException:
@@ -1944,6 +1951,7 @@ def set_device_daily_count(mobile_id: str, body: DeviceDailyCountUpdateIn):
 
 @app.post("/device/{mobile_id}/monthly_update")
 def set_device_monthly_count(mobile_id: str, body: DeviceMonthlyCountUpdateIn):
+    """Atomically increment the monthly count by 1. Ignores the value in body to prevent race conditions."""
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
@@ -1952,16 +1960,16 @@ def set_device_monthly_count(mobile_id: str, body: DeviceMonthlyCountUpdateIn):
                 if not row:
                     raise HTTPException(status_code=404, detail="Device not found")
                 did = row[0]
-            
+
             _check_and_reset_counters(conn, did)
-            
+
             with conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE public.device SET monthly_count = %s, updated_at = NOW()
+                    UPDATE public.device SET monthly_count = monthly_count + 1, updated_at = NOW()
                     WHERE id = %s RETURNING monthly_count;
-                """, (body.monthly_count, did))
+                """, (did,))
                 count = cur.fetchone()[0]
-            
+
             conn.commit()
             return {"mobile_id": mobile_id, "monthly_count": int(count)}
         except HTTPException:
@@ -3181,17 +3189,31 @@ def set_device_grid_layout(mobile_id: str, body: Dict[str, Any]):
 
 # ---------- Online status with 1-minute threshold ----------
 @app.get("/device/{mobile_id}/online", response_model=DeviceOnlineStatusOut)
-def get_device_online_status(mobile_id: str):
+def get_device_online_status(mobile_id: str, resolution: Optional[str] = Query(None)):
     with pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT id, is_online, last_online_at,
                        EXTRACT(EPOCH FROM (NOW() - last_online_at)) as seconds_ago,
-                       is_active, tenant_id
+                       is_active, tenant_id, resolution
                 FROM public.device WHERE mobile_id = %s LIMIT 1;
             """, (mobile_id,))
             row = cur.fetchone()
             if not row:
+                # Device not yet registered — cache its reported resolution so the
+                # admin can see it pre-filled when adding the device in the CMS.
+                if resolution:
+                    try:
+                        cur.execute("""
+                            INSERT INTO public.device_resolution_cache (mobile_id, resolution, reported_at)
+                            VALUES (%s, %s, NOW())
+                            ON CONFLICT (mobile_id) DO UPDATE
+                                SET resolution = EXCLUDED.resolution,
+                                    reported_at = NOW();
+                        """, (mobile_id, resolution))
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
                 raise HTTPException(status_code=404, detail="Device not found")
             
             did = row[0]
@@ -3199,7 +3221,19 @@ def get_device_online_status(mobile_id: str):
             seconds_ago = row[3]
             is_active = row[4] if row[4] is not None else True
             tenant_id = row[5]
-            
+            current_resolution = row[6]
+
+            # Auto-save reported resolution if not already set
+            if resolution and not current_resolution:
+                try:
+                    cur.execute(
+                        "UPDATE public.device SET resolution = %s WHERE mobile_id = %s;",
+                        (resolution, mobile_id)
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+
             # If device is inactive, return 404 to show "not enrolled" screen on device
             if not is_active:
                 raise HTTPException(status_code=404, detail="Device is deactivated")
@@ -3286,14 +3320,16 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                         "download_status": download_status
                     }
                 
-                # Update the device status and clear needs_refresh flag
+                # Update device status; also auto-save resolution if app reported one
+                # and the device doesn't have one set yet (COALESCE keeps existing value).
                 cur.execute("""
-                    UPDATE public.device 
+                    UPDATE public.device
                     SET is_online = %s, last_online_at = NOW(), updated_at = NOW(),
-                        needs_refresh = FALSE
+                        needs_refresh = FALSE,
+                        resolution = COALESCE(resolution, %s)
                     WHERE mobile_id = %s
                     RETURNING is_online;
-                """, (body.is_online, mobile_id))
+                """, (body.is_online, body.resolution, mobile_id))
                 row = cur.fetchone()
                 
                 # Check if device needs to wipe local files
@@ -3302,13 +3338,22 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                     cur.execute("SELECT wipe_pending FROM public.device WHERE id = %s;", (did,))
                     wipe_row = cur.fetchone()
                     wipe_pending = wipe_row[0] if wipe_row and wipe_row[0] else False
-                    
+
                     # If wipe was pending, clear the flag after this response
                     if wipe_pending:
                         cur.execute("UPDATE public.device SET wipe_pending = FALSE WHERE id = %s;", (did,))
                 except Exception as e:
                     # Column might not exist yet - that's OK
                     print(f"wipe_pending check skipped: {e}")
+
+                # Read current mute state to send back to the device
+                is_muted = False
+                try:
+                    cur.execute("SELECT is_muted FROM public.device WHERE id = %s;", (did,))
+                    mute_row = cur.fetchone()
+                    is_muted = bool(mute_row[0]) if mute_row and mute_row[0] else False
+                except Exception as e:
+                    print(f"is_muted check skipped: {e}")
                 
                 # Log status change if it actually changed
                 if previous_status != body.is_online:
@@ -3338,12 +3383,13 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                     print(f"[WS] Broadcast error: {e}")
             
             return {
-                "mobile_id": mobile_id, 
+                "mobile_id": mobile_id,
                 "is_online": bool(row[0]),
                 "is_active": True,
                 "force_refresh": needs_refresh,
                 "download_status": download_status,
-                "wipe_videos": wipe_pending
+                "wipe_videos": wipe_pending,
+                "is_muted": is_muted,
             }
         except HTTPException:
             conn.rollback()
@@ -3401,6 +3447,55 @@ def get_shop_devices(shop_name: str):
             }
 
 
+# ---------- Device audio mute ----------
+@app.post("/device/{mobile_id}/mute")
+def set_device_mute(mobile_id: str, body: DeviceMuteIn, user: Dict = Depends(get_current_user)):
+    """Mute or unmute a device. The Android app picks up the change on the next heartbeat (~30 s)."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE public.device SET is_muted = %s, updated_at = NOW() WHERE mobile_id = %s;",
+                (body.is_muted, mobile_id)
+            )
+        conn.commit()
+    return {"mobile_id": mobile_id, "is_muted": body.is_muted}
+
+
+# ---------- Auto-detected resolution lookup ----------
+@app.get("/device/{mobile_id}/detected-resolution")
+def get_detected_resolution(mobile_id: str):
+    """Return the screen resolution that the Android device self-reported.
+
+    Checks the enrolled device table first (fastest path once enrolled),
+    then falls back to the pre-enrollment cache populated by the GET /online
+    endpoint.  Returns {"resolution": null} when nothing has been reported yet.
+    """
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            # 1) Already enrolled — check device table
+            cur.execute(
+                "SELECT resolution FROM public.device WHERE mobile_id = %s LIMIT 1;",
+                (mobile_id,)
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                return {"resolution": row[0], "source": "device"}
+
+            # 2) Not yet enrolled — check pre-enrollment cache
+            try:
+                cur.execute(
+                    "SELECT resolution FROM public.device_resolution_cache WHERE mobile_id = %s;",
+                    (mobile_id,)
+                )
+                cache_row = cur.fetchone()
+                if cache_row and cache_row[0]:
+                    return {"resolution": cache_row[0], "source": "cache"}
+            except Exception:
+                pass  # Cache table may not exist on first deploy
+
+    return {"resolution": None, "source": None}
+
+
 # ---------- Device creation with group/shop linking ----------
 @app.post("/device/create")
 def create_device_with_linking(body: DeviceCreateIn, user: Dict = Depends(get_current_user)):
@@ -3413,14 +3508,26 @@ def create_device_with_linking(body: DeviceCreateIn, user: Dict = Depends(get_cu
                 cur.execute("SELECT id FROM public.device WHERE mobile_id = %s AND tenant_id = %s ORDER BY id DESC LIMIT 1;", (body.mobile_id, tenant_id))
                 existing = cur.fetchone()
                 
+                # Determine effective resolution: prefer what the admin chose in the UI,
+                # then fall back to whatever the device auto-reported before enrollment.
+                effective_resolution = body.resolution
+                if not effective_resolution:
+                    cur.execute(
+                        "SELECT resolution FROM public.device_resolution_cache WHERE mobile_id = %s;",
+                        (body.mobile_id,)
+                    )
+                    cache_row = cur.fetchone()
+                    if cache_row and cache_row[0]:
+                        effective_resolution = cache_row[0]
+
                 if existing:
                     did = existing[0]
                     # Update resolution and device_name if provided
                     updates = []
                     params = []
-                    if body.resolution:
+                    if effective_resolution:
                         updates.append("resolution = %s")
-                        params.append(body.resolution)
+                        params.append(effective_resolution)
                     if body.device_name:
                         updates.append("device_name = %s")
                         params.append(body.device_name)
@@ -3428,13 +3535,22 @@ def create_device_with_linking(body: DeviceCreateIn, user: Dict = Depends(get_cu
                         params.append(did)
                         cur.execute(f"UPDATE public.device SET {', '.join(updates)} WHERE id = %s;", params)
                 else:
-                    # Create new device with resolution and device_name
+                    # Create new device; resolution comes from admin choice or auto-detected cache
                     cur.execute("""
                         INSERT INTO public.device (mobile_id, download_status, is_online, last_online_at, resolution, device_name, tenant_id)
                         VALUES (%s, FALSE, FALSE, NOW(), %s, %s, %s)
                         RETURNING id;
-                    """, (body.mobile_id, body.resolution, body.device_name, tenant_id))
+                    """, (body.mobile_id, effective_resolution, body.device_name, tenant_id))
                     did = cur.fetchone()[0]
+
+                # Remove from cache now that the device is enrolled
+                try:
+                    cur.execute(
+                        "DELETE FROM public.device_resolution_cache WHERE mobile_id = %s;",
+                        (body.mobile_id,)
+                    )
+                except Exception:
+                    pass  # Cache table may not exist on first deploy; non-fatal
                 
                 result = {
                     "device_id": did,
@@ -6059,7 +6175,8 @@ def standalone_list_devices(
                        -- Count downloaded videos (from download_progress JSON if available)
                        COALESCE(dc.downloaded_count, 0) as downloaded_count,
                        -- Last content update time
-                       COALESCE(lc.last_content_update, d.updated_at) as last_content_update
+                       COALESCE(lc.last_content_update, d.updated_at) as last_content_update,
+                       d.is_muted
                 FROM public.device d
                 LEFT JOIN public.device_assignment da ON da.did = d.id
                 LEFT JOIN public."group" g1 ON g1.id = da.gid
@@ -6139,6 +6256,7 @@ def standalone_list_devices(
             "downloaded_count": downloaded_count if download_status else 0,
             "content_status": content_status,
             "last_content_update": r[14] if len(r) > 14 else None,
+            "is_muted": bool(r[15]) if len(r) > 15 and r[15] is not None else False,
         })
     
     return {"items": items, "total": total, "count": len(items), "limit": limit, "offset": offset, "query": q}

@@ -1,270 +1,205 @@
-# DGX Backend
+# CMS Backend
 
-A microservices-based backend system for managing devices, videos, shops, and groups with PostgreSQL and AWS S3 integration. Built with FastAPI.
+A FastAPI-based backend for the Digix CMS platform — managing devices, videos, shops, groups, content approvals, announcements, and real-time WebSocket communication.
 
 ## Overview
 
-This backend provides RESTful APIs for a device management and video distribution system. It consists of multiple FastAPI services that can run independently or together, managing:
+The backend provides all REST APIs consumed by the CMS frontend and Android devices. It handles:
 
-- **Devices** - Mobile/IoT device registration and status tracking
-- **Videos** - Video file uploads to S3 with metadata management
-- **Shops** - Shop/location management
-- **Groups** - Device grouping functionality
-- **Links** - Associations between devices, videos, shops, and groups
+- **Devices** — registration, online status, storage reporting, expiration, layout config
+- **Videos & Advertisements** — S3 upload, metadata, rotation, fit mode, content type
+- **Shops & Groups** — location and device-group management
+- **Links** — associations between devices, videos, shops, and groups (`device_video_shop_group`)
+- **Content Approval** — request/review workflow for linking content to groups
+- **Announcements** — global and targeted announcements with scheduling and expiration
+- **WebSocket** — real-time push for pending approvals badge and announcements
+- **Background Tasks** — scheduled device expiration, offline detection, storage cleanup
+
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        API Services                              │
-├──────────────┬──────────────┬──────────────┬───────────────────┤
-│ device.py    │ video.py     │ shop.py      │ group.py          │
-│ Port: 8000   │ Port: 8003   │ Port: 8002   │ Port: 8001        │
-├──────────────┴──────────────┴──────────────┴───────────────────┤
-│           device_video_shop_group.py (Combined Service)         │
-│                         Port: 8005                               │
-├─────────────────────────────────────────────────────────────────┤
-│                     PostgreSQL Database                          │
-│                     AWS S3 (Video Storage)                       │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                        CMS Backend (Port 8005)                    │
+├──────────────────────────────────────────────────────────────────┤
+│  device_video_shop_group.py  — core linking, layout, downloads   │
+│  client_requirements_api.py  — content approval workflow         │
+│  announcement_api.py         — announcements CRUD + scheduling   │
+│  websocket_routes.py         — WebSocket endpoints               │
+│  websocket_manager.py        — connection manager + broadcast    │
+│  background_tasks.py         — scheduled jobs (expiry, offline)  │
+│  company_expiration_api.py   — company/tenant expiration         │
+├──────────────────────────────────────────────────────────────────┤
+│                     PostgreSQL Database                           │
+│                     AWS S3 (Video/Image Storage)                  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-## Services
+---
 
-### Device Service (`device.py`)
-Manages device registration and status tracking.
+## Key Features
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/db_health` | GET | Database health check |
-| `/insert_device` | POST | Register a new device |
-| `/device/{mobile_id}` | GET | Get device by mobile ID |
-| `/devices` | GET | List devices (paginated, searchable) |
-| `/device/{mobile_id}` | PUT | Update device |
-| `/device/{mobile_id}` | DELETE | Delete device |
+### Device Layout & Grid
+- `GET/POST /device/{mobile_id}/layout` — save and restore grid layout config per device
+- `layout_config` JSON stores slot assignments, rotations, and sequential playback settings
+- `POST /group/{gname}/sync-to-devices` — push a layout to all devices in a group
 
-### Video Service (`video_service.py`)
-Handles video uploads to S3 and metadata management.
+### Sequential Playback (Single Mode)
+When `layout_config` slot 1 has `play_all_sequential: true`, the downloads endpoint returns all videos in `sequential_videos` order instead of just the single slot video. Android plays them in sequence, looping forever.
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/upload_video` | POST | Upload video to S3 |
-| `/video/{video_name}` | GET | Get video metadata + presigned URL |
-| `/video/{video_name}/presign` | GET | Generate presigned download URL |
-| `/videos` | GET | List videos (paginated) |
-| `/video/{video_name}` | PUT | Update video metadata |
-| `/video/{video_name}/rotation` | POST | Set video rotation |
-| `/video/{video_name}/fit_mode` | POST | Set video fit mode |
-| `/video/{video_name}` | DELETE | Delete video record |
+### Content Approval Workflow
+- Users submit content change requests (`link_content`, `video_assign`, `video_remove`)
+- Admins approve or reject via `POST /content-changes/{id}/review`
+- On approval, `device_video_shop_group` is synced so Recent Links updates immediately
+- WebSocket pushes updated pending count to all connected admins
 
-### Shop Service (`shop_service.py`)
-Manages shop/location entities.
+### Real-time WebSocket
+- `WS /ws/{tenant_id}` — persistent connection per tenant
+- Broadcasts: `pending_approvals` count, `announcement` events
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/insert_shop` | POST | Create a new shop |
-| `/shop/{shop_name}` | GET | Get shop by name |
-| `/shops` | GET | List shops (paginated) |
-| `/shop/{shop_name}` | PUT | Update shop |
-| `/shop/{shop_name}` | DELETE | Delete shop |
+### Android Device Downloads
+- `GET /device/{mobile_id}/videos/downloads` — returns presigned S3 URLs for all assigned content, ordered by `grid_position` from `layout_config`
+- Supports single, sequential, and all grid layout modes (`split_h`, `split_v`, `grid_3`, `grid_4`, `grid_1x4`)
 
-### Group Service (`group.py`)
-Manages device groups.
+---
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/insert_group` | POST | Create a new group |
-| `/group/{gname}` | GET | Get group by name |
-| `/groups` | GET | List groups (paginated) |
-| `/group/{gname}` | PUT | Update group |
-| `/group/{gname}` | DELETE | Delete group |
+## API Reference (Main Endpoints)
 
-### Combined Service (`device_video_shop_group.py`)
-Main unified service providing linking functionality and extended features.
-
+### Links
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/link` | POST | Create device-video-shop-group link |
 | `/links` | GET | List all links |
-| `/links/by_device/{mobile_id}` | GET | Get links for a device |
-| `/links/by_group/{gname}` | GET | Get links for a group |
-| `/device/{mobile_id}/presigned_urls` | GET | Get presigned URLs for device's videos |
-| `/device/{mobile_id}/online` | POST | Update device online status |
-| `/device/{mobile_id}/temperature` | POST | Update device temperature |
-| `/device/{mobile_id}/logs` | GET | Get device logs |
-| `/device/{mobile_id}/logs/download` | GET | Download device logs as CSV |
-| `/devices/logs/summary` | GET | Get logs summary for all devices |
-| `/group/{gname}/videos` | PUT | Update videos for a group |
-| `/admin/mark_offline_devices` | POST | Mark stale devices as offline |
+| `/link/{id}/settings` | PUT | Update grid_position, rotation, resolution |
+| `/link/device-to-group` | POST | Link device to group (inherits all videos) |
+
+### Device
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/device/{mobile_id}/layout` | GET/POST | Get/save grid layout config |
+| `/device/{mobile_id}/videos/downloads` | GET | Presigned URLs for device content |
+| `/device/{mobile_id}/resolution` | GET/POST | Device screen resolution |
+| `/device/{mobile_id}/online` | POST | Update online status |
+| `/device/{mobile_id}/storage` | POST | Report storage usage |
+
+### Content Approval
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/content-changes` | POST | Submit a content change request |
+| `/content-changes` | GET | List requests (filter by status) |
+| `/content-changes/{id}/review` | POST | Approve or reject a request |
+| `/company/approval-settings` | GET/PUT | Toggle approval requirement |
+
+### Announcements
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/announcements` | GET/POST | List / create announcements |
+| `/announcements/{id}` | PUT/DELETE | Update / delete announcement |
+| `/announcements/active` | GET | Get currently active announcements |
+
+### WebSocket
+| Endpoint | Description |
+|----------|-------------|
+| `WS /ws/{tenant_id}` | Real-time push channel per tenant |
+
+---
 
 ## Installation
 
 ### Prerequisites
 - Python 3.9+
 - PostgreSQL 12+
-- AWS Account with S3 access
+- AWS account with S3 access
 
 ### Setup
 
-1. **Clone the repository**
-   ```bash
-   git clone <repository-url>
-   cd dgx-backend
-   ```
-
-2. **Create virtual environment**
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # Linux/Mac
-   # or
-   venv\Scripts\activate     # Windows
-   ```
-
-3. **Install dependencies**
-   ```bash
-   pip install -r requirement.txt
-   ```
-
-4. **Configure environment variables**
-   
-   Create a `.env` file:
-   ```env
-   # PostgreSQL
-   PGHOST=localhost
-   PGPORT=5432
-   PGDATABASE=dgx
-   PGUSER=app_user
-   PGPASSWORD=your_password
-   PG_MIN_CONN=1
-   PG_MAX_CONN=10
-   
-   # AWS S3
-   S3_BUCKET=your-bucket-name
-   S3_PREFIX=myvideos
-   AWS_REGION=us-east-1
-   PRESIGN_EXPIRES=3600
-   
-   # Optional
-   PORT=8005
-   ```
-
-5. **Initialize the database**
-   
-   The services auto-create tables on startup, or run migrations manually.
-
-## Running the Services
-
-### Development Mode
-
-Run individual services:
 ```bash
-# Device Service
-uvicorn device:app --host 0.0.0.0 --port 8000 --reload
+git clone <repository-url>
+cd cms-backend
 
-# Video Service
-uvicorn video_service:app --host 0.0.0.0 --port 8003 --reload
+python -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
 
-# Shop Service
-uvicorn shop_service:app --host 0.0.0.0 --port 8002 --reload
+pip install -r requirement.txt
+```
 
-# Group Service
-uvicorn group:app --host 0.0.0.0 --port 8001 --reload
+### Environment Variables
 
-# Combined Service (recommended)
+Create a `.env` file:
+
+```env
+# PostgreSQL
+PGHOST=localhost
+PGPORT=5432
+PGDATABASE=dgx
+PGUSER=app_user
+PGPASSWORD=your_password
+PG_MIN_CONN=1
+PG_MAX_CONN=10
+
+# AWS S3
+S3_BUCKET=your-bucket-name
+S3_PREFIX=videos
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=your_key
+AWS_SECRET_ACCESS_KEY=your_secret
+PRESIGN_EXPIRES=3600
+
+# App
+PORT=8005
+SECRET_KEY=your_secret_key
+```
+
+---
+
+## Running
+
+### Development
+```bash
 uvicorn device_video_shop_group:app --host 0.0.0.0 --port 8005 --reload
 ```
 
-Or run directly:
-```bash
-python device_video_shop_group.py
-```
-
-### Production Mode
-
+### Production
 ```bash
 uvicorn device_video_shop_group:app --host 0.0.0.0 --port 8005 --workers 4
 ```
 
-## Database Schema
+Interactive API docs available at `http://localhost:8005/docs`
 
-The system uses the following main tables:
+---
 
-- `device` - Device registration and status
-- `video` - Video metadata and S3 references
-- `shop` - Shop information
-- `group` - Group definitions
-- `device_video_shop_group` - Link table connecting all entities
-- `device_logs` - Device telemetry logs
+## Database Schema (Main Tables)
 
-## Cron Jobs
+| Table | Description |
+|-------|-------------|
+| `device` | Device registration, status, storage, expiration |
+| `video` | Video metadata and S3 references |
+| `advertisement` | Image/ad metadata and S3 references |
+| `shop` | Shop/location entities |
+| `group` | Device groups |
+| `device_video_shop_group` | Core link table (device ↔ video ↔ shop ↔ group) |
+| `device_assignment` | Device ↔ group ↔ shop assignment |
+| `group_video` | Group ↔ video membership |
+| `group_advertisement` | Group ↔ advertisement membership |
+| `device_layout` | Per-device grid layout config |
+| `content_change_request` | Approval workflow requests |
+| `announcement` | Global/targeted announcements |
+| `company` | Tenant/company records |
 
-### Mark Offline Devices
+---
 
-Use `mark_devices_offline.sh` to mark devices as offline if they haven't reported recently:
+## Deployment
 
-```bash
-# Add to crontab to run every minute
-* * * * * /path/to/mark_devices_offline.sh
-```
+CI/CD is configured via `.github/workflows/deploy-backend.yml`. Pushes to `staging` trigger automatic deployment.
 
-Or call the API endpoint:
-```bash
-curl -X POST http://localhost:8005/admin/mark_offline_devices
-```
+---
 
-## Video Properties
+## Branch Strategy
 
-Videos support the following configurable properties:
-
-| Property | Values | Default | Description |
-|----------|--------|---------|-------------|
-| `rotation` | 0, 90, 180, 270 | 0 | Display rotation in degrees |
-| `fit_mode` | cover, contain, fill, none | cover | CSS object-fit behavior |
-| `content_type` | video, image, html, pdf | video | Media type |
-| `display_duration` | seconds | 10 | Display duration for slideshows |
-
-## Dependencies
-
-```
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
-psycopg2-binary==2.9.9
-boto3==1.34.0
-python-dotenv==1.0.0
-pydantic==2.5.0
-```
-
-## API Documentation
-
-Once running, access the interactive API documentation:
-
-- Swagger UI: `http://localhost:8005/docs`
-- ReDoc: `http://localhost:8005/redoc`
-
-## Error Handling
-
-The API uses standard HTTP status codes:
-
-| Code | Description |
-|------|-------------|
-| 200 | Success |
-| 400 | Bad request / validation error |
-| 404 | Resource not found |
-| 409 | Conflict (e.g., deleting linked device) |
-| 500 | Internal server error |
-| 503 | Database connection pool exhausted |
-
-## Security Notes
-
-- CORS is configured to allow all origins (`*`) - restrict in production
-- Database credentials should be properly secured
-- S3 buckets should have appropriate access policies
-- Consider adding authentication/authorization for production use
-
-## License
-
-[Add your license here]
+| Branch | Purpose |
+|--------|---------|
+| `staging` | Main integration branch — all PRs target here |
+| `main` | Production-stable |
+| `fix/*` | Bug fix branches |
+| `feat/*` | Feature branches |
