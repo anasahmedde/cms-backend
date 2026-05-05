@@ -85,11 +85,11 @@ DB_MAX_CONN = int(os.getenv("PG_MAX_CONN", "50"))
 AWS_REGION = os.getenv("AWS_REGION")
 PRESIGN_EXPIRES = int(os.getenv("PRESIGN_EXPIRES", "900"))  # 15 min
 
-# CHANGED: Reduced from 120 to 45 seconds for faster offline detection
-ONLINE_THRESHOLD_SECONDS = 45
+# Must be > Android heartbeat interval (10s) with a safety margin
+ONLINE_THRESHOLD_SECONDS = 25
 
-# Background task check interval (30 seconds)
-OFFLINE_CHECK_INTERVAL_SECONDS = 30
+# Should be <= ONLINE_THRESHOLD_SECONDS so no device slips through between checks
+OFFLINE_CHECK_INTERVAL_SECONDS = 10
 
 # NOTE: active_sessions is now imported from tenant_context
 
