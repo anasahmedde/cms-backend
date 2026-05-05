@@ -630,41 +630,49 @@ def _check_and_reset_counters(conn, did: int) -> Tuple[bool, bool]:
         updates = []
         params = []
         
-        # Reset daily if last reset was before today
-        if last_daily is None or last_daily < today:
-            # Save yesterday's count to history (if there was a previous day)
-            if last_daily is not None and current_daily_count > 0:
+        # Reset daily only when we KNOW the day has changed (last_daily is not None AND before today).
+        # If last_daily is None it means this is the first run — just initialise the date,
+        # do NOT zero the counter so we don't wipe a count that already exists.
+        if last_daily is not None and last_daily < today:
+            if current_daily_count > 0:
                 try:
                     cur.execute("""
                         INSERT INTO public.count_history (did, period_type, period_date, count_value)
                         VALUES (%s, 'daily', %s, %s)
                         ON CONFLICT (did, period_type, period_date) DO UPDATE SET count_value = EXCLUDED.count_value;
                     """, (did, last_daily, current_daily_count))
-                except Exception as e:
-                    pass  # Ignore errors on history save
-            
+                except Exception:
+                    pass
             updates.append("daily_count = 0")
             updates.append("last_daily_reset = %s")
             params.append(today)
             daily_reset = True
-        
-        # Reset monthly if last reset was before this month
-        if last_monthly is None or last_monthly < month_start:
-            # Save last month's count to history
-            if last_monthly is not None and current_monthly_count > 0:
+        elif last_daily is None:
+            # First run — stamp today so future days trigger the reset correctly
+            updates.append("last_daily_reset = %s")
+            params.append(today)
+
+        # Reset monthly only when we KNOW the month has changed.
+        # If last_monthly is None it is the first run — just initialise the date,
+        # do NOT zero the counter.
+        if last_monthly is not None and last_monthly < month_start:
+            if current_monthly_count > 0:
                 try:
                     cur.execute("""
                         INSERT INTO public.count_history (did, period_type, period_date, count_value)
                         VALUES (%s, 'monthly', %s, %s)
                         ON CONFLICT (did, period_type, period_date) DO UPDATE SET count_value = EXCLUDED.count_value;
                     """, (did, last_monthly, current_monthly_count))
-                except Exception as e:
-                    pass  # Ignore errors on history save
-            
+                except Exception:
+                    pass
             updates.append("monthly_count = 0")
             updates.append("last_monthly_reset = %s")
             params.append(month_start)
             monthly_reset = True
+        elif last_monthly is None:
+            # First run — stamp month_start so future month boundaries trigger reset
+            updates.append("last_monthly_reset = %s")
+            params.append(month_start)
         
         if updates:
             params.append(did)
@@ -1920,7 +1928,9 @@ def get_temperature_series(
 
 @app.post("/device/{mobile_id}/daily_update")
 def set_device_daily_count(mobile_id: str, body: DeviceDailyCountUpdateIn):
-    """Atomically increment the daily count by 1. Ignores the value in body to prevent race conditions."""
+    """Atomically increment daily_count AND monthly_count by 1 in a single transaction.
+    Monthly is incremented here (not in monthly_update) so that one door event
+    always produces exactly one increment to both counters with no race condition."""
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
@@ -1934,13 +1944,17 @@ def set_device_daily_count(mobile_id: str, body: DeviceDailyCountUpdateIn):
 
             with conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE public.device SET daily_count = daily_count + 1, updated_at = NOW()
-                    WHERE id = %s RETURNING daily_count;
+                    UPDATE public.device
+                    SET daily_count   = daily_count + 1,
+                        monthly_count = monthly_count + 1,
+                        updated_at    = NOW()
+                    WHERE id = %s
+                    RETURNING daily_count, monthly_count;
                 """, (did,))
-                count = cur.fetchone()[0]
+                daily, monthly = cur.fetchone()
 
             conn.commit()
-            return {"mobile_id": mobile_id, "daily_count": int(count)}
+            return {"mobile_id": mobile_id, "daily_count": int(daily), "monthly_count": int(monthly)}
         except HTTPException:
             conn.rollback()
             raise
@@ -1951,32 +1965,23 @@ def set_device_daily_count(mobile_id: str, body: DeviceDailyCountUpdateIn):
 
 @app.post("/device/{mobile_id}/monthly_update")
 def set_device_monthly_count(mobile_id: str, body: DeviceMonthlyCountUpdateIn):
-    """Atomically increment the monthly count by 1. Ignores the value in body to prevent race conditions."""
+    """No-op: monthly_count is now incremented atomically inside daily_update.
+    This endpoint is kept for Android backward-compatibility and simply returns
+    the current monthly_count without modifying it."""
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM public.device WHERE mobile_id = %s LIMIT 1;", (mobile_id,))
+                cur.execute(
+                    "SELECT monthly_count FROM public.device WHERE mobile_id = %s LIMIT 1;",
+                    (mobile_id,)
+                )
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Device not found")
-                did = row[0]
-
-            _check_and_reset_counters(conn, did)
-
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE public.device SET monthly_count = monthly_count + 1, updated_at = NOW()
-                    WHERE id = %s RETURNING monthly_count;
-                """, (did,))
-                count = cur.fetchone()[0]
-
-            conn.commit()
-            return {"mobile_id": mobile_id, "monthly_count": int(count)}
+                return {"mobile_id": mobile_id, "monthly_count": int(row[0] or 0)}
         except HTTPException:
-            conn.rollback()
             raise
         except:
-            conn.rollback()
             raise
 
 
