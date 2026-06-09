@@ -192,11 +192,14 @@ async def startup_event():
     # NEW: Start client requirements background tasks (expiration, approval)
     await start_background_tasks()
     
-    # NEW: Apply schema migrations (idempotent)
+    # Apply schema migrations (idempotent)
     try:
         with pg_conn() as conn:
             ensure_client_requirements_schema(conn)
             ensure_company_expiration_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS ble_device_id VARCHAR(50) DEFAULT NULL;")
+            conn.commit()
         print("[APP] All schema migrations verified")
     except Exception as e:
         print(f"[APP] Schema migration warning: {e}")
@@ -3114,12 +3117,7 @@ def get_ble_device_id(mobile_id: str):
     """Get the BLE pairing ID for a device. Returns null if not configured."""
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            try:
-                cur.execute("SELECT ble_device_id FROM public.device WHERE mobile_id = %s ORDER BY id DESC LIMIT 1;", (mobile_id,))
-            except Exception:
-                cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS ble_device_id VARCHAR(50) DEFAULT NULL;")
-                conn.commit()
-                cur.execute("SELECT ble_device_id FROM public.device WHERE mobile_id = %s ORDER BY id DESC LIMIT 1;", (mobile_id,))
+            cur.execute("SELECT ble_device_id FROM public.device WHERE mobile_id = %s ORDER BY id DESC LIMIT 1;", (mobile_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Device not found")
@@ -3132,13 +3130,10 @@ def set_ble_device_id(mobile_id: str, body: BleDeviceIdIn):
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                try:
-                    cur.execute("UPDATE public.device SET ble_device_id = %s WHERE mobile_id = %s RETURNING id;",
-                                (body.ble_device_id or None, mobile_id))
-                except Exception:
-                    cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS ble_device_id VARCHAR(50) DEFAULT NULL;")
-                    cur.execute("UPDATE public.device SET ble_device_id = %s WHERE mobile_id = %s RETURNING id;",
-                                (body.ble_device_id or None, mobile_id))
+                cur.execute(
+                    "UPDATE public.device SET ble_device_id = %s WHERE mobile_id = %s RETURNING id;",
+                    (body.ble_device_id or None, mobile_id)
+                )
                 row = cur.fetchone()
                 if not row:
                     conn.rollback()
@@ -3408,6 +3403,7 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                     is_muted = bool(mute_row[0]) if mute_row and mute_row[0] else False
                     ble_device_id = mute_row[1] if mute_row and len(mute_row) > 1 else None
                 except Exception as e:
+                    conn.rollback()
                     print(f"is_muted/ble_device_id check skipped: {e}")
                 
                 # Log status change if it actually changed
