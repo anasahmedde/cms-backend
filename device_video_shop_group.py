@@ -3105,54 +3105,6 @@ def get_device_name(mobile_id: str):
             return {"mobile_id": mobile_id, "device_name": row[0]}
 
 
-class BleDeviceIdIn(BaseModel):
-    ble_device_id: Optional[str] = None  # None or empty = disable auth
-
-
-@app.get("/device/{mobile_id}/ble-id")
-def get_ble_device_id(mobile_id: str):
-    """Get the BLE pairing ID for a device. Returns null if not configured."""
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            try:
-                cur.execute("SELECT ble_device_id FROM public.device WHERE mobile_id = %s ORDER BY id DESC LIMIT 1;", (mobile_id,))
-            except Exception:
-                cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS ble_device_id VARCHAR(50) DEFAULT NULL;")
-                conn.commit()
-                cur.execute("SELECT ble_device_id FROM public.device WHERE mobile_id = %s ORDER BY id DESC LIMIT 1;", (mobile_id,))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Device not found")
-            return {"mobile_id": mobile_id, "ble_device_id": row[0]}
-
-
-@app.post("/device/{mobile_id}/ble-id")
-def set_ble_device_id(mobile_id: str, body: BleDeviceIdIn):
-    """Set or clear the BLE pairing ID for a device. Pass null/empty to disable auth."""
-    with pg_conn() as conn:
-        try:
-            with conn.cursor() as cur:
-                try:
-                    cur.execute("UPDATE public.device SET ble_device_id = %s WHERE mobile_id = %s RETURNING id;",
-                                (body.ble_device_id or None, mobile_id))
-                except Exception:
-                    cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS ble_device_id VARCHAR(50) DEFAULT NULL;")
-                    cur.execute("UPDATE public.device SET ble_device_id = %s WHERE mobile_id = %s RETURNING id;",
-                                (body.ble_device_id or None, mobile_id))
-                row = cur.fetchone()
-                if not row:
-                    conn.rollback()
-                    raise HTTPException(status_code=404, detail="Device not found")
-                conn.commit()
-                return {"mobile_id": mobile_id, "ble_device_id": body.ble_device_id or None}
-        except HTTPException:
-            conn.rollback()
-            raise
-        except Exception as e:
-            conn.rollback()
-            raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.post("/device/{mobile_id}/grid_layout")
 def set_device_grid_layout(mobile_id: str, body: Dict[str, Any]):
     """
@@ -3399,16 +3351,14 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                     # Column might not exist yet - that's OK
                     print(f"wipe_pending check skipped: {e}")
 
-                # Read current mute state and ble_device_id to send back to the device
+                # Read current mute state to send back to the device
                 is_muted = False
-                ble_device_id = None
                 try:
-                    cur.execute("SELECT is_muted, ble_device_id FROM public.device WHERE id = %s;", (did,))
+                    cur.execute("SELECT is_muted FROM public.device WHERE id = %s;", (did,))
                     mute_row = cur.fetchone()
                     is_muted = bool(mute_row[0]) if mute_row and mute_row[0] else False
-                    ble_device_id = mute_row[1] if mute_row and len(mute_row) > 1 else None
                 except Exception as e:
-                    print(f"is_muted/ble_device_id check skipped: {e}")
+                    print(f"is_muted check skipped: {e}")
                 
                 # Log status change if it actually changed
                 if previous_status != body.is_online:
@@ -3445,7 +3395,6 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                 "download_status": download_status,
                 "wipe_videos": wipe_pending,
                 "is_muted": is_muted,
-                "ble_device_id": ble_device_id,
             }
         except HTTPException:
             conn.rollback()
