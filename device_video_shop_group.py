@@ -763,7 +763,7 @@ SELECT l.id, l.did, l.vid, l.sid, l.gid, l.created_at, l.updated_at,
        v.rotation, v.content_type, v.fit_mode, v.display_duration,
        l.display_order, v.resolution,
        l.device_rotation, l.device_resolution, l.grid_position, l.grid_size,
-       d.device_name, d.is_active, d.is_muted
+       d.device_name, d.is_active, d.is_muted, d.ble_device_id
 FROM public.device_video_shop_group l
 JOIN public.device d ON d.id = l.did
 JOIN public.video  v ON v.id = l.vid
@@ -806,6 +806,7 @@ def _row_to_link_dict(row) -> Dict[str, Any]:
         "device_name": row[26] if len(row) > 26 else None,
         "is_active": row[27] if len(row) > 27 else True,
         "is_muted": bool(row[28]) if len(row) > 28 else False,
+        "ble_device_id": row[29] if len(row) > 29 else None,
     }
 
 
@@ -931,7 +932,7 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
                            0 as rotation, 'video' as content_type, 'cover' as fit_mode, 10 as display_duration,
                            0 as display_order, NULL as resolution,
                            NULL as device_rotation, NULL as device_resolution, 0 as grid_position, NULL as grid_size,
-                           d.device_name, d.is_active, d.is_muted
+                           d.device_name, d.is_active, d.is_muted, d.ble_device_id
                     FROM public.device_assignment da
                     JOIN public.device d ON d.id = da.did
                     LEFT JOIN public.shop s ON s.id = da.sid
@@ -981,7 +982,7 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
                            0 as rotation, 'video' as content_type, 'cover' as fit_mode, 10 as display_duration,
                            0 as display_order, NULL as resolution,
                            NULL as device_rotation, NULL as device_resolution, 0 as grid_position, NULL as grid_size,
-                           d.device_name, d.is_active, d.is_muted
+                           d.device_name, d.is_active, d.is_muted, d.ble_device_id
                     FROM public.device d
                     WHERE NOT EXISTS (
                         SELECT 1 FROM public.device_video_shop_group l WHERE l.did = d.id
@@ -3126,20 +3127,50 @@ def get_ble_device_id(mobile_id: str):
 
 @app.post("/device/{mobile_id}/ble-id")
 def set_ble_device_id(mobile_id: str, body: BleDeviceIdIn):
-    """Set or clear the BLE pairing ID for a device. Pass null/empty to disable auth."""
+    """Set or clear the BLE pairing ID for a device. Pass null/empty to disable auth.
+    The ID must be unique within the tenant — two devices cannot share the same ESP32 ID."""
+    new_id = (body.ble_device_id or "").strip() or None
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
+                # Resolve the target device's tenant so uniqueness is checked within it
+                cur.execute(
+                    "SELECT tenant_id FROM public.device WHERE mobile_id = %s ORDER BY id DESC LIMIT 1;",
+                    (mobile_id,)
+                )
+                trow = cur.fetchone()
+                if not trow:
+                    conn.rollback()
+                    raise HTTPException(status_code=404, detail="Device not found")
+                tenant_id = trow[0]
+
+                # Reject duplicates (only when assigning a non-empty ID)
+                if new_id is not None:
+                    cur.execute(
+                        """SELECT device_name, mobile_id FROM public.device
+                           WHERE ble_device_id = %s AND tenant_id = %s AND mobile_id <> %s
+                           LIMIT 1;""",
+                        (new_id, tenant_id, mobile_id)
+                    )
+                    conflict = cur.fetchone()
+                    if conflict:
+                        conn.rollback()
+                        other = conflict[0] or conflict[1]
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"BLE Device ID '{new_id}' is already assigned to '{other}'. Each device must have a unique ID."
+                        )
+
                 cur.execute(
                     "UPDATE public.device SET ble_device_id = %s WHERE mobile_id = %s RETURNING id;",
-                    (body.ble_device_id or None, mobile_id)
+                    (new_id, mobile_id)
                 )
                 row = cur.fetchone()
                 if not row:
                     conn.rollback()
                     raise HTTPException(status_code=404, detail="Device not found")
                 conn.commit()
-                return {"mobile_id": mobile_id, "ble_device_id": body.ble_device_id or None}
+                return {"mobile_id": mobile_id, "ble_device_id": new_id}
         except HTTPException:
             conn.rollback()
             raise
