@@ -70,6 +70,8 @@ from company_expiration_api import router as company_expiration_router, check_co
 
 # NEW: Platform Announcements (visible to all users)
 from announcement_api import router as announcement_router
+# NEW: Web-app (Linux player) + camera gender counting — isolated, additive router
+from webapp_api import router as webapp_router, ensure_webapp_schema
 
 load_dotenv()
 
@@ -200,6 +202,7 @@ async def startup_event():
             with conn.cursor() as cur:
                 cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS ble_device_id VARCHAR(50) DEFAULT NULL;")
             conn.commit()
+            ensure_webapp_schema(conn)  # NEW: gender_counting_enabled column + gender_count_history table
         print("[APP] All schema migrations verified")
     except Exception as e:
         print(f"[APP] Schema migration warning: {e}")
@@ -232,6 +235,8 @@ app.include_router(platform_router, prefix="/platform", tags=["Platform"])
 app.include_router(client_requirements_router, tags=["Client Requirements"])
 # NEW: Platform Announcements (visible to all users)
 app.include_router(announcement_router, tags=["Platform Announcements"])
+# NEW: Web-app player + gender counting (mounted under /webapp — Android endpoints untouched)
+app.include_router(webapp_router, prefix="/webapp", tags=["WebApp"])
 
 
 # ===========================================================
