@@ -16,8 +16,9 @@ Include in device_video_shop_group.py:
     # inside startup migration block:  ensure_webapp_schema(conn)
 """
 import os
+import json
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import boto3
 from fastapi import APIRouter, HTTPException, UploadFile, File
@@ -84,6 +85,9 @@ def ensure_webapp_schema(conn):
         cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS header_text      TEXT    DEFAULT NULL;")
         cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS footer_enabled   BOOLEAN DEFAULT FALSE;")
         cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS footer_image_url TEXT    DEFAULT NULL;")  # s3://bucket/key
+        # All header/footer styling (colors, font, size, rotation, fit, ...) as one
+        # JSON blob — new style options never need another migration.
+        cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS header_footer_style TEXT DEFAULT NULL;")
     conn.commit()
 
 
@@ -253,6 +257,16 @@ class HeaderFooterIn(BaseModel):
     header_enabled: Optional[bool] = None
     header_text: Optional[str] = None
     footer_enabled: Optional[bool] = None
+    style: Optional[Dict[str, Any]] = None  # {"header": {...}, "footer": {...}}
+
+
+def _parse_style(raw):
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
 
 
 @router.get("/device/{mobile_id}/header-footer")
@@ -261,7 +275,7 @@ def get_header_footer(mobile_id: str):
     with pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT header_enabled, header_text, footer_enabled, footer_image_url
+                SELECT header_enabled, header_text, footer_enabled, footer_image_url, header_footer_style
                 FROM public.device WHERE mobile_id = %s ORDER BY id DESC LIMIT 1;
             """, (mobile_id,))
             row = cur.fetchone()
@@ -273,12 +287,13 @@ def get_header_footer(mobile_id: str):
                 "header_text": row[1],
                 "footer_enabled": bool(row[2]) if row[2] is not None else False,
                 "footer_image_url": presign_s3(row[3]),
+                "style": _parse_style(row[4]),
             }
 
 
 @router.post("/device/{mobile_id}/header-footer")
 def set_header_footer(mobile_id: str, body: HeaderFooterIn):
-    """Set the header/footer flags and header text (from the dashboard)."""
+    """Set the header/footer flags, header text, and styling (from the dashboard)."""
     sets, vals = [], []
     if body.header_enabled is not None:
         sets.append("header_enabled = %s"); vals.append(body.header_enabled)
@@ -286,6 +301,8 @@ def set_header_footer(mobile_id: str, body: HeaderFooterIn):
         sets.append("header_text = %s"); vals.append(body.header_text or None)
     if body.footer_enabled is not None:
         sets.append("footer_enabled = %s"); vals.append(body.footer_enabled)
+    if body.style is not None:
+        sets.append("header_footer_style = %s"); vals.append(json.dumps(body.style))
     if not sets:
         return {"mobile_id": mobile_id, "updated": False}
     vals.append(mobile_id)
