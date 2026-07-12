@@ -71,7 +71,7 @@ from company_expiration_api import router as company_expiration_router, check_co
 # NEW: Platform Announcements (visible to all users)
 from announcement_api import router as announcement_router
 # NEW: Web-app (Linux player) + camera gender counting — isolated, additive router
-from webapp_api import router as webapp_router, ensure_webapp_schema
+from webapp_api import router as webapp_router, ensure_webapp_schema, presign_s3
 
 load_dotenv()
 
@@ -3430,17 +3430,30 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                     # Column might not exist yet - that's OK
                     print(f"wipe_pending check skipped: {e}")
 
-                # Read current mute state and ble_device_id to send back to the device
+                # Read current mute state, ble_device_id, and header/footer config
                 is_muted = False
                 ble_device_id = None
+                header_enabled = False
+                header_image_url = None
+                footer_enabled = False
+                footer_text = None
                 try:
-                    cur.execute("SELECT is_muted, ble_device_id FROM public.device WHERE id = %s;", (did,))
+                    cur.execute("""
+                        SELECT is_muted, ble_device_id,
+                               header_enabled, header_image_url, footer_enabled, footer_text
+                        FROM public.device WHERE id = %s;
+                    """, (did,))
                     mute_row = cur.fetchone()
-                    is_muted = bool(mute_row[0]) if mute_row and mute_row[0] else False
-                    ble_device_id = mute_row[1] if mute_row and len(mute_row) > 1 else None
+                    if mute_row:
+                        is_muted = bool(mute_row[0]) if mute_row[0] else False
+                        ble_device_id = mute_row[1]
+                        header_enabled = bool(mute_row[2]) if mute_row[2] else False
+                        header_image_url = mute_row[3]
+                        footer_enabled = bool(mute_row[4]) if mute_row[4] else False
+                        footer_text = mute_row[5]
                 except Exception as e:
                     conn.rollback()
-                    print(f"is_muted/ble_device_id check skipped: {e}")
+                    print(f"is_muted/ble_device_id/header-footer check skipped: {e}")
                 
                 # Log status change if it actually changed
                 if previous_status != body.is_online:
@@ -3478,6 +3491,10 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                 "wipe_videos": wipe_pending,
                 "is_muted": is_muted,
                 "ble_device_id": ble_device_id,
+                "header_enabled": header_enabled,
+                "header_image_url": presign_s3(header_image_url),
+                "footer_enabled": footer_enabled,
+                "footer_text": footer_text,
             }
         except HTTPException:
             conn.rollback()

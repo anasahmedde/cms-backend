@@ -15,15 +15,40 @@ Include in device_video_shop_group.py:
     app.include_router(webapp_router, prefix="/webapp", tags=["WebApp"])
     # inside startup migration block:  ensure_webapp_schema(conn)
 """
+import os
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+import boto3
+from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel, Field
 
 from database import pg_conn
 
 router = APIRouter()
+
+# ---- S3 (same bucket/region convention as the rest of the app) ----------------
+S3_BUCKET = os.getenv("S3_BUCKET", "digix-videos")
+AWS_REGION = os.getenv("AWS_REGION")
+
+
+def _s3():
+    return boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else boto3.client("s3")
+
+
+def presign_s3(uri, expires=604800):  # 7-day presigned GET URL (device caches locally anyway)
+    """Turn an s3://bucket/key URI into a presigned GET URL. Pass-through for plain URLs."""
+    if not uri:
+        return None
+    if not uri.startswith("s3://"):
+        return uri
+    rest = uri[len("s3://"):]
+    bucket, _, key = rest.partition("/")
+    try:
+        return _s3().generate_presigned_url(
+            "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires)
+    except Exception:
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -53,6 +78,12 @@ def ensure_webapp_schema(conn):
             CREATE INDEX IF NOT EXISTS idx_gender_hist_mobile_time
             ON public.gender_count_history (mobile_id, created_at);
         """)
+        # Device-specific header (image via S3 link) + footer (text). Android never
+        # breaks if these are absent; they default to disabled.
+        cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS header_enabled   BOOLEAN DEFAULT FALSE;")
+        cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS header_image_url TEXT    DEFAULT NULL;")  # s3://bucket/key
+        cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS footer_enabled   BOOLEAN DEFAULT FALSE;")
+        cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS footer_text      TEXT    DEFAULT NULL;")
     conn.commit()
 
 
@@ -212,3 +243,104 @@ def set_gender_enabled(mobile_id: str, body: GenderEnabledIn):
         except Exception as e:
             conn.rollback()
             raise HTTPException(status_code=500, detail=str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HEADER (image via S3) + FOOTER (text)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class HeaderFooterIn(BaseModel):
+    header_enabled: Optional[bool] = None
+    footer_enabled: Optional[bool] = None
+    footer_text: Optional[str] = None
+
+
+@router.get("/device/{mobile_id}/header-footer")
+def get_header_footer(mobile_id: str):
+    """Current header/footer config (header image returned as a presigned URL)."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT header_enabled, header_image_url, footer_enabled, footer_text
+                FROM public.device WHERE mobile_id = %s ORDER BY id DESC LIMIT 1;
+            """, (mobile_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Device not found")
+            return {
+                "mobile_id": mobile_id,
+                "header_enabled": bool(row[0]) if row[0] is not None else False,
+                "header_image_url": presign_s3(row[1]),
+                "footer_enabled": bool(row[2]) if row[2] is not None else False,
+                "footer_text": row[3],
+            }
+
+
+@router.post("/device/{mobile_id}/header-footer")
+def set_header_footer(mobile_id: str, body: HeaderFooterIn):
+    """Set the header/footer flags and footer text (from the dashboard)."""
+    sets, vals = [], []
+    if body.header_enabled is not None:
+        sets.append("header_enabled = %s"); vals.append(body.header_enabled)
+    if body.footer_enabled is not None:
+        sets.append("footer_enabled = %s"); vals.append(body.footer_enabled)
+    if body.footer_text is not None:
+        sets.append("footer_text = %s"); vals.append(body.footer_text or None)
+    if not sets:
+        return {"mobile_id": mobile_id, "updated": False}
+    vals.append(mobile_id)
+    with pg_conn() as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE public.device SET {', '.join(sets)} WHERE mobile_id = %s RETURNING id;",
+                    tuple(vals),
+                )
+                if not cur.fetchone():
+                    conn.rollback()
+                    raise HTTPException(status_code=404, detail="Device not found")
+            conn.commit()
+            return {"mobile_id": mobile_id, "updated": True}
+        except HTTPException:
+            conn.rollback()
+            raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/device/{mobile_id}/header-image")
+def upload_header_image(mobile_id: str, file: UploadFile = File(...)):
+    """Upload the header image to S3, store the s3:// link on the device."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            device_id, _ = _resolve_device(cur, mobile_id)
+            if device_id is None:
+                raise HTTPException(status_code=404, detail="Device not found")
+
+    fname = file.filename or "header.jpg"
+    ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else "jpg"
+    if ext not in ("jpg", "jpeg", "png", "webp", "gif"):
+        ext = "jpg"
+    key = f"headers/{mobile_id}.{ext}"
+    try:
+        _s3().upload_fileobj(
+            file.file, S3_BUCKET, key,
+            ExtraArgs={"ContentType": file.content_type or "image/jpeg", "ACL": "private"},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"S3 upload failed: {e}")
+
+    uri = f"s3://{S3_BUCKET}/{key}"
+    with pg_conn() as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE public.device SET header_image_url = %s WHERE mobile_id = %s;",
+                    (uri, mobile_id),
+                )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
+    return {"mobile_id": mobile_id, "header_image_url": presign_s3(uri)}
