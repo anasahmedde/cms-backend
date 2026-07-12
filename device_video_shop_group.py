@@ -3434,13 +3434,13 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                 is_muted = False
                 ble_device_id = None
                 header_enabled = False
-                header_image_url = None
+                header_text = None
                 footer_enabled = False
-                footer_text = None
+                footer_image_url = None
                 try:
                     cur.execute("""
                         SELECT is_muted, ble_device_id,
-                               header_enabled, header_image_url, footer_enabled, footer_text
+                               header_enabled, header_text, footer_enabled, footer_image_url
                         FROM public.device WHERE id = %s;
                     """, (did,))
                     mute_row = cur.fetchone()
@@ -3448,9 +3448,9 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                         is_muted = bool(mute_row[0]) if mute_row[0] else False
                         ble_device_id = mute_row[1]
                         header_enabled = bool(mute_row[2]) if mute_row[2] else False
-                        header_image_url = mute_row[3]
+                        header_text = mute_row[3]
                         footer_enabled = bool(mute_row[4]) if mute_row[4] else False
-                        footer_text = mute_row[5]
+                        footer_image_url = mute_row[5]
                 except Exception as e:
                     conn.rollback()
                     print(f"is_muted/ble_device_id/header-footer check skipped: {e}")
@@ -3492,9 +3492,9 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                 "is_muted": is_muted,
                 "ble_device_id": ble_device_id,
                 "header_enabled": header_enabled,
-                "header_image_url": presign_s3(header_image_url),
+                "header_text": header_text,
                 "footer_enabled": footer_enabled,
-                "footer_text": footer_text,
+                "footer_image_url": presign_s3(footer_image_url),
             }
         except HTTPException:
             conn.rollback()
