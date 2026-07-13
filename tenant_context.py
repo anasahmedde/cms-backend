@@ -308,15 +308,22 @@ def log_audit(conn, tenant_id, user_id, action, resource_type=None,
     """
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO public.audit_log
-                    (tenant_id, user_id, action, resource_type, resource_id, details, ip_address)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (
-                tenant_id, user_id, action, resource_type, resource_id,
-                json.dumps(details) if details else None,
-                ip_address,
-            ))
+            # Savepoint so a failed audit INSERT cannot abort the caller's
+            # transaction (which would silently turn its commit into a rollback).
+            cur.execute("SAVEPOINT audit_log_sp")
+            try:
+                cur.execute("""
+                    INSERT INTO public.audit_log
+                        (tenant_id, user_id, action, resource_type, resource_id, details, ip_address)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    tenant_id, user_id, action, resource_type, resource_id,
+                    json.dumps(details) if details else None,
+                    ip_address,
+                ))
+                cur.execute("RELEASE SAVEPOINT audit_log_sp")
+            except Exception:
+                cur.execute("ROLLBACK TO SAVEPOINT audit_log_sp")
     except Exception:
         pass  # Never let audit logging break the caller
 
