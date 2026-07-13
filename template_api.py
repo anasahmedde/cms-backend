@@ -51,6 +51,7 @@ from typing import Any, Dict, List, Optional
 
 import boto3
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from database import pg_conn
@@ -64,6 +65,15 @@ from tenant_context import (
 logger = logging.getLogger("template_api")
 
 router = APIRouter()
+
+# Standalone web player (Linux mini-PC browser / kiosk). Read once at import.
+_PLAYER_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "player.html")
+try:
+    with open(_PLAYER_HTML_PATH, "r", encoding="utf-8") as _f:
+        _PLAYER_HTML = _f.read()
+except OSError as _e:  # pragma: no cover - only if the asset is missing
+    _PLAYER_HTML = None
+    logger.error("player.html not found at %s: %s", _PLAYER_HTML_PATH, _e)
 
 S3_BUCKET = os.getenv("S3_BUCKET", "digix-videos")
 AWS_REGION = os.getenv("AWS_REGION")
@@ -945,6 +955,20 @@ def _collapse_content(cur, tenant_id: int, shop_id: Optional[int], device_id: in
         if zone_key not in best or rank[scope] > best[zone_key][0]:
             best[zone_key] = (rank[scope], payload)
     return {k: v[1] for k, v in best.items()}
+
+
+@router.get("/player", response_class=HTMLResponse)
+@router.get("/webapp/player", response_class=HTMLResponse)
+def web_player():
+    """
+    Self-contained screen-template renderer for a browser/kiosk on a Linux
+    player. Open with ?device=<mobile_id> (e.g. /player?device=DGX123). The page
+    resolves and renders the device's template and plays its playlist zone from
+    the existing content pipeline; degrades to a cached render when offline.
+    """
+    if _PLAYER_HTML is None:
+        raise HTTPException(status_code=500, detail="Player asset unavailable")
+    return HTMLResponse(content=_PLAYER_HTML)
 
 
 @router.get("/device/{mobile_id}/template")
