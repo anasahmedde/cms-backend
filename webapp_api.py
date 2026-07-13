@@ -295,38 +295,6 @@ _HF_EMPTY = {"header_enabled": False, "header_text": None,
              "header_footer_style": None}
 
 
-def device_group_hf(cur, did):
-    """The header/footer config of the device's GROUP (or None if it has no group)."""
-    cur.execute("""
-        SELECT g.id, g.gname, g.header_enabled, g.header_text, g.footer_enabled,
-               g.footer_image_url, g.header_footer_style
-        FROM public.device_assignment da
-        JOIN public."group" g ON g.id = da.gid
-        WHERE da.did = %s LIMIT 1;
-    """, (did,))
-    row = cur.fetchone()
-    if not row:
-        cur.execute("""
-            SELECT g.id, g.gname, g.header_enabled, g.header_text, g.footer_enabled,
-                   g.footer_image_url, g.header_footer_style
-            FROM public.device_video_shop_group l
-            JOIN public."group" g ON g.id = l.gid
-            WHERE l.did = %s LIMIT 1;
-        """, (did,))
-        row = cur.fetchone()
-    if not row:
-        return None
-    return {
-        "gid": row[0],
-        "gname": row[1],
-        "header_enabled": bool(row[2]) if row[2] else False,
-        "header_text": row[3],
-        "footer_enabled": bool(row[4]) if row[4] else False,
-        "footer_image_url": presign_s3(row[5]),
-        "style": _parse_style(row[6]),
-    }
-
-
 def resolve_header_footer(cur, did):
     """Effective header/footer for a device.
 
@@ -379,9 +347,7 @@ def get_header_footer(mobile_id: str):
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Device not found")
-            # What the device would actually show (its own override, or the group's),
-            # plus the group's own config so the dashboard knows whether the group
-            # even has a header/footer to inherit.
+            # Also return what the device would actually show (its own override, or the group's)
             effective = resolve_header_footer(cur, row[0])
             return {
                 "mobile_id": mobile_id,
@@ -392,7 +358,6 @@ def get_header_footer(mobile_id: str):
                 "footer_image_url": presign_s3(row[4]),
                 "style": _parse_style(row[5]),
                 "effective": {**effective, "style": _parse_style(effective.get("header_footer_style"))},
-                "group": device_group_hf(cur, row[0]),
             }
 
 
