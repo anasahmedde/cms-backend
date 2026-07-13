@@ -3437,12 +3437,10 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                 header_text = None
                 footer_enabled = False
                 footer_image_url = None
-                header_footer_style = None
                 try:
                     cur.execute("""
                         SELECT is_muted, ble_device_id,
-                               header_enabled, header_text, footer_enabled, footer_image_url,
-                               header_footer_style
+                               header_enabled, header_text, footer_enabled, footer_image_url
                         FROM public.device WHERE id = %s;
                     """, (did,))
                     mute_row = cur.fetchone()
@@ -3453,7 +3451,6 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                         header_text = mute_row[3]
                         footer_enabled = bool(mute_row[4]) if mute_row[4] else False
                         footer_image_url = mute_row[5]
-                        header_footer_style = mute_row[6]
                 except Exception as e:
                     conn.rollback()
                     print(f"is_muted/ble_device_id/header-footer check skipped: {e}")
@@ -3498,7 +3495,6 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                 "header_text": header_text,
                 "footer_enabled": footer_enabled,
                 "footer_image_url": presign_s3(footer_image_url),
-                "header_footer_style": header_footer_style,
             }
         except HTTPException:
             conn.rollback()
