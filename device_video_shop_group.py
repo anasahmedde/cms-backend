@@ -71,7 +71,7 @@ from company_expiration_api import router as company_expiration_router, check_co
 # NEW: Platform Announcements (visible to all users)
 from announcement_api import router as announcement_router
 # NEW: Web-app (Linux player) + camera gender counting — isolated, additive router
-from webapp_api import router as webapp_router, ensure_webapp_schema, presign_s3, resolve_header_footer
+from webapp_api import router as webapp_router, ensure_webapp_schema
 
 load_dotenv()
 
@@ -3430,22 +3430,17 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                     # Column might not exist yet - that's OK
                     print(f"wipe_pending check skipped: {e}")
 
-                # Read current mute state, ble_device_id, and header/footer config
+                # Read current mute state and ble_device_id to send back to the device
                 is_muted = False
                 ble_device_id = None
-                hf = {"header_enabled": False, "header_text": None, "footer_enabled": False,
-                      "footer_image_url": None, "header_footer_style": None}
                 try:
                     cur.execute("SELECT is_muted, ble_device_id FROM public.device WHERE id = %s;", (did,))
                     mute_row = cur.fetchone()
-                    if mute_row:
-                        is_muted = bool(mute_row[0]) if mute_row[0] else False
-                        ble_device_id = mute_row[1]
-                    # Header/footer is a GROUP setting; the device inherits it unless it overrides.
-                    hf = resolve_header_footer(cur, did)
+                    is_muted = bool(mute_row[0]) if mute_row and mute_row[0] else False
+                    ble_device_id = mute_row[1] if mute_row and len(mute_row) > 1 else None
                 except Exception as e:
                     conn.rollback()
-                    print(f"is_muted/ble_device_id/header-footer check skipped: {e}")
+                    print(f"is_muted/ble_device_id check skipped: {e}")
                 
                 # Log status change if it actually changed
                 if previous_status != body.is_online:
@@ -3483,11 +3478,6 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                 "wipe_videos": wipe_pending,
                 "is_muted": is_muted,
                 "ble_device_id": ble_device_id,
-                "header_enabled": hf["header_enabled"],
-                "header_text": hf["header_text"],
-                "footer_enabled": hf["footer_enabled"],
-                "footer_image_url": hf["footer_image_url"],   # already presigned by the resolver
-                "header_footer_style": hf["header_footer_style"],
             }
         except HTTPException:
             conn.rollback()
