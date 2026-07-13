@@ -197,9 +197,14 @@ async def startup_event():
     # NEW: Start client requirements background tasks (expiration, approval)
     await start_background_tasks()
     
-    # Apply schema migrations (idempotent)
+    # Apply schema migrations (idempotent).
+    # Base schemas FIRST: this hook runs before the sync on_startup hook, so on
+    # a fresh database the dependent migrations below would otherwise fail
+    # (their FKs need device/shop/company) and be skipped until a second boot.
     try:
         with pg_conn() as conn:
+            ensure_dvsg_schema(conn)
+            ensure_multitenant_schema(conn)
             ensure_client_requirements_schema(conn)
             ensure_company_expiration_schema(conn)
             with conn.cursor() as cur:
