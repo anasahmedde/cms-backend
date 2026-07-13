@@ -76,6 +76,9 @@ from webapp_api import router as webapp_router, ensure_webapp_schema
 from template_api import router as template_router, heartbeat_template_fields
 from migrations.template_schema import ensure_template_schema
 
+from bulk_enrollment_api import router as bulk_enrollment_router
+from migrations.bulk_import_schema import ensure_bulk_import_schema
+
 load_dotenv()
 
 # ---------- Settings ----------
@@ -217,6 +220,7 @@ async def startup_event():
             conn.commit()
             ensure_webapp_schema(conn)  # NEW: gender_counting_enabled column + gender_count_history table
             ensure_template_schema(conn)  # NEW: screen templates + zone content + device.app_version
+            ensure_bulk_import_schema(conn)  # NEW: bulk device-enrollment jobs
         print("[APP] All schema migrations verified")
     except Exception as e:
         print(f"[APP] Schema migration warning: {e}")
@@ -254,6 +258,8 @@ app.include_router(webapp_router, prefix="/webapp", tags=["WebApp"])
 # NEW: Screen templates (platform designer + zone content + player resolvers).
 # Mounted without prefix — declares its own /platform/templates, /shop, /device paths.
 app.include_router(template_router, tags=["Screen Templates"])
+# NEW: Bulk device enrollment (CSV/XLSX import + pending-device claim).
+app.include_router(bulk_enrollment_router, tags=["Bulk Enrollment"])
 
 
 # ===========================================================
