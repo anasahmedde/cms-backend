@@ -261,7 +261,9 @@ def list_companies(
                     COALESCE((SELECT COUNT(*) FROM public.device d WHERE d.tenant_id = c.id AND d.is_online = TRUE), 0) as devices_online,
                     COALESCE((SELECT COUNT(*) FROM public.device d WHERE d.tenant_id = c.id AND d.is_online = FALSE), 0) as devices_offline,
                     -- User count
-                    COALESCE((SELECT COUNT(*) FROM public.users u WHERE u.tenant_id = c.id), 0) as user_count
+                    COALESCE((SELECT COUNT(*) FROM public.users u WHERE u.tenant_id = c.id), 0) as user_count,
+                    -- Linked screen template
+                    c.template_id
                 FROM public.company c
                 {where_sql}
                 ORDER BY c.created_at DESC
@@ -289,6 +291,8 @@ def list_companies(
                     "devices_offline": r[22] or 0,
                     # User count
                     "user_count": r[23] or 0,
+                    # Linked screen template (null = default screens)
+                    "template_id": r[24],
                 }
                 
                 # Calculate expiration status and days
