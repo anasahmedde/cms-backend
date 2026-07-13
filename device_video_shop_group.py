@@ -73,6 +73,9 @@ from announcement_api import router as announcement_router
 # NEW: Web-app (Linux player) + camera gender counting — isolated, additive router
 from webapp_api import router as webapp_router, ensure_webapp_schema
 
+from template_api import router as template_router, heartbeat_template_fields
+from migrations.template_schema import ensure_template_schema
+
 load_dotenv()
 
 # ---------- Settings ----------
@@ -201,8 +204,14 @@ async def startup_event():
             ensure_company_expiration_schema(conn)
             with conn.cursor() as cur:
                 cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS ble_device_id VARCHAR(50) DEFAULT NULL;")
+                # These two are read by the heartbeat but previously had no
+                # migration anywhere (live DBs got them via manual DDL) — ensure
+                # them so fresh installs work.
+                cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS is_muted BOOLEAN DEFAULT FALSE;")
+                cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS wipe_pending BOOLEAN DEFAULT FALSE;")
             conn.commit()
             ensure_webapp_schema(conn)  # NEW: gender_counting_enabled column + gender_count_history table
+            ensure_template_schema(conn)  # NEW: screen templates + zone content + device.app_version
         print("[APP] All schema migrations verified")
     except Exception as e:
         print(f"[APP] Schema migration warning: {e}")
@@ -237,6 +246,9 @@ app.include_router(client_requirements_router, tags=["Client Requirements"])
 app.include_router(announcement_router, tags=["Platform Announcements"])
 # NEW: Web-app player + gender counting (mounted under /webapp — Android endpoints untouched)
 app.include_router(webapp_router, prefix="/webapp", tags=["WebApp"])
+# NEW: Screen templates (platform designer + zone content + player resolvers).
+# Mounted without prefix — declares its own /platform/templates, /shop, /device paths.
+app.include_router(template_router, tags=["Screen Templates"])
 
 
 # ===========================================================
@@ -549,6 +561,7 @@ class DeviceOnlineStatusOut(BaseModel):
 class DeviceOnlineUpdateIn(BaseModel):
     is_online: bool = True
     resolution: Optional[str] = None  # e.g. "1920x1080" — auto-reported by Android app
+    app_version: Optional[str] = None  # player version (APK/webapp) — fleet telemetry
 
 
 class DeviceMuteIn(BaseModel):
@@ -3410,14 +3423,18 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                     UPDATE public.device
                     SET is_online = %s, last_online_at = NOW(), updated_at = NOW(),
                         needs_refresh = FALSE,
-                        resolution = COALESCE(resolution, %s)
+                        resolution = COALESCE(resolution, %s),
+                        app_version = COALESCE(%s, app_version)
                     WHERE mobile_id = %s
                     RETURNING is_online;
-                """, (body.is_online, body.resolution, mobile_id))
+                """, (body.is_online, body.resolution, body.app_version, mobile_id))
                 row = cur.fetchone()
                 
-                # Check if device needs to wipe local files
+                # Check if device needs to wipe local files.
+                # Savepoint: a failure here must not abort the transaction (that
+                # would silently roll back the device-status UPDATE above).
                 wipe_pending = False
+                cur.execute("SAVEPOINT hb_wipe")
                 try:
                     cur.execute("SELECT wipe_pending FROM public.device WHERE id = %s;", (did,))
                     wipe_row = cur.fetchone()
@@ -3426,22 +3443,30 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                     # If wipe was pending, clear the flag after this response
                     if wipe_pending:
                         cur.execute("UPDATE public.device SET wipe_pending = FALSE WHERE id = %s;", (did,))
+                    cur.execute("RELEASE SAVEPOINT hb_wipe")
                 except Exception as e:
                     # Column might not exist yet - that's OK
+                    cur.execute("ROLLBACK TO SAVEPOINT hb_wipe")
                     print(f"wipe_pending check skipped: {e}")
 
                 # Read current mute state and ble_device_id to send back to the device
                 is_muted = False
                 ble_device_id = None
+                cur.execute("SAVEPOINT hb_mute")
                 try:
                     cur.execute("SELECT is_muted, ble_device_id FROM public.device WHERE id = %s;", (did,))
                     mute_row = cur.fetchone()
                     is_muted = bool(mute_row[0]) if mute_row and mute_row[0] else False
                     ble_device_id = mute_row[1] if mute_row and len(mute_row) > 1 else None
+                    cur.execute("RELEASE SAVEPOINT hb_mute")
                 except Exception as e:
-                    conn.rollback()
+                    cur.execute("ROLLBACK TO SAVEPOINT hb_mute")
                     print(f"is_muted/ble_device_id check skipped: {e}")
-                
+
+                # Screen-template change detection (template_version/template_stamp).
+                # Never raises; returns nulls when no template is linked.
+                template_fields = heartbeat_template_fields(cur, tenant_id)
+
                 # Log status change if it actually changed
                 if previous_status != body.is_online:
                     event_type = "online" if body.is_online else "offline"
@@ -3478,6 +3503,7 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                 "wipe_videos": wipe_pending,
                 "is_muted": is_muted,
                 "ble_device_id": ble_device_id,
+                **template_fields,
             }
         except HTTPException:
             conn.rollback()
