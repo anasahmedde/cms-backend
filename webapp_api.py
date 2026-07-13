@@ -88,16 +88,6 @@ def ensure_webapp_schema(conn):
         # All header/footer styling (colors, font, size, rotation, fit, ...) as one
         # JSON blob — new style options never need another migration.
         cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS header_footer_style TEXT DEFAULT NULL;")
-
-        # Header/footer is primarily a GROUP setting. A device inherits its group's
-        # header/footer unless header_footer_override = TRUE, in which case the
-        # device's own columns above are used instead.
-        cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS header_footer_override BOOLEAN DEFAULT FALSE;")
-        cur.execute('ALTER TABLE public."group" ADD COLUMN IF NOT EXISTS header_enabled      BOOLEAN DEFAULT FALSE;')
-        cur.execute('ALTER TABLE public."group" ADD COLUMN IF NOT EXISTS header_text         TEXT    DEFAULT NULL;')
-        cur.execute('ALTER TABLE public."group" ADD COLUMN IF NOT EXISTS footer_enabled      BOOLEAN DEFAULT FALSE;')
-        cur.execute('ALTER TABLE public."group" ADD COLUMN IF NOT EXISTS footer_image_url    TEXT    DEFAULT NULL;')
-        cur.execute('ALTER TABLE public."group" ADD COLUMN IF NOT EXISTS header_footer_style TEXT    DEFAULT NULL;')
     conn.commit()
 
 
@@ -268,7 +258,6 @@ class HeaderFooterIn(BaseModel):
     header_text: Optional[str] = None
     footer_enabled: Optional[bool] = None
     style: Optional[Dict[str, Any]] = None  # {"header": {...}, "footer": {...}}
-    header_footer_override: Optional[bool] = None  # device only: ignore group config
 
 
 def _parse_style(raw):
@@ -280,84 +269,25 @@ def _parse_style(raw):
         return {}
 
 
-def _hf(he, ht, fe, fu, style):
-    return {
-        "header_enabled": bool(he) if he else False,
-        "header_text": ht,
-        "footer_enabled": bool(fe) if fe else False,
-        "footer_image_url": presign_s3(fu),
-        "header_footer_style": style,
-    }
-
-
-_HF_EMPTY = {"header_enabled": False, "header_text": None,
-             "footer_enabled": False, "footer_image_url": None,
-             "header_footer_style": None}
-
-
-def resolve_header_footer(cur, did):
-    """Effective header/footer for a device.
-
-    Header/footer is a GROUP setting: a device inherits its group's config.
-    If the device has header_footer_override = TRUE, its own columns win instead.
-    """
-    cur.execute("""
-        SELECT header_footer_override, header_enabled, header_text,
-               footer_enabled, footer_image_url, header_footer_style
-        FROM public.device WHERE id = %s;
-    """, (did,))
-    d = cur.fetchone()
-    if d and d[0]:                      # per-device override
-        return _hf(d[1], d[2], d[3], d[4], d[5])
-
-    # Otherwise inherit from the device's group (device_assignment is UNIQUE per did)
-    cur.execute("""
-        SELECT g.header_enabled, g.header_text, g.footer_enabled,
-               g.footer_image_url, g.header_footer_style
-        FROM public.device_assignment da
-        JOIN public."group" g ON g.id = da.gid
-        WHERE da.did = %s LIMIT 1;
-    """, (did,))
-    row = cur.fetchone()
-    if not row:                         # fall back to the video-link table
-        cur.execute("""
-            SELECT g.header_enabled, g.header_text, g.footer_enabled,
-                   g.footer_image_url, g.header_footer_style
-            FROM public.device_video_shop_group l
-            JOIN public."group" g ON g.id = l.gid
-            WHERE l.did = %s LIMIT 1;
-        """, (did,))
-        row = cur.fetchone()
-
-    if row:
-        return _hf(row[0], row[1], row[2], row[3], row[4])
-    return dict(_HF_EMPTY)
-
-
 @router.get("/device/{mobile_id}/header-footer")
 def get_header_footer(mobile_id: str):
     """Current header/footer config (footer image returned as a presigned URL)."""
     with pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT id, header_enabled, header_text, footer_enabled, footer_image_url,
-                       header_footer_style, header_footer_override
+                SELECT header_enabled, header_text, footer_enabled, footer_image_url, header_footer_style
                 FROM public.device WHERE mobile_id = %s ORDER BY id DESC LIMIT 1;
             """, (mobile_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Device not found")
-            # Also return what the device would actually show (its own override, or the group's)
-            effective = resolve_header_footer(cur, row[0])
             return {
                 "mobile_id": mobile_id,
-                "header_footer_override": bool(row[6]) if row[6] is not None else False,
-                "header_enabled": bool(row[1]) if row[1] is not None else False,
-                "header_text": row[2],
-                "footer_enabled": bool(row[3]) if row[3] is not None else False,
-                "footer_image_url": presign_s3(row[4]),
-                "style": _parse_style(row[5]),
-                "effective": {**effective, "style": _parse_style(effective.get("header_footer_style"))},
+                "header_enabled": bool(row[0]) if row[0] is not None else False,
+                "header_text": row[1],
+                "footer_enabled": bool(row[2]) if row[2] is not None else False,
+                "footer_image_url": presign_s3(row[3]),
+                "style": _parse_style(row[4]),
             }
 
 
@@ -373,8 +303,6 @@ def set_header_footer(mobile_id: str, body: HeaderFooterIn):
         sets.append("footer_enabled = %s"); vals.append(body.footer_enabled)
     if body.style is not None:
         sets.append("header_footer_style = %s"); vals.append(json.dumps(body.style))
-    if body.header_footer_override is not None:
-        sets.append("header_footer_override = %s"); vals.append(body.header_footer_override)
     if not sets:
         return {"mobile_id": mobile_id, "updated": False}
     vals.append(mobile_id)
@@ -433,99 +361,3 @@ def upload_footer_image(mobile_id: str, file: UploadFile = File(...)):
             conn.rollback()
             raise HTTPException(status_code=500, detail=str(e))
     return {"mobile_id": mobile_id, "footer_image_url": presign_s3(uri)}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# GROUP-LEVEL HEADER / FOOTER (the primary place it is configured)
-# Devices in a group inherit this unless they set header_footer_override.
-# ══════════════════════════════════════════════════════════════════════════════
-
-@router.get("/group/{gid}/header-footer")
-def get_group_header_footer(gid: int):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT header_enabled, header_text, footer_enabled,
-                       footer_image_url, header_footer_style
-                FROM public."group" WHERE id = %s;
-            """, (gid,))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Group not found")
-            return {
-                "gid": gid,
-                "header_enabled": bool(row[0]) if row[0] is not None else False,
-                "header_text": row[1],
-                "footer_enabled": bool(row[2]) if row[2] is not None else False,
-                "footer_image_url": presign_s3(row[3]),
-                "style": _parse_style(row[4]),
-            }
-
-
-@router.post("/group/{gid}/header-footer")
-def set_group_header_footer(gid: int, body: HeaderFooterIn):
-    """Set header/footer for a whole group — every device in it inherits this."""
-    sets, vals = [], []
-    if body.header_enabled is not None:
-        sets.append("header_enabled = %s"); vals.append(body.header_enabled)
-    if body.header_text is not None:
-        sets.append("header_text = %s"); vals.append(body.header_text or None)
-    if body.footer_enabled is not None:
-        sets.append("footer_enabled = %s"); vals.append(body.footer_enabled)
-    if body.style is not None:
-        sets.append("header_footer_style = %s"); vals.append(json.dumps(body.style))
-    if not sets:
-        return {"gid": gid, "updated": False}
-    vals.append(gid)
-    with pg_conn() as conn:
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f'UPDATE public."group" SET {", ".join(sets)} WHERE id = %s RETURNING id;',
-                    tuple(vals),
-                )
-                if not cur.fetchone():
-                    conn.rollback()
-                    raise HTTPException(status_code=404, detail="Group not found")
-            conn.commit()
-            return {"gid": gid, "updated": True}
-        except HTTPException:
-            conn.rollback()
-            raise
-        except Exception as e:
-            conn.rollback()
-            raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/group/{gid}/footer-image")
-def upload_group_footer_image(gid: int, file: UploadFile = File(...)):
-    """Upload the group's footer image to S3."""
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute('SELECT id FROM public."group" WHERE id = %s;', (gid,))
-            if not cur.fetchone():
-                raise HTTPException(status_code=404, detail="Group not found")
-
-    fname = file.filename or "footer.jpg"
-    ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else "jpg"
-    if ext not in ("jpg", "jpeg", "png", "webp", "gif"):
-        ext = "jpg"
-    key = f"footers/group-{gid}.{ext}"
-    try:
-        _s3().upload_fileobj(
-            file.file, S3_BUCKET, key,
-            ExtraArgs={"ContentType": file.content_type or "image/jpeg", "ACL": "private"},
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"S3 upload failed: {e}")
-
-    uri = f"s3://{S3_BUCKET}/{key}"
-    with pg_conn() as conn:
-        try:
-            with conn.cursor() as cur:
-                cur.execute('UPDATE public."group" SET footer_image_url = %s WHERE id = %s;', (uri, gid))
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            raise HTTPException(status_code=500, detail=str(e))
-    return {"gid": gid, "footer_image_url": presign_s3(uri)}
