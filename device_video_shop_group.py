@@ -973,10 +973,14 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
                         SELECT 1 FROM public.device_video_shop_group l WHERE l.did = da.did
                     )
                 """
-                # Tenant scoping for device_assignment query
+                # Tenant scoping for device_assignment query.
+                # The placeholder goes BEFORE the filter placeholders in the SQL,
+                # so the param must lead the list too — appending it bound the
+                # first ILIKE pattern into tenant_id (bigint) and 500'd whenever
+                # a mobile_id/shop/group filter was used.
                 if tenant_id:
                     assignment_sql += " AND d.tenant_id = %s"
-                    assignment_params.append(tenant_id)
+                    assignment_params.insert(0, tenant_id)
                 if assignment_where:
                     assignment_sql += " AND " + " AND ".join(assignment_where)
                 assignment_sql += " ORDER BY da.id DESC LIMIT %s OFFSET %s;"
@@ -1023,10 +1027,11 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
                         SELECT 1 FROM public.device_assignment da WHERE da.did = d.id
                     )
                 """
-                # Tenant scoping for unassigned devices query
+                # Tenant scoping for unassigned devices query — same placeholder
+                # ordering rule as the assignment query above.
                 if tenant_id:
                     unassigned_sql += " AND d.tenant_id = %s"
-                    unassigned_params.append(tenant_id)
+                    unassigned_params.insert(0, tenant_id)
                 if unassigned_where:
                     unassigned_sql += " AND " + " AND ".join(unassigned_where)
                 unassigned_sql += " ORDER BY d.is_online DESC, d.id DESC LIMIT %s OFFSET %s;"
