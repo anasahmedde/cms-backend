@@ -145,6 +145,33 @@ def validate_zones(zones: Any) -> List[str]:
                 cv = style.get(color_field)
                 if cv is not None and (not isinstance(cv, str) or not HEX_COLOR_RE.match(cv)):
                     errors.append(f"{where}: style.{color_field} must be a hex color like #0a1628")
+            # Designer-set backgrounds (same schema as content payloads; the
+            # resolver folds them into resolved content so players need nothing new).
+            if style.get("bg_gradient") is not None:
+                errors.extend(f"{where}: style.{e}" for e in _validate_gradient(style["bg_gradient"]))
+            biu = style.get("bg_image_url")
+            if biu is not None and (not isinstance(biu, str)
+                                    or not biu.startswith(("http://", "https://"))
+                                    or len(biu) > 2048):
+                errors.append(f"{where}: style.bg_image_url must be an http(s) URL (max 2048 chars)")
+            # Typography / layout knobs the players already consume.
+            fsv = style.get("font_size_vh")
+            if fsv is not None and (isinstance(fsv, bool) or not isinstance(fsv, (int, float)) or not (1 <= fsv <= 100)):
+                errors.append(f"{where}: style.font_size_vh must be a number 1-100")
+            if style.get("align") is not None and style["align"] not in ("left", "center", "right"):
+                errors.append(f"{where}: style.align must be left|center|right")
+            if style.get("direction") is not None and style["direction"] not in ("ltr", "rtl"):
+                errors.append(f"{where}: style.direction must be ltr|rtl")
+            if style.get("bold") is not None and not isinstance(style["bold"], bool):
+                errors.append(f"{where}: style.bold must be a boolean")
+            if style.get("fit_mode") is not None and style["fit_mode"] not in ("cover", "contain"):
+                errors.append(f"{where}: style.fit_mode must be cover|contain")
+            ts = style.get("ticker_speed")
+            if ts is not None and (isinstance(ts, bool) or not isinstance(ts, (int, float)) or not (1 <= ts <= 100)):
+                errors.append(f"{where}: style.ticker_speed must be a number 1-100")
+            pp = style.get("padding_pct")
+            if pp is not None and (isinstance(pp, bool) or not isinstance(pp, (int, float)) or not (0 <= pp <= 40)):
+                errors.append(f"{where}: style.padding_pct must be a number 0-40")
         binding = zone.get("binding", {})
         if not isinstance(binding, dict):
             errors.append(f"{where}: 'binding' must be an object")
@@ -368,6 +395,18 @@ def resolve_zone(zone: Dict, entity: Dict[str, Optional[str]],
         if bg_img:
             resolved["bg_image"] = bg_img
         out["content"] = resolved
+
+    # Designer-set zone backgrounds (style.bg_gradient / style.bg_image_url)
+    # fold into resolved content — the players already render content-level
+    # backgrounds for every zone type, so no player change is needed. Tenant
+    # content, when present, wins.
+    style = out.get("style") or {}
+    if isinstance(out.get("content"), dict):
+        c = out["content"]
+        if c.get("bg_gradient") is None and style.get("bg_gradient") is not None:
+            c["bg_gradient"] = style["bg_gradient"]
+        if not c.get("bg_image") and style.get("bg_image_url"):
+            c["bg_image"] = style["bg_image_url"]
     return out
 
 
