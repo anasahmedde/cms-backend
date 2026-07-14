@@ -30,6 +30,9 @@ Route map (mounted WITHOUT prefix; full paths declared here):
     PUT    /platform/companies/{cid}/template        link/unlink {template_id|null}
   Company dashboard (require_tenant_context):
     GET    /company/template                                    linked template + zones
+    GET    /company/template-content                            company-wide default content
+    PUT    /company/template-content/{zone_key}                 upsert payload (scope=company)
+    POST   /company/template-content/{zone_key}/media           upload image/video
     GET    /shop/{shop_id}/template-content                     all zone content for shop
     PUT    /shop/{shop_id}/template-content/{zone_key}          upsert payload
     POST   /shop/{shop_id}/template-content/{zone_key}/media    upload image/video
@@ -945,6 +948,49 @@ async def _upload_zone_media(conn, cur, tenant_id: int, zone: Dict, zone_key: st
         payload["qr_mode"] = "media" if media_type == "video" else payload.get("qr_mode", "image")
     return _upsert_zone_content(conn, cur, tenant_id, zone, zone_key, scope,
                                 shop_id, device_id, payload, user_id)
+
+
+@router.get("/company/template-content")
+def company_template_content(ctx: TenantContext = Depends(require_tenant_context)):
+    """Company-wide default zone content (scope='company' — the resolver's lowest-precedence layer)."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            tpl = _tenant_template(cur, ctx.active_tenant_id)
+            content = _get_scope_content(cur, ctx.active_tenant_id, "company", None, None)
+    zones = [z for z in (tpl["zones"] if tpl else [])
+             if (z.get("binding") or {}).get("source") == "content"]
+    return {"template_linked": tpl is not None,
+            "content_zones": zones, "content": content}
+
+
+@router.put("/company/template-content/{zone_key}")
+def put_company_zone_content(zone_key: str, body: ZoneContentIn,
+                             ctx: TenantContext = Depends(require_tenant_context)):
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            tpl = _tenant_template(cur, ctx.active_tenant_id)
+            if not tpl:
+                raise HTTPException(status_code=422, detail="Company has no linked template")
+            zone = _content_zone_or_422(tpl, zone_key)
+            saved = _upsert_zone_content(conn, cur, ctx.active_tenant_id, zone, zone_key,
+                                         "company", None, None, body.payload, ctx.user_id)
+        conn.commit()
+    return {"zone_key": zone_key, "payload": saved}
+
+
+@router.post("/company/template-content/{zone_key}/media")
+async def upload_company_zone_media(zone_key: str, file: UploadFile = File(...),
+                                    ctx: TenantContext = Depends(require_tenant_context)):
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            tpl = _tenant_template(cur, ctx.active_tenant_id)
+            if not tpl:
+                raise HTTPException(status_code=422, detail="Company has no linked template")
+            zone = _content_zone_or_422(tpl, zone_key)
+            saved = await _upload_zone_media(conn, cur, ctx.active_tenant_id, zone, zone_key,
+                                             "company", None, None, file, ctx.user_id)
+        conn.commit()
+    return {"zone_key": zone_key, "payload": saved}
 
 
 @router.get("/shop/{shop_id}/template-content")

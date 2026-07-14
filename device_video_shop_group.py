@@ -79,6 +79,8 @@ from migrations.template_schema import ensure_template_schema
 from bulk_enrollment_api import router as bulk_enrollment_router
 from migrations.bulk_import_schema import ensure_bulk_import_schema
 
+from migrations.reported_resolution_schema import ensure_reported_resolution_schema
+
 load_dotenv()
 
 # ---------- Settings ----------
@@ -221,6 +223,7 @@ async def startup_event():
             ensure_webapp_schema(conn)  # NEW: gender_counting_enabled column + gender_count_history table
             ensure_template_schema(conn)  # NEW: screen templates + zone content + device.app_version
             ensure_bulk_import_schema(conn)  # NEW: bulk device-enrollment jobs
+            ensure_reported_resolution_schema(conn)  # NEW: device-reported resolution provenance
         print("[APP] All schema migrations verified")
     except Exception as e:
         print(f"[APP] Schema migration warning: {e}")
@@ -3331,13 +3334,18 @@ def get_device_online_status(mobile_id: str, resolution: Optional[str] = Query(N
             tenant_id = row[5]
             current_resolution = row[6]
 
-            # Auto-save reported resolution if not already set
-            if resolution and not current_resolution:
+            # Auto-save reported resolution if not already set (COALESCE keeps the
+            # only-if-NULL behavior for the admin-effective `resolution`), and always
+            # record what the device actually reports (provenance for drift detection).
+            if resolution:
                 try:
-                    cur.execute(
-                        "UPDATE public.device SET resolution = %s WHERE mobile_id = %s;",
-                        (resolution, mobile_id)
-                    )
+                    cur.execute("""
+                        UPDATE public.device
+                        SET resolution = COALESCE(resolution, %s),
+                            reported_resolution = %s,
+                            resolution_reported_at = NOW()
+                        WHERE mobile_id = %s;
+                    """, (resolution, resolution, mobile_id))
                     conn.commit()
                 except Exception:
                     conn.rollback()
@@ -3430,15 +3438,22 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                 
                 # Update device status; also auto-save resolution if app reported one
                 # and the device doesn't have one set yet (COALESCE keeps existing value).
+                # reported_resolution/resolution_reported_at track what the hardware
+                # actually reports on EVERY heartbeat (provenance for drift detection)
+                # without ever overwriting the admin-effective `resolution`.
                 cur.execute("""
                     UPDATE public.device
                     SET is_online = %s, last_online_at = NOW(), updated_at = NOW(),
                         needs_refresh = FALSE,
                         resolution = COALESCE(resolution, %s),
-                        app_version = COALESCE(%s, app_version)
+                        app_version = COALESCE(%s, app_version),
+                        reported_resolution = COALESCE(%s, reported_resolution),
+                        resolution_reported_at = CASE WHEN %s IS NOT NULL THEN NOW()
+                                                      ELSE resolution_reported_at END
                     WHERE mobile_id = %s
                     RETURNING is_online;
-                """, (body.is_online, body.resolution, body.app_version, mobile_id))
+                """, (body.is_online, body.resolution, body.app_version,
+                      body.resolution, body.resolution, mobile_id))
                 row = cur.fetchone()
                 
                 # Check if device needs to wipe local files.
@@ -3597,14 +3612,17 @@ def get_detected_resolution(mobile_id: str):
     """
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            # 1) Already enrolled — check device table
+            # 1) Already enrolled — check device table (admin-effective value first,
+            #    then the heartbeat-reported value as fallback)
             cur.execute(
-                "SELECT resolution FROM public.device WHERE mobile_id = %s LIMIT 1;",
+                "SELECT resolution, reported_resolution FROM public.device WHERE mobile_id = %s LIMIT 1;",
                 (mobile_id,)
             )
             row = cur.fetchone()
             if row and row[0]:
                 return {"resolution": row[0], "source": "device"}
+            if row and row[1]:
+                return {"resolution": row[1], "source": "reported"}
 
             # 2) Not yet enrolled — check pre-enrollment cache
             try:
@@ -6301,7 +6319,7 @@ def standalone_list_devices(
                        COALESCE(dc.downloaded_count, 0) as downloaded_count,
                        -- Last content update time
                        COALESCE(lc.last_content_update, d.updated_at) as last_content_update,
-                       d.is_muted
+                       d.is_muted, d.app_version, d.reported_resolution
                 FROM public.device d
                 LEFT JOIN public.device_assignment da ON da.did = d.id
                 LEFT JOIN public."group" g1 ON g1.id = da.gid
@@ -6382,6 +6400,9 @@ def standalone_list_devices(
             "content_status": content_status,
             "last_content_update": r[14] if len(r) > 14 else None,
             "is_muted": bool(r[15]) if len(r) > 15 and r[15] is not None else False,
+            # Fleet telemetry (self-reported by the player heartbeat)
+            "app_version": r[16] if len(r) > 16 else None,
+            "reported_resolution": r[17] if len(r) > 17 else None,
         })
     
     return {"items": items, "total": total, "count": len(items), "limit": limit, "offset": offset, "query": q}

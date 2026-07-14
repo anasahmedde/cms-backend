@@ -598,6 +598,7 @@ class PlatformDashboardOut(BaseModel):
     expiring_companies: list  # companies expiring soon
     expired_companies_list: list  # expired companies
     notifications: list  # notification alerts
+    fleet_versions: list  # [{app_version, count}] distribution across all devices
 
 
 @router.get("/dashboard", response_model=PlatformDashboardOut)
@@ -698,6 +699,17 @@ def platform_dashboard(ctx: TenantContext = Depends(require_platform_user)):
             totals["total_devices"] = r[0]
             totals["online_devices"] = r[1]
             totals["offline_devices"] = r[2]
+
+            # Fleet app-version distribution (heartbeat telemetry; NULL = never reported)
+            cur.execute("""
+                SELECT app_version, COUNT(*) AS cnt
+                FROM public.device
+                GROUP BY app_version
+                ORDER BY cnt DESC, app_version ASC NULLS LAST
+            """)
+            totals["fleet_versions"] = [
+                {"app_version": row[0], "count": row[1]} for row in cur.fetchall()
+            ]
 
             # Global entity counts
             cur.execute("SELECT COUNT(*) FROM public.video")

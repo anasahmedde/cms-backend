@@ -338,7 +338,7 @@
     fetch(api("/device/" + encodeURIComponent(DEVICE) + "/online_update"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ is_online: true, app_version: "web-player-1.0" }),
+      body: JSON.stringify({ is_online: true, app_version: "web-player-1.0", resolution: screen.width + "x" + screen.height }),
     }).then(function (r) { return r.ok ? r.json() : null; })
       .then(function (hb) {
         if (hb && hb.template_stamp && hb.template_stamp !== state.stamp) refreshTemplate();
