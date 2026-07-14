@@ -57,8 +57,18 @@ class AnnouncementOut(BaseModel):
 # SCHEMA - Run once to create the table
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Run the DDL once per process, not per request: ALTER TABLE takes an ACCESS
+# EXCLUSIVE lock even when the column already exists, and two concurrent
+# /announcement/active requests each holding DDL + the auto-deactivate UPDATE
+# deadlocked each other in production logs.
+_announcement_schema_ensured = False
+
+
 def ensure_announcement_schema(conn):
-    """Create the platform_announcement table if it doesn't exist."""
+    """Create the platform_announcement table if it doesn't exist (once per process)."""
+    global _announcement_schema_ensured
+    if _announcement_schema_ensured:
+        return
     ddl = """
     CREATE TABLE IF NOT EXISTS public.platform_announcement (
         id SERIAL PRIMARY KEY,
@@ -92,6 +102,7 @@ def ensure_announcement_schema(conn):
             ADD COLUMN IF NOT EXISTS target_company_id INTEGER;
         """)
     conn.commit()
+    _announcement_schema_ensured = True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
