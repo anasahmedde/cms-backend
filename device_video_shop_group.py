@@ -53,6 +53,7 @@ from tenant_context import (
     hash_password, verify_password, generate_token, create_session,
     invalidate_user_sessions, invalidate_tenant_sessions,
     active_sessions, log_audit, ROLE_PERMISSIONS,
+    destroy_session as tc_destroy_session,
 )
 from platform_api import router as platform_router
 
@@ -80,6 +81,7 @@ from bulk_enrollment_api import router as bulk_enrollment_router
 from migrations.bulk_import_schema import ensure_bulk_import_schema
 
 from migrations.reported_resolution_schema import ensure_reported_resolution_schema
+from migrations.auth_session_schema import ensure_auth_session_schema
 
 load_dotenv()
 
@@ -224,6 +226,7 @@ async def startup_event():
             ensure_template_schema(conn)  # NEW: screen templates + zone content + device.app_version
             ensure_bulk_import_schema(conn)  # NEW: bulk device-enrollment jobs
             ensure_reported_resolution_schema(conn)  # NEW: device-reported resolution provenance
+            ensure_auth_session_schema(conn)  # NEW: durable auth sessions (survive deploys)
         print("[APP] All schema migrations verified")
     except Exception as e:
         print(f"[APP] Schema migration warning: {e}")
@@ -4921,7 +4924,8 @@ def logout(authorization: Optional[str] = Header(None)):
             session_data = active_sessions[token]
             user_id = session_data.get("user_id")
             tenant_id = session_data.get("tenant_id")
-            del active_sessions[token]
+        # Removes from memory AND the durable auth_session row.
+        tc_destroy_session(token)
 
     # Close the most recent active session for this user
     if user_id:
