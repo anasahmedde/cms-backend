@@ -59,6 +59,34 @@ class TestValidateZones:
         zone = dict(WHITEBOARD_ZONES[0], w=0)
         assert any("w/h must be within" in e for e in validate_zones([zone]))
 
+    def test_text_runs_valid(self):
+        zone = {"key": "combo", "type": "text", "x": 0, "y": 0, "w": 100, "h": 30, "z": 1,
+                "binding": {"source": "static"},
+                "content": {"runs": [
+                    {"text": "Big", "x": 5, "y": 5, "font_size_vh": 40, "bold": True, "text_color": "#ffffff"},
+                    {"text": "small note", "x": 5, "y": 60, "font_size_vh": 15, "align": "left"},
+                ]}}
+        assert validate_zones([zone]) == []
+
+    def test_text_runs_bad_position(self):
+        zone = {"key": "combo", "type": "text", "x": 0, "y": 0, "w": 100, "h": 30, "z": 1,
+                "binding": {"source": "static"},
+                "content": {"runs": [{"text": "x", "x": 120, "y": 5}]}}
+        assert any("content.runs[0].x must be a number 0-100" in e for e in validate_zones([zone]))
+
+    def test_text_runs_only_on_text_zones(self):
+        zone = {"key": "vid", "type": "media", "x": 0, "y": 0, "w": 50, "h": 50, "z": 1,
+                "binding": {"source": "content", "scope": "shop"},
+                "content": {"runs": [{"text": "x", "x": 5, "y": 5}]}}
+        assert any("content.runs is only valid on text/ticker zones" in e for e in validate_zones([zone]))
+
+    def test_resolve_passes_runs_through(self):
+        zone = {"key": "combo", "type": "text", "x": 0, "y": 0, "w": 100, "h": 30, "z": 1,
+                "binding": {"source": "static"},
+                "content": {"text": "fallback", "runs": [{"text": "A", "x": 1, "y": 1, "font_size_vh": 20}]}}
+        out = resolve_zone(zone, {}, {}, lambda s: "https://x/" + s)
+        assert out["content"]["runs"] == [{"text": "A", "x": 1, "y": 1, "font_size_vh": 20}]
+
     def test_missing_dimension(self):
         zone = {k: v for k, v in WHITEBOARD_ZONES[0].items() if k != "h"}
         assert any("'h' must be a number" in e for e in validate_zones([zone]))
