@@ -166,12 +166,15 @@ def validate_content_payload(zone_type: str, payload: Any) -> List[str]:
     errors: List[str] = []
     if not isinstance(payload, dict):
         return ["payload must be an object"]
+    # Background can be a color, a gradient, or an image (URL or uploaded S3).
+    bg_keys = {"bg_color", "bg_gradient", "bg_image_url", "bg_image_s3"}
+    media_keys = {"media_s3", "media_url", "media_type"}
     allowed = {
-        "text": {"text", "bg_color", "text_color"},
-        "media": {"media_s3", "media_type"},
-        "qr": {"qr_mode", "qr_link", "media_s3", "media_type", "qr_generated_s3"},
-        "ticker": {"text", "bg_color", "text_color"},
-        "clock": {"bg_color", "text_color", "format"},
+        "text": {"text", "text_color"} | bg_keys,
+        "media": media_keys,
+        "qr": {"qr_mode", "qr_link", "qr_generated_s3"} | media_keys,
+        "ticker": {"text", "text_color"} | bg_keys,
+        "clock": {"text_color", "format"} | bg_keys,
         "playlist": set(),
     }.get(zone_type)
     if allowed is None:
@@ -186,6 +189,17 @@ def validate_content_payload(zone_type: str, payload: Any) -> List[str]:
         cv = payload.get(color_field)
         if cv is not None and (not isinstance(cv, str) or not HEX_COLOR_RE.match(cv)):
             errors.append(f"{color_field} must be a hex color like #0a1628")
+    grad = payload.get("bg_gradient")
+    if grad is not None:
+        errors.extend(_validate_gradient(grad))
+    for url_field in ("media_url", "bg_image_url"):
+        uv = payload.get(url_field)
+        if uv is not None and (not isinstance(uv, str) or len(uv) > 2048 or not uv.startswith(("http://", "https://"))):
+            errors.append(f"{url_field} must be an http(s) URL of at most 2048 characters")
+    for s3_field in ("media_s3", "bg_image_s3", "qr_generated_s3"):
+        sv = payload.get(s3_field)
+        if sv is not None and (not isinstance(sv, str) or not sv.startswith("s3://")):
+            errors.append(f"{s3_field} must be an s3:// URI")
     if zone_type == "qr":
         mode = payload.get("qr_mode")
         if mode is not None and mode not in QR_MODES:
@@ -197,6 +211,91 @@ def validate_content_payload(zone_type: str, payload: Any) -> List[str]:
         if mode == "link" and not link:
             errors.append("qr_mode 'link' requires qr_link")
     return errors
+
+
+def _validate_gradient(grad: Any) -> List[str]:
+    if not isinstance(grad, dict):
+        return ["bg_gradient must be an object like {stops:[..], angle:int}"]
+    errs = []
+    stops = grad.get("stops")
+    if not isinstance(stops, list) or not (2 <= len(stops) <= 4):
+        errs.append("bg_gradient.stops must be a list of 2–4 hex colors")
+    else:
+        for s in stops:
+            if not isinstance(s, str) or not HEX_COLOR_RE.match(s):
+                errs.append(f"bg_gradient stop {s!r} must be a hex color")
+    angle = grad.get("angle", 135)
+    if isinstance(angle, bool) or not isinstance(angle, (int, float)) or not (0 <= angle <= 360):
+        errs.append("bg_gradient.angle must be a number 0–360")
+    return errs
+
+
+# ── Raw value parsing (for bulk import cells; the UI sends structured payloads) ──
+
+IMAGE_EXT_RE = re.compile(r"\.(png|jpe?g|gif|webp|svg|bmp)(\?|#|$)", re.I)
+VIDEO_EXT_RE = re.compile(r"\.(mp4|webm|mov|m4v|mkv)(\?|#|$)", re.I)
+GRADIENT_ANGLE_RE = re.compile(r"@\s*(\d{1,3})")
+
+
+def resolve_media_value(cur, tenant_id: int, value: str) -> Dict[str, Any]:
+    """
+    A raw media value → structured fields. Accepts an http(s) URL, an s3:// URI,
+    or the NAME of a video / advertisement already in the tenant's library
+    (auto-resolved to its stored S3 object). Raises ValueError if a bare name
+    matches nothing.
+    """
+    v = (value or "").strip()
+    if not v:
+        return {}
+    if v.startswith(("http://", "https://")):
+        return {"media_url": v, "media_type": "video" if VIDEO_EXT_RE.search(v) else "image"}
+    if v.startswith("s3://"):
+        return {"media_s3": v, "media_type": "video" if VIDEO_EXT_RE.search(v) else "image"}
+    cur.execute("SELECT s3_link, COALESCE(content_type, 'video') FROM public.video "
+                "WHERE video_name = %s AND tenant_id = %s LIMIT 1;", (v, tenant_id))
+    row = cur.fetchone()
+    if row:
+        return {"media_s3": row[0], "media_type": "image" if row[1] == "image" else "video"}
+    cur.execute("SELECT s3_link FROM public.advertisement WHERE ad_name = %s AND tenant_id = %s LIMIT 1;",
+                (v, tenant_id))
+    row = cur.fetchone()
+    if row:
+        return {"media_s3": row[0], "media_type": "image"}
+    raise ValueError(f"'{v}' is not a URL and no video/advertisement has that name")
+
+
+def parse_bg_value(cur, tenant_id: int, value: str) -> Dict[str, Any]:
+    """A raw background value → {bg_color} | {bg_gradient} | {bg_image_url|bg_image_s3}."""
+    v = (value or "").strip()
+    if not v:
+        return {}
+    hexes = re.findall(r"#[0-9a-fA-F]{3,8}", v)
+    if len(hexes) >= 2:
+        m = GRADIENT_ANGLE_RE.search(v)
+        angle = max(0, min(360, int(m.group(1)))) if m else 135
+        return {"bg_gradient": {"stops": hexes[:4], "angle": angle}}
+    if len(hexes) == 1 and re.fullmatch(r"\s*#[0-9a-fA-F]{3,8}\s*", v):
+        return {"bg_color": hexes[0]}
+    mv = resolve_media_value(cur, tenant_id, v)  # image URL / s3 / library name
+    if mv.get("media_url"):
+        return {"bg_image_url": mv["media_url"]}
+    if mv.get("media_s3"):
+        return {"bg_image_s3": mv["media_s3"]}
+    return {}
+
+
+def parse_qr_value(cur, tenant_id: int, value: str) -> Dict[str, Any]:
+    """A raw QR value → generate-from-link, or show an image/video (URL/s3/name)."""
+    v = (value or "").strip()
+    if not v:
+        return {}
+    # An http(s) link WITHOUT an image extension = a link to encode into a QR.
+    if v.startswith(("http://", "https://")) and not IMAGE_EXT_RE.search(v):
+        return {"qr_mode": "link", "qr_link": v}
+    mv = resolve_media_value(cur, tenant_id, v)
+    if mv.get("media_type") == "video":
+        return {"qr_mode": "media", **mv}
+    return {"qr_mode": "image", **mv}
 
 
 def resolve_zone(zone: Dict, entity: Dict[str, Optional[str]],
@@ -226,20 +325,45 @@ def resolve_zone(zone: Dict, entity: Dict[str, Optional[str]],
     elif source == "content":
         payload = dict(content.get(zone.get("key"), {}))
         resolved: Dict[str, Any] = {}
+
+        # A media value may be an uploaded S3 object (presign it) OR an external
+        # URL (pass through as-is). This lets content reference any public image/
+        # video URL, or a video/advertisement already in the library (stored as s3://).
+        def media_url_of(s3_key, ext_url):
+            if ext_url:
+                return ext_url
+            if s3_key:
+                return presign(s3_key)
+            return None
+
         if zone.get("type") == "qr":
             mode = payload.get("qr_mode") or ("link" if payload.get("qr_link") else "image")
             resolved["qr_mode"] = mode
-            uri = payload.get("qr_generated_s3") if mode == "link" else payload.get("media_s3")
-            if uri:
-                resolved["media_url"] = presign(uri)
-                resolved["media_type"] = payload.get("media_type", "image") if mode == "media" else "image"
-        else:
-            if payload.get("media_s3"):
-                resolved["media_url"] = presign(payload["media_s3"])
+            if mode == "link":
+                url = media_url_of(payload.get("qr_generated_s3"), None)
+                mtype = "image"
+            else:
+                url = media_url_of(payload.get("media_s3"), payload.get("media_url"))
+                mtype = payload.get("media_type", "image") if mode == "media" else "image"
+            if url:
+                resolved["media_url"] = url
+                resolved["media_type"] = mtype
+        elif zone.get("type") == "media":
+            url = media_url_of(payload.get("media_s3"), payload.get("media_url"))
+            if url:
+                resolved["media_url"] = url
                 resolved["media_type"] = payload.get("media_type", "image")
-        for k in ("text", "bg_color", "text_color", "format"):
+
+        # Shared text/style fields (text + ticker + any zone with a background).
+        for k in ("text", "text_color", "bg_color", "format"):
             if payload.get(k) is not None:
                 resolved[k] = payload[k]
+        # Background can also be a gradient or an image (precedence image > gradient > color).
+        if payload.get("bg_gradient") is not None:
+            resolved["bg_gradient"] = payload["bg_gradient"]
+        bg_img = media_url_of(payload.get("bg_image_s3"), payload.get("bg_image_url"))
+        if bg_img:
+            resolved["bg_image"] = bg_img
         out["content"] = resolved
     return out
 
