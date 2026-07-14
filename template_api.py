@@ -407,6 +407,11 @@ def resolve_zone(zone: Dict, entity: Dict[str, Optional[str]],
             c["bg_gradient"] = style["bg_gradient"]
         if not c.get("bg_image") and style.get("bg_image_url"):
             c["bg_image"] = style["bg_image_url"]
+        # Solid color too — the Android renderer draws content-level backgrounds;
+        # a designer-set style.bg_color must reach it the same way.
+        if (c.get("bg_color") is None and c.get("bg_gradient") is None
+                and not c.get("bg_image") and style.get("bg_color")):
+            c["bg_color"] = style["bg_color"]
     return out
 
 

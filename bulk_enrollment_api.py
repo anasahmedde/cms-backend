@@ -508,14 +508,38 @@ def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_cont
                 content_zones, _tpl = _tenant_content_zones(cur, tenant_id)
                 zone_map = {z["key"]: z for z in content_zones}
 
-                created = skipped = pending = 0
+                created = skipped = pending = updated = 0
                 content_written = 0
+
+                def write_row_content(did, row):
+                    """Per-device template content (device-scope override)."""
+                    nonlocal content_written
+                    for zone_key, payload in (row.get("content") or {}).items():
+                        zone = zone_map.get(zone_key)
+                        if not zone or not payload:
+                            continue
+                        tpl_api._upsert_zone_content(conn, cur, tenant_id, zone, zone_key,
+                                                     "device", None, did, dict(payload), ctx.user_id)
+                        content_written += 1
+
                 # 2) create devices row-by-row (safe + idempotent); assignment per device
                 for r in rows:
                     if r["action"] == "error":
                         continue
                     if r["action"] == "skip":
+                        # The device already exists in this tenant. The sheet is
+                        # still the operator's source of truth for its CONTENT —
+                        # skipping it entirely left previously-enrolled screens
+                        # without the sheet's QR/media values while new screens
+                        # got them ("appears on one device but not the other").
                         skipped += 1
+                        if r.get("content") and r.get("device_id"):
+                            cur.execute("SELECT id FROM public.device WHERE tenant_id = %s AND mobile_id = %s;",
+                                        (tenant_id, r["device_id"]))
+                            hit = cur.fetchone()
+                            if hit:
+                                write_row_content(hit[0], r)
+                                updated += 1
                         continue
                     if r["action"] == "pending":
                         code = _pending_code()
@@ -524,11 +548,16 @@ def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_cont
                     else:  # create
                         mobile_id = r["device_id"]
                         activation = None
-                        # Guard: skip if it now exists in this tenant (idempotent re-run)
+                        # Guard: it may exist by now (idempotent re-run) — still
+                        # refresh its content from the sheet.
                         cur.execute("SELECT id FROM public.device WHERE tenant_id = %s AND mobile_id = %s;",
                                     (tenant_id, mobile_id))
-                        if cur.fetchone():
+                        existing_row = cur.fetchone()
+                        if existing_row:
                             skipped += 1
+                            if r.get("content"):
+                                write_row_content(existing_row[0], r)
+                                updated += 1
                             continue
                     cur.execute("""
                         INSERT INTO public.device
@@ -546,14 +575,7 @@ def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_cont
                             VALUES (%s, %s, %s, %s)
                             ON CONFLICT (did) DO UPDATE SET gid = EXCLUDED.gid, sid = EXCLUDED.sid, updated_at = NOW();
                         """, (did, gid, sid, tenant_id))
-                    # Per-device template content (device-scope override).
-                    for zone_key, payload in (r.get("content") or {}).items():
-                        zone = zone_map.get(zone_key)
-                        if not zone or not payload:
-                            continue
-                        tpl_api._upsert_zone_content(conn, cur, tenant_id, zone, zone_key,
-                                                     "device", None, did, dict(payload), ctx.user_id)
-                        content_written += 1
+                    write_row_content(did, r)
 
                     if r["action"] == "pending":
                         pending += 1
@@ -561,6 +583,7 @@ def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_cont
                         created += 1
 
                 report = {"created": created, "pending": pending, "skipped": skipped,
+                          "content_updated_existing": updated,
                           "content_written": content_written,
                           "shops": len(shop_ids), "groups": len(group_ids)}
                 cur.execute("""
