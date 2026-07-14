@@ -150,18 +150,35 @@
     return "left:" + z.x + "%;top:" + z.y + "%;width:" + z.w + "%;height:" + z.h + "%;z-index:" + (z.z || 1) + ";";
   }
 
+  function gradientCss(g) {
+    return "linear-gradient(" + (typeof g.angle === "number" ? g.angle : 135) + "deg, " + (g.stops || []).join(", ") + ")";
+  }
+
+  // Background precedence: content image > content gradient > content/style color.
+  function applyBackground(el, c, st) {
+    if (c.bg_image) {
+      el.style.backgroundImage = "url('" + c.bg_image.replace(/'/g, "%27") + "')";
+      el.style.backgroundSize = "cover";
+      el.style.backgroundPosition = "center";
+      return;
+    }
+    if (c.bg_gradient && c.bg_gradient.stops) { el.style.background = gradientCss(c.bg_gradient); return; }
+    var col = c.bg_color || st.bg_color;
+    if (col) el.style.background = col;
+  }
+
   function buildZone(z) {
     var el = document.createElement("div");
     el.className = "zone";
     el.setAttribute("style", pos(z));
     var st = z.style || {};
     var c = z.content || {};
-    if (st.bg_color) el.style.background = st.bg_color;
+    applyBackground(el, c, st);
 
     switch (z.type) {
-      case "text":      fillText(el, c.text || "", st); break;
-      case "ticker":    fillTicker(el, c.text || "", st); break;
-      case "clock":     fillClock(el, st); break;
+      case "text":      fillText(el, c.text || "", st, c); break;
+      case "ticker":    fillTicker(el, c.text || "", st, c); break;
+      case "clock":     fillClock(el, st, c); break;
       case "media":     fillMedia(el, c, st); break;
       case "qr":        fillQr(el, c, st); break;
       case "playlist":  fillPlaylist(el, z, st); break;
@@ -170,10 +187,11 @@
     return el;
   }
 
-  function textStyle(el, st) {
+  function textStyle(el, st, c) {
     var t = document.createElement("div");
     t.className = "txt";
-    if (st.text_color) t.style.color = st.text_color;
+    var textColor = (c && c.text_color) || st.text_color;
+    if (textColor) t.style.color = textColor;
     // font_size_vh is a % of the ZONE height; convert against the zone element.
     var vh = typeof st.font_size_vh === "number" ? st.font_size_vh : 45;
     t.style.fontSize = "min(" + (vh) + "cqh, 40vw)";
@@ -184,19 +202,20 @@
     return t;
   }
 
-  function fillText(el, text, st) {
-    var t = textStyle(el, st);
+  function fillText(el, text, st, c) {
+    var t = textStyle(el, st, c);
     t.textContent = text;
     el.appendChild(t);
   }
 
-  function fillTicker(el, text, st) {
+  function fillTicker(el, text, st, c) {
     var wrap = document.createElement("div");
     wrap.className = "ticker-wrap";
     var mv = document.createElement("span");
     mv.className = "ticker-move";
     mv.textContent = text;
-    if (st.text_color) mv.style.color = st.text_color;
+    var tc = (c && c.text_color) || st.text_color;
+    if (tc) mv.style.color = tc;
     var speed = typeof st.ticker_speed === "number" ? st.ticker_speed : 18;
     mv.style.animationDuration = speed + "s";
     mv.style.fontSize = "min(" + (st.font_size_vh || 60) + "cqh, 12vw)";
@@ -206,8 +225,8 @@
     el.style.justifyContent = "flex-start";
   }
 
-  function fillClock(el, st) {
-    var t = textStyle(el, st);
+  function fillClock(el, st, c) {
+    var t = textStyle(el, st, c);
     el.appendChild(t);
     function tick() {
       var d = new Date();
