@@ -124,9 +124,14 @@ class AuditLogOut(BaseModel):
     created_at: datetime
 
 
-# Hardware-dependent analytics a company may or may not have installed.
-# Missing key = feature OFF (the default for new companies).
-COMPANY_FEATURE_KEYS = ("temperature", "footfall", "gender")
+# Per-company feature flags stored on company.features (JSONB).
+#  - temperature/footfall/gender: hardware-dependent analytics; a MISSING key
+#    means OFF (dashboards hide those surfaces until switched on).
+#  - grid: the split/grid layout editor; a capability every company has today,
+#    so a MISSING key means ON — it's opt-OUT (the dashboard treats absent as
+#    enabled). The backend only validates/stores it; the default-ON semantics
+#    live in the client (lib/features featureOn).
+COMPANY_FEATURE_KEYS = ("temperature", "footfall", "gender", "grid")
 
 
 def _validate_features(features):
