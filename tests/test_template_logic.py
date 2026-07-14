@@ -134,7 +134,9 @@ ENTITY = {"company.name": "MoltyFoam", "shop.name": "Shop Karachi 12", "device.n
 class TestResolveZone:
     def test_shop_name_binding(self):
         out = resolve_zone(WHITEBOARD_ZONES[0], ENTITY, {}, FAKE_PRESIGN)
-        assert out["content"] == {"text": "Shop Karachi 12"}
+        # style.bg_color folds into resolved content so the Android renderer
+        # (which draws content-level backgrounds) shows designer colors.
+        assert out["content"] == {"text": "Shop Karachi 12", "bg_color": "#0a1628"}
         assert out["style"]["bg_color"] == "#0a1628"
         assert (out["x"], out["y"], out["w"], out["h"]) == (0, 0, 100, 15)
 
@@ -144,7 +146,7 @@ class TestResolveZone:
 
     def test_missing_entity_falls_back_to_empty(self):
         out = resolve_zone(WHITEBOARD_ZONES[0], {}, {}, FAKE_PRESIGN)
-        assert out["content"] == {"text": ""}
+        assert out["content"] == {"text": "", "bg_color": "#0a1628"}
 
     def test_qr_link_mode_uses_generated_png(self):
         content = {"qr": {"qr_mode": "link", "qr_link": "https://example.com",
