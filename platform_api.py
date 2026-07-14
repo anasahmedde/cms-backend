@@ -38,6 +38,7 @@ class CompanyCreateIn(BaseModel):
     admin_username: str = Field(..., min_length=3, max_length=100)
     admin_email: Optional[str] = None
     admin_full_name: Optional[str] = None
+    features: Optional[dict] = None
 
 class CompanyUpdateIn(BaseModel):
     name: Optional[str] = None
@@ -49,6 +50,7 @@ class CompanyUpdateIn(BaseModel):
     max_storage_mb: Optional[int] = None
     primary_color: Optional[str] = None
     accent_color: Optional[str] = None
+    features: Optional[dict] = None
 
 class CompanyOut(BaseModel):
     id: int
@@ -67,6 +69,7 @@ class CompanyOut(BaseModel):
     accent_color: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+    features: dict = {}
 
 class CompanyListOut(BaseModel):
     items: List[CompanyOut]
@@ -121,9 +124,27 @@ class AuditLogOut(BaseModel):
     created_at: datetime
 
 
+# Hardware-dependent analytics a company may or may not have installed.
+# Missing key = feature OFF (the default for new companies).
+COMPANY_FEATURE_KEYS = ("temperature", "footfall", "gender")
+
+
+def _validate_features(features):
+    if features is None:
+        return None
+    if not isinstance(features, dict):
+        raise HTTPException(status_code=422, detail="features must be an object")
+    bad = [k for k in features if k not in COMPANY_FEATURE_KEYS]
+    if bad:
+        raise HTTPException(status_code=422, detail=f"Unknown feature keys: {bad}; allowed: {list(COMPANY_FEATURE_KEYS)}")
+    if any(not isinstance(v, bool) for v in features.values()):
+        raise HTTPException(status_code=422, detail="feature values must be booleans")
+    return features
+
+
 COMPANY_COLUMNS = """id, slug, name, email, phone, address, logo_s3_key,
     max_devices, max_users, max_storage_mb, status, trial_ends_at,
-    primary_color, accent_color, created_at, updated_at"""
+    primary_color, accent_color, created_at, updated_at, features"""
 
 def _row_to_company(r) -> CompanyOut:
     return CompanyOut(
@@ -131,6 +152,7 @@ def _row_to_company(r) -> CompanyOut:
         address=r[5], logo_s3_key=r[6], max_devices=r[7], max_users=r[8],
         max_storage_mb=r[9], status=r[10], trial_ends_at=r[11],
         primary_color=r[12], accent_color=r[13], created_at=r[14], updated_at=r[15],
+        features=r[16] if len(r) > 16 and isinstance(r[16], dict) else {},
     )
 
 
@@ -175,11 +197,12 @@ def create_company(body: CompanyCreateIn, ctx: TenantContext = Depends(require_p
 
                 cur.execute(f"""
                     INSERT INTO public.company
-                        (slug, name, email, phone, address, max_devices, max_users, max_storage_mb, created_by)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        (slug, name, email, phone, address, max_devices, max_users, max_storage_mb, created_by, features)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
                     RETURNING id, created_at
                 """, (body.slug, body.name, body.email, body.phone, body.address,
-                      body.max_devices, body.max_users, body.max_storage_mb, ctx.user_id))
+                      body.max_devices, body.max_users, body.max_storage_mb, ctx.user_id,
+                      json.dumps(_validate_features(body.features) or {})))
                 company_id, created_at = cur.fetchone()
 
                 role_map = clone_roles_for_company(conn, company_id)
@@ -251,6 +274,7 @@ def list_companies(
                     c.id, c.slug, c.name, c.email, c.phone, c.address, c.logo_s3_key,
                     c.max_devices, c.max_users, c.max_storage_mb, c.status, c.trial_ends_at,
                     c.primary_color, c.accent_color, c.created_at, c.updated_at,
+                    c.features,
                     -- Expiration fields
                     c.expires_at,
                     c.grace_period_days,
@@ -282,23 +306,25 @@ def list_companies(
                     "primary_color": r[12], "accent_color": r[13], 
                     "created_at": r[14].isoformat() if r[14] else None, 
                     "updated_at": r[15].isoformat() if r[15] else None,
+                    # Per-company feature flags (missing key = OFF)
+                    "features": r[16] if isinstance(r[16], dict) else {},
                     # Expiration fields
-                    "expires_at": r[16].isoformat() if r[16] else None,
-                    "grace_period_days": r[17] if r[17] is not None else 7,
+                    "expires_at": r[17].isoformat() if r[17] else None,
+                    "grace_period_days": r[18] if r[18] is not None else 7,
                     # Device counts
-                    "device_count": r[20] or 0,
-                    "devices_online": r[21] or 0,
-                    "devices_offline": r[22] or 0,
+                    "device_count": r[21] or 0,
+                    "devices_online": r[22] or 0,
+                    "devices_offline": r[23] or 0,
                     # User count
-                    "user_count": r[23] or 0,
+                    "user_count": r[24] or 0,
                     # Linked screen template (null = default screens)
-                    "template_id": r[24],
+                    "template_id": r[25],
                 }
                 
                 # Calculate expiration status and days
-                expires_at = r[16]
-                grace_period_days = r[17] if r[17] is not None else 7
-                suspended_at = r[19]
+                expires_at = r[17]
+                grace_period_days = r[18] if r[18] is not None else 7
+                suspended_at = r[20]
                 
                 if suspended_at:
                     item["expiration_status"] = "suspended"
@@ -362,6 +388,9 @@ def update_company(slug: str, body: CompanyUpdateIn, ctx: TenantContext = Depend
                     v = getattr(body, f, None)
                     if v is not None:
                         updates.append(f"{c} = %s"); params.append(v)
+                if body.features is not None:
+                    updates.append("features = %s::jsonb")
+                    params.append(json.dumps(_validate_features(body.features)))
                 if not updates:
                     return get_company(slug, ctx)
                 params.append(slug)

@@ -82,6 +82,7 @@ from migrations.bulk_import_schema import ensure_bulk_import_schema
 
 from migrations.reported_resolution_schema import ensure_reported_resolution_schema
 from migrations.auth_session_schema import ensure_auth_session_schema
+from migrations.company_features_schema import ensure_company_features_schema
 
 load_dotenv()
 
@@ -227,6 +228,7 @@ async def startup_event():
             ensure_bulk_import_schema(conn)  # NEW: bulk device-enrollment jobs
             ensure_reported_resolution_schema(conn)  # NEW: device-reported resolution provenance
             ensure_auth_session_schema(conn)  # NEW: durable auth sessions (survive deploys)
+            ensure_company_features_schema(conn)  # NEW: per-company feature flags
         print("[APP] All schema migrations verified")
     except Exception as e:
         print(f"[APP] Schema migration warning: {e}")
