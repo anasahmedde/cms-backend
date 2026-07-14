@@ -40,11 +40,13 @@ from pydantic import BaseModel, Field
 
 from database import pg_conn
 from tenant_context import TenantContext, log_audit, require_tenant_context
+import template_api as tpl_api
 
 logger = logging.getLogger("bulk_enrollment_api")
 router = APIRouter()
 
-COLUMNS = ["device_name", "shop_name", "group_name", "device_id", "resolution", "notes"]
+BASE_COLUMNS = ["device_name", "shop_name", "group_name", "device_id", "resolution", "notes"]
+COLUMNS = BASE_COLUMNS  # back-compat alias
 REQUIRED = ["device_name", "shop_name"]
 RESOLUTION_RE = re.compile(r"^\d{2,5}x\d{2,5}$")
 MOBILE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
@@ -52,11 +54,11 @@ PENDING_PREFIX = "pending:"
 MAX_ROWS = 20000
 COMMIT_BATCH = 500
 
-EXAMPLE_ROWS = [
+BASE_EXAMPLE = [
     ["Main Entrance Screen", "Shop Karachi 12", "North Region", "a1b2c3d4e5f6a7b8", "1080x1920", "landscape TV at door"],
     ["Checkout Screen", "Shop Karachi 12", "North Region", "", "", "device id unknown - will be claimed on site"],
 ]
-INSTRUCTIONS = [
+BASE_INSTRUCTIONS = [
     "DIGIX bulk device import — fill one row per screen, then upload this file.",
     "device_name (required): a friendly name for the screen.",
     "shop_name (required): the shop this screen belongs to; created automatically if new.",
@@ -65,6 +67,77 @@ INSTRUCTIONS = [
     "resolution (optional): e.g. 1080x1920. Auto-detected from the device if blank.",
     "notes (optional): free text, not shown on screens.",
 ]
+# Per-zone example + guidance shown for the content columns (device-level content).
+_ZONE_HELP = {
+    "media": ("https://example.com/promo.jpg",
+              "an image/video URL, an s3:// path, or the NAME of a video/advertisement already uploaded"),
+    "qr": ("https://menu.example.com/shop12",
+           "a LINK to turn into a QR code, OR an image URL / s3:// path / library name to show as-is"),
+    "text": ("50% OFF this week", "the text to show on this screen"),
+    "bg": ("#111827  (or  #0a1628 -> #f59e0b @135  for a gradient, or an image URL)",
+           "a #hex color, a gradient like '#0a1628 -> #f59e0b @135', or an image URL/name"),
+}
+
+
+def content_columns_for(zones) -> list:
+    """[(header, zone_key, field, zone_type)] for each content-bound zone."""
+    cols = []
+    for z in zones or []:
+        if (z.get("binding") or {}).get("source") != "content":
+            continue
+        key, zt = z.get("key"), z.get("type")
+        if zt in ("text", "ticker"):
+            cols.append((f"content.{key}.text", key, "text", zt))
+            cols.append((f"content.{key}.bg", key, "bg", zt))
+        elif zt == "clock":
+            cols.append((f"content.{key}.bg", key, "bg", zt))
+        elif zt == "media":
+            cols.append((f"content.{key}.media", key, "media", zt))
+        elif zt == "qr":
+            cols.append((f"content.{key}.qr", key, "qr", zt))
+    return cols
+
+
+def _tenant_content_zones(cur, tenant_id: int):
+    tpl = tpl_api._tenant_template(cur, tenant_id)
+    if not tpl:
+        return [], None
+    zones = [z for z in tpl["zones"] if (z.get("binding") or {}).get("source") == "content"]
+    return zones, tpl
+
+
+def _template_bundle(tenant_id: int):
+    """Columns, example rows, and instructions for the tenant's linked template."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            content_cols, tpl = _tenant_content_zones(cur, tenant_id)
+    ccols = content_columns_for(content_cols)
+    headers = BASE_COLUMNS + [h for (h, _, _, _) in ccols]
+    example = [list(r) + ["" for _ in ccols] for r in BASE_EXAMPLE]
+    if ccols and example:
+        for i, (_h, _k, field, _zt) in enumerate(ccols):
+            example[0][len(BASE_COLUMNS) + i] = _ZONE_HELP.get(field, ("", ""))[0]
+    instructions = list(BASE_INSTRUCTIONS)
+    if ccols:
+        instructions.append("")
+        instructions.append(f"Screen content (from the linked template '{tpl['name']}') — filled PER SCREEN; blank = inherit the shop's content:")
+        for (h, _k, field, _zt) in ccols:
+            instructions.append(f"{h}: {_ZONE_HELP.get(field, ('', 'content'))[1]}")
+    else:
+        instructions.append("")
+        instructions.append("(No screen template is linked to this company yet, so there are no content columns.)")
+    return headers, example, instructions, ccols
+
+
+def _csv_bytes(headers, example, instructions) -> bytes:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    for line in instructions:
+        w.writerow(["# " + line] if line else [])
+    w.writerow(headers)
+    for row in example:
+        w.writerow(row)
+    return buf.getvalue().encode("utf-8")
 
 
 # ─────────────────────────── models ───────────────────────────
@@ -81,21 +154,11 @@ class ClaimIn(BaseModel):
 
 # ─────────────────────────── template download ───────────────────────────
 
-def _csv_bytes() -> bytes:
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    for line in INSTRUCTIONS:
-        w.writerow(["# " + line])
-    w.writerow(COLUMNS)
-    for row in EXAMPLE_ROWS:
-        w.writerow(row)
-    return buf.getvalue().encode("utf-8")
-
-
 @router.get("/bulk-devices/template.csv")
 def template_csv(ctx: TenantContext = Depends(require_tenant_context)):
+    headers, example, instructions, _ = _template_bundle(ctx.active_tenant_id)
     return StreamingResponse(
-        io.BytesIO(_csv_bytes()), media_type="text/csv",
+        io.BytesIO(_csv_bytes(headers, example, instructions)), media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="digix-devices-template.csv"'},
     )
 
@@ -107,24 +170,25 @@ def template_xlsx(ctx: TenantContext = Depends(require_tenant_context)):
         from openpyxl.styles import Font, PatternFill
     except ImportError:
         raise HTTPException(status_code=501, detail="XLSX export unavailable; use the CSV template")
+    headers, example, instructions, ccols = _template_bundle(ctx.active_tenant_id)
     wb = Workbook()
     ws = wb.active
     ws.title = "Devices"
     header_fill = PatternFill("solid", fgColor="0A1628")
+    content_fill = PatternFill("solid", fgColor="1E3A5F")
     header_font = Font(color="FFFFFF", bold=True)
-    ws.append(COLUMNS)
-    for cell in ws[1]:
-        cell.fill = header_fill
+    ws.append(headers)
+    for i, cell in enumerate(ws[1]):
+        cell.fill = content_fill if i >= len(BASE_COLUMNS) else header_fill
         cell.font = header_font
-    for row in EXAMPLE_ROWS:
+    for row in example:
         ws.append(row)
-    widths = [26, 22, 18, 22, 12, 30]
-    for i, wdt in enumerate(widths, start=1):
-        ws.column_dimensions[chr(64 + i)].width = wdt
+    for i in range(len(headers)):
+        ws.column_dimensions[_col_letter(i + 1)].width = 30 if i >= len(BASE_COLUMNS) else [26, 22, 18, 22, 12, 30][i]
     info = wb.create_sheet("Instructions")
-    for line in INSTRUCTIONS:
+    for line in instructions:
         info.append([line])
-    info.column_dimensions["A"].width = 110
+    info.column_dimensions["A"].width = 120
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
@@ -132,6 +196,14 @@ def template_xlsx(ctx: TenantContext = Depends(require_tenant_context)):
         out, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": 'attachment; filename="digix-devices-template.xlsx"'},
     )
+
+
+def _col_letter(n: int) -> str:
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
 
 
 # ─────────────────────────── parsing ───────────────────────────
@@ -152,15 +224,19 @@ def _norm_header(cells: List[str]) -> Optional[List[str]]:
 
 
 def _rows_from(header: List[str], data_rows: List[List[str]]) -> List[Dict[str, str]]:
-    idx = {col: header.index(col) for col in COLUMNS if col in header}
+    base_idx = {col: header.index(col) for col in BASE_COLUMNS if col in header}
+    # Any header of the form content.<zone>.<field> is a template content column.
+    content_idx = {h: i for i, h in enumerate(header) if h.startswith("content.")}
     out = []
     for cells in data_rows:
         if not any(str(c or "").strip() for c in cells):
             continue
-        rec = {}
-        for col in COLUMNS:
-            i = idx.get(col)
-            rec[col] = str(cells[i]).strip() if (i is not None and i < len(cells) and cells[i] is not None) else ""
+
+        def cell(i):
+            return str(cells[i]).strip() if (i is not None and i < len(cells) and cells[i] is not None) else ""
+
+        rec = {col: cell(base_idx.get(col)) for col in BASE_COLUMNS}
+        rec["_content"] = {h: cell(i) for h, i in content_idx.items() if cell(i)}
         out.append(rec)
     return out
 
@@ -218,8 +294,38 @@ def _parse_xlsx(data: bytes) -> List[Dict[str, str]]:
 
 # ─────────────────────────── validation ───────────────────────────
 
+def _parse_row_content(cur, tenant_id, content_cols, raw_content):
+    """Parse a row's content cells → ({zone_key: payload}, [errors]). content_cols
+    is [(header, zone_key, field, zone_type)]. Needs a DB cursor for name lookups."""
+    payloads: Dict[str, Dict[str, Any]] = {}
+    ztypes: Dict[str, str] = {}
+    errors: List[str] = []
+    for (header, key, field, zt) in content_cols:
+        val = (raw_content or {}).get(header, "").strip()
+        if not val:
+            continue
+        ztypes[key] = zt
+        pl = payloads.setdefault(key, {})
+        try:
+            if field == "text":
+                pl["text"] = val
+            elif field == "bg":
+                pl.update(tpl_api.parse_bg_value(cur, tenant_id, val))
+            elif field == "media":
+                pl.update(tpl_api.resolve_media_value(cur, tenant_id, val))
+            elif field == "qr":
+                pl.update(tpl_api.parse_qr_value(cur, tenant_id, val))
+        except ValueError as e:
+            errors.append(f"{header}: {e}")
+    for key, pl in payloads.items():
+        for msg in tpl_api.validate_content_payload(ztypes[key], pl):
+            errors.append(f"content.{key}: {msg}")
+    return payloads, errors
+
+
 def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_devices: int,
-                  mobile_ids_this_tenant: set, mobile_ids_other_tenant: set) -> Dict[str, Any]:
+                  mobile_ids_this_tenant: set, mobile_ids_other_tenant: set,
+                  content_cols=None, cur=None, tenant_id=None) -> Dict[str, Any]:
     """Pure validation. Returns preview {rows, errors, summary}. Writes nothing."""
     errors: List[Dict[str, Any]] = []
     seen_ids: Dict[str, int] = {}
@@ -249,6 +355,12 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
         res = rec.get("resolution", "").strip()
         if res and not RESOLUTION_RE.match(res):
             row_errors.append("resolution must look like 1080x1920")
+
+        # Template content cells (only when the company has a linked template).
+        row_content = {}
+        if content_cols and cur is not None:
+            row_content, content_errs = _parse_row_content(cur, tenant_id, content_cols, rec.get("_content"))
+            row_errors.extend(content_errs)
 
         will = "error"
         if not row_errors:
@@ -281,6 +393,7 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
             "device_id": dev_id,
             "resolution": res,
             "action": will,
+            "content": row_content,
         })
 
     after = existing_device_count + valid_new
@@ -299,6 +412,7 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
             "error_rows": len({e["row"] for e in errors if e["row"] > 0}),
             "new_shops": sorted(shops),
             "new_groups": sorted(groups),
+            "content_columns": [h for (h, _, _, _) in (content_cols or [])],
             "quota": {"existing": existing_device_count, "new": valid_new, "after": after,
                       "max": max_devices, "ok": quota_ok},
             "valid": len(errors) == 0,
@@ -335,7 +449,12 @@ async def bulk_validate(file: UploadFile = File(...), ctx: TenantContext = Depen
                 for mid, tid in cur.fetchall():
                     (mine if tid == tenant_id else other).add(mid)
 
-            preview = validate_rows(rows, existing, max_devices, mine, other)
+            # Content columns come from the company's linked template (if any).
+            content_zones, _tpl = _tenant_content_zones(cur, tenant_id)
+            content_cols = content_columns_for(content_zones)
+
+            preview = validate_rows(rows, existing, max_devices, mine, other,
+                                    content_cols=content_cols, cur=cur, tenant_id=tenant_id)
 
             cur.execute("""
                 INSERT INTO public.bulk_import_job
@@ -385,7 +504,12 @@ def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_cont
                 group_ids = _upsert_named(cur, '"group"', "gname",
                                           {r["group_name"] for r in rows if r["group_name"]}, tenant_id)
 
+                # Content zones of the linked template, for writing per-device content.
+                content_zones, _tpl = _tenant_content_zones(cur, tenant_id)
+                zone_map = {z["key"]: z for z in content_zones}
+
                 created = skipped = pending = 0
+                content_written = 0
                 # 2) create devices row-by-row (safe + idempotent); assignment per device
                 for r in rows:
                     if r["action"] == "error":
@@ -422,12 +546,22 @@ def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_cont
                             VALUES (%s, %s, %s, %s)
                             ON CONFLICT (did) DO UPDATE SET gid = EXCLUDED.gid, sid = EXCLUDED.sid, updated_at = NOW();
                         """, (did, gid, sid, tenant_id))
+                    # Per-device template content (device-scope override).
+                    for zone_key, payload in (r.get("content") or {}).items():
+                        zone = zone_map.get(zone_key)
+                        if not zone or not payload:
+                            continue
+                        tpl_api._upsert_zone_content(conn, cur, tenant_id, zone, zone_key,
+                                                     "device", None, did, dict(payload), ctx.user_id)
+                        content_written += 1
+
                     if r["action"] == "pending":
                         pending += 1
                     else:
                         created += 1
 
                 report = {"created": created, "pending": pending, "skipped": skipped,
+                          "content_written": content_written,
                           "shops": len(shop_ids), "groups": len(group_ids)}
                 cur.execute("""
                     UPDATE public.bulk_import_job

@@ -183,6 +183,64 @@ class TestResolveZone:
         assert out["content"] == {"text": "Fixed"}
 
 
+class TestParseBgValue:
+    # Color/gradient parsing needs no DB (cur unused for those branches).
+    def test_solid_color(self):
+        from template_api import parse_bg_value
+        assert parse_bg_value(None, 1, "#0a1628") == {"bg_color": "#0a1628"}
+
+    def test_gradient_two_stops_with_angle(self):
+        from template_api import parse_bg_value
+        out = parse_bg_value(None, 1, "#0a1628 -> #f59e0b @120")
+        assert out["bg_gradient"]["stops"] == ["#0a1628", "#f59e0b"]
+        assert out["bg_gradient"]["angle"] == 120
+
+    def test_gradient_default_angle(self):
+        from template_api import parse_bg_value
+        assert parse_bg_value(None, 1, "#000000, #ffffff")["bg_gradient"]["angle"] == 135
+
+
+class TestResolveMediaValue:
+    def test_external_image_url(self):
+        from template_api import resolve_media_value
+        assert resolve_media_value(None, 1, "https://x.com/a.png") == {"media_url": "https://x.com/a.png", "media_type": "image"}
+
+    def test_external_video_url(self):
+        from template_api import resolve_media_value
+        assert resolve_media_value(None, 1, "https://x.com/clip.mp4")["media_type"] == "video"
+
+    def test_s3_uri(self):
+        from template_api import resolve_media_value
+        assert resolve_media_value(None, 1, "s3://b/k.jpg") == {"media_s3": "s3://b/k.jpg", "media_type": "image"}
+
+
+class TestParseQrValue:
+    def test_link_to_encode(self):
+        from template_api import parse_qr_value
+        assert parse_qr_value(None, 1, "https://menu.example.com/x") == {"qr_mode": "link", "qr_link": "https://menu.example.com/x"}
+
+    def test_image_url_shown_as_is(self):
+        from template_api import parse_qr_value
+        out = parse_qr_value(None, 1, "https://x.com/qr.png")
+        assert out["qr_mode"] == "image" and out["media_url"].endswith("qr.png")
+
+
+class TestValidateGradientPayload:
+    def test_gradient_ok(self):
+        assert validate_content_payload("text", {"bg_gradient": {"stops": ["#000", "#fff"], "angle": 90}}) == []
+
+    def test_gradient_bad_stop(self):
+        errs = validate_content_payload("text", {"bg_gradient": {"stops": ["blue", "#fff"]}})
+        assert any("hex color" in e for e in errs)
+
+    def test_media_url_external_ok(self):
+        assert validate_content_payload("media", {"media_url": "https://x.com/a.jpg", "media_type": "image"}) == []
+
+    def test_media_url_must_be_http(self):
+        errs = validate_content_payload("media", {"media_url": "ftp://x/a"})
+        assert any("http(s) URL" in e for e in errs)
+
+
 class TestMakeQrPng:
     def test_generates_png_bytes(self):
         png = make_qr_png("https://example.com/menu")
