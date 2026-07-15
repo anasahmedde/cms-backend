@@ -857,6 +857,35 @@ def get_device_id_by_mobile(conn, mobile_id: str) -> Optional[int]:
         return int(row[0]) if row else None
 
 
+def authorize_device(cur, mobile_id: str, user: Dict) -> Tuple[List[int], int]:
+    """Authorize a DASHBOARD caller to act on a device identified by mobile_id.
+
+    Returns (device_ids newest-first, device_tenant_id). Because mobile_id is NOT
+    unique across tenants, a company user is scoped to their own tenant (they can
+    never see or touch another tenant's row); a platform user with no active tenant
+    may act on any. Raises 404 when the caller has no accessible device with that
+    mobile_id. This is the guard that closes the cross-tenant IDOR on the device
+    command endpoints — do NOT use it on device-facing routes (heartbeat, etc.),
+    which are unauthenticated by design.
+    """
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
+    is_platform = user.get("user_type") == "platform"
+    if is_platform and not tenant_id:
+        cur.execute(
+            "SELECT id, tenant_id FROM public.device WHERE mobile_id = %s ORDER BY id DESC;",
+            (mobile_id,),
+        )
+    else:
+        cur.execute(
+            "SELECT id, tenant_id FROM public.device WHERE mobile_id = %s AND tenant_id = %s ORDER BY id DESC;",
+            (mobile_id, tenant_id),
+        )
+    rows = cur.fetchall()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Device not found")
+    return [int(r[0]) for r in rows], rows[0][1]
+
+
 def fetch_link_by_id(conn, link_id: int) -> Optional[Dict[str, Any]]:
     with conn.cursor() as cur:
         cur.execute(READ_JOIN_SQL + " WHERE l.id = %s;", (link_id,))
@@ -3100,15 +3129,13 @@ def get_device_resolution(mobile_id: str):
 
 
 @app.post("/device/{mobile_id}/resolution")
-def set_device_resolution(mobile_id: str, resolution: str = Query(None)):
+def set_device_resolution(mobile_id: str, resolution: str = Query(None), user: Dict = Depends(get_current_user)):
     """Set device screen resolution."""
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("UPDATE public.device SET resolution = %s WHERE mobile_id = %s RETURNING id;", (resolution, mobile_id))
-                row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail="Device not found")
+                ids, _ = authorize_device(cur, mobile_id, user)
+                cur.execute("UPDATE public.device SET resolution = %s WHERE id = ANY(%s::bigint[]);", (resolution, ids))
                 conn.commit()
                 return {"mobile_id": mobile_id, "resolution": resolution}
         except HTTPException:
@@ -3120,17 +3147,16 @@ def set_device_resolution(mobile_id: str, resolution: str = Query(None)):
 
 
 @app.post("/device/{mobile_id}/name")
-def set_device_name(mobile_id: str, body: DeviceNameUpdateIn):
+def set_device_name(mobile_id: str, body: DeviceNameUpdateIn, user: Dict = Depends(get_current_user)):
     """Set/update device friendly name."""
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("UPDATE public.device SET device_name = %s WHERE mobile_id = %s RETURNING id, device_name;", (body.device_name, mobile_id))
+                ids, _ = authorize_device(cur, mobile_id, user)
+                cur.execute("UPDATE public.device SET device_name = %s WHERE id = ANY(%s::bigint[]) RETURNING device_name;", (body.device_name, ids))
                 row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail="Device not found")
                 conn.commit()
-                return {"mobile_id": mobile_id, "device_name": row[1]}
+                return {"mobile_id": mobile_id, "device_name": row[0] if row else body.device_name}
         except HTTPException:
             conn.rollback()
             raise
@@ -3168,23 +3194,16 @@ def get_ble_device_id(mobile_id: str):
 
 
 @app.post("/device/{mobile_id}/ble-id")
-def set_ble_device_id(mobile_id: str, body: BleDeviceIdIn):
+def set_ble_device_id(mobile_id: str, body: BleDeviceIdIn, user: Dict = Depends(get_current_user)):
     """Set or clear the BLE pairing ID for a device. Pass null/empty to disable auth.
     The ID must be unique within the tenant — two devices cannot share the same ESP32 ID."""
     new_id = (body.ble_device_id or "").strip() or None
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                # Resolve the target device's tenant so uniqueness is checked within it
-                cur.execute(
-                    "SELECT tenant_id FROM public.device WHERE mobile_id = %s ORDER BY id DESC LIMIT 1;",
-                    (mobile_id,)
-                )
-                trow = cur.fetchone()
-                if not trow:
-                    conn.rollback()
-                    raise HTTPException(status_code=404, detail="Device not found")
-                tenant_id = trow[0]
+                # Authorize the caller for this device; use the device's own tenant
+                # so uniqueness is still checked within it.
+                ids, tenant_id = authorize_device(cur, mobile_id, user)
 
                 # Reject duplicates (only when assigning a non-empty ID)
                 if new_id is not None:
@@ -3204,13 +3223,9 @@ def set_ble_device_id(mobile_id: str, body: BleDeviceIdIn):
                         )
 
                 cur.execute(
-                    "UPDATE public.device SET ble_device_id = %s WHERE mobile_id = %s RETURNING id;",
-                    (new_id, mobile_id)
+                    "UPDATE public.device SET ble_device_id = %s WHERE id = ANY(%s::bigint[]);",
+                    (new_id, ids)
                 )
-                row = cur.fetchone()
-                if not row:
-                    conn.rollback()
-                    raise HTTPException(status_code=404, detail="Device not found")
                 conn.commit()
                 return {"mobile_id": mobile_id, "ble_device_id": new_id}
         except HTTPException:
@@ -3603,9 +3618,10 @@ def set_device_mute(mobile_id: str, body: DeviceMuteIn, user: Dict = Depends(get
     """Mute or unmute a device. The Android app picks up the change on the next heartbeat (~30 s)."""
     with pg_conn() as conn:
         with conn.cursor() as cur:
+            ids, _ = authorize_device(cur, mobile_id, user)
             cur.execute(
-                "UPDATE public.device SET is_muted = %s, updated_at = NOW() WHERE mobile_id = %s;",
-                (body.is_muted, mobile_id)
+                "UPDATE public.device SET is_muted = %s, updated_at = NOW() WHERE id = ANY(%s::bigint[]);",
+                (body.is_muted, ids)
             )
         conn.commit()
     return {"mobile_id": mobile_id, "is_muted": body.is_muted}
@@ -5952,7 +5968,7 @@ def get_device_active_status(mobile_id: str):
 
 
 @app.post("/device/{mobile_id}/active-status")
-def set_device_active_status(mobile_id: str, body: DeviceActiveStatusIn):
+def set_device_active_status(mobile_id: str, body: DeviceActiveStatusIn, user: Dict = Depends(get_current_user)):
     """
     Set the active status of a device.
     - When is_active = False: Device will show "Not Enrolled" screen
@@ -5961,18 +5977,10 @@ def set_device_active_status(mobile_id: str, body: DeviceActiveStatusIn):
     try:
         with pg_conn() as conn:
             with conn.cursor() as cur:
-                # Check device exists
-                cur.execute("""
-                    SELECT id FROM public.device 
-                    WHERE mobile_id = %s 
-                    ORDER BY id DESC LIMIT 1;
-                """, (mobile_id,))
-                row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail=f"Device not found: {mobile_id}")
-                
-                did = row[0]
-                
+                # Authorize the caller for this device (tenant-scoped)
+                ids, _ = authorize_device(cur, mobile_id, user)
+                did = ids[0]
+
                 # Update is_active status and set needs_refresh to trigger app restart
                 cur.execute("""
                     UPDATE public.device 
@@ -5995,7 +6003,7 @@ def set_device_active_status(mobile_id: str, body: DeviceActiveStatusIn):
 
 
 @app.post("/device/{mobile_id}/refresh")
-def trigger_device_refresh(mobile_id: str):
+def trigger_device_refresh(mobile_id: str, user: Dict = Depends(get_current_user)):
     """
     Trigger a refresh/restart of the device app.
     The device will restart on next heartbeat.
@@ -6003,18 +6011,10 @@ def trigger_device_refresh(mobile_id: str):
     try:
         with pg_conn() as conn:
             with conn.cursor() as cur:
-                # Check device exists
-                cur.execute("""
-                    SELECT id FROM public.device 
-                    WHERE mobile_id = %s 
-                    ORDER BY id DESC LIMIT 1;
-                """, (mobile_id,))
-                row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail=f"Device not found: {mobile_id}")
-                
-                did = row[0]
-                
+                # Authorize the caller for this device (tenant-scoped)
+                ids, _ = authorize_device(cur, mobile_id, user)
+                did = ids[0]
+
                 # Set needs_refresh flag
                 cur.execute("""
                     UPDATE public.device 
@@ -6035,7 +6035,7 @@ def trigger_device_refresh(mobile_id: str):
 
 
 @app.post("/device/{mobile_id}/unassign-from-group")
-def unassign_device_from_group(mobile_id: str):
+def unassign_device_from_group(mobile_id: str, user: Dict = Depends(get_current_user)):
     """
     Unassign a device from its current group.
     This will:
@@ -6047,18 +6047,10 @@ def unassign_device_from_group(mobile_id: str):
     try:
         with pg_conn() as conn:
             with conn.cursor() as cur:
-                # Get device ID
-                cur.execute("""
-                    SELECT id FROM public.device 
-                    WHERE mobile_id = %s 
-                    ORDER BY id DESC LIMIT 1;
-                """, (mobile_id,))
-                row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail=f"Device not found: {mobile_id}")
-                
-                did = row[0]
-                
+                # Authorize the caller for this device (tenant-scoped)
+                ids, _ = authorize_device(cur, mobile_id, user)
+                did = ids[0]
+
                 # Get current group info before unassigning
                 cur.execute("""
                     SELECT g.gname 
@@ -6419,18 +6411,24 @@ def standalone_list_devices(
     return {"items": items, "total": total, "count": len(items), "limit": limit, "offset": offset, "query": q}
 
 @app.put("/device/{mobile_id}")
-def standalone_update_device(mobile_id: str, patch: StandaloneDeviceUpdate):
+def standalone_update_device(mobile_id: str, patch: StandaloneDeviceUpdate, user: Dict = Depends(get_current_user)):
     sets, params = [], []
     if patch.mobile_id is not None:
         sets.append("mobile_id = %s"); params.append(patch.mobile_id)
     if patch.download_status is not None:
         sets.append("download_status = %s"); params.append(patch.download_status)
-    if not sets:
-        return standalone_get_device(mobile_id)
-    params.append(mobile_id)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"UPDATE public.device SET {', '.join(sets)} WHERE mobile_id = %s RETURNING id, mobile_id, download_status, created_at, updated_at;", params)
+            # Authorize first (tenant-scoped) so even a no-op PUT can't read another
+            # tenant's device metadata by mobile_id collision.
+            ids, _ = authorize_device(cur, mobile_id, user)
+            if not sets:
+                cur.execute("SELECT id, mobile_id, download_status, created_at, updated_at FROM public.device WHERE id = ANY(%s::bigint[]) ORDER BY id DESC LIMIT 1;", (ids,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="Device not found")
+                return {"id": row[0], "mobile_id": row[1], "download_status": row[2], "created_at": row[3], "updated_at": row[4]}
+            cur.execute(f"UPDATE public.device SET {', '.join(sets)} WHERE id = ANY(%s::bigint[]) RETURNING id, mobile_id, download_status, created_at, updated_at;", params + [ids])
             row = cur.fetchone()
         conn.commit()
     if not row:
@@ -6438,14 +6436,13 @@ def standalone_update_device(mobile_id: str, patch: StandaloneDeviceUpdate):
     return {"message": "Device updated", "item": {"id": row[0], "mobile_id": row[1], "download_status": row[2], "created_at": row[3], "updated_at": row[4]}}
 
 @app.delete("/device/{mobile_id}")
-def standalone_delete_device(mobile_id: str, force: bool = Query(False)):
+def standalone_delete_device(mobile_id: str, force: bool = Query(False), user: Dict = Depends(get_current_user)):
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM public.device WHERE mobile_id = %s ORDER BY id DESC;", (mobile_id,))
-                device_ids = [r[0] for r in cur.fetchall()]
-                if not device_ids:
-                    raise HTTPException(status_code=404, detail="Device not found")
+                # Tenant-scoped: only ever delete the caller's own device rows
+                # (mobile_id is not unique across tenants — never cross-tenant delete).
+                device_ids, _ = authorize_device(cur, mobile_id, user)
 
                 # Check all FK references
                 linked = {}
@@ -6489,7 +6486,10 @@ def standalone_delete_device(mobile_id: str, force: bool = Query(False)):
                     except Exception:
                         cur.execute(f"ROLLBACK TO SAVEPOINT sp_{label}")
 
-                cur.execute("DELETE FROM public.device WHERE mobile_id = %s RETURNING id;", (mobile_id,))
+                # Delete ONLY the caller's own tenant-scoped rows (mobile_id is not
+                # unique across tenants — keying on it here would cross-tenant delete
+                # and CASCADE-wipe another tenant's device data).
+                cur.execute("DELETE FROM public.device WHERE id = ANY(%s::bigint[]) RETURNING id;", (device_ids,))
                 deleted = cur.fetchall()
             conn.commit()
             return {"deleted_count": len(deleted), "unlinked": unlinked}
@@ -6976,7 +6976,7 @@ def standalone_delete_video(video_name: str, force: bool = Query(False)):
 # ============================================================================
 
 @app.post("/device/{mobile_id}/wipe-videos", response_model=DeviceWipeVideosOut)
-def wipe_all_videos_from_device(mobile_id: str):
+def wipe_all_videos_from_device(mobile_id: str, user: Dict = Depends(get_current_user)):
     """
     Send a command to the device to delete all locally stored video files.
     This does NOT delete videos from S3 or remove links from the database.
@@ -6984,10 +6984,10 @@ def wipe_all_videos_from_device(mobile_id: str):
     """
     with pg_conn() as conn:
         try:
-            did = get_device_id_by_mobile(conn, mobile_id)
-            if did is None:
-                raise HTTPException(status_code=404, detail=f"Device not found: {mobile_id}")
-            
+            with conn.cursor() as ac:
+                ids, _ = authorize_device(ac, mobile_id, user)
+            did = ids[0]
+
             with conn.cursor() as cur:
                 # Only set wipe flag - do NOT delete any links from database
                 # The videos remain on S3 and in the database, only device storage is cleared
@@ -7028,9 +7028,9 @@ def wipe_all_videos_from_device(mobile_id: str):
 
 
 @app.delete("/device/{mobile_id}/wipe-videos")
-def wipe_all_videos_from_device_delete(mobile_id: str):
+def wipe_all_videos_from_device_delete(mobile_id: str, user: Dict = Depends(get_current_user)):
     """DELETE method alias for wipe-videos endpoint."""
-    return wipe_all_videos_from_device(mobile_id)
+    return wipe_all_videos_from_device(mobile_id, user)
 
 
 # ============================================================================
