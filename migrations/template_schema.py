@@ -36,6 +36,25 @@ def ensure_template_schema(conn):
                 updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
         """)
+        # owner_tenant_id: NULL = platform-owned (shared, edited in the platform
+        # designer). Non-NULL = a company-private copy a company admin forked and
+        # edits in the company designer. Company writes are ALWAYS scoped to a row
+        # they own, so one tenant can never mutate another tenant's (or the shared
+        # platform) template.
+        cur.execute("""
+            ALTER TABLE public.screen_template
+            ADD COLUMN IF NOT EXISTS owner_tenant_id BIGINT
+                REFERENCES public.company(id) ON DELETE CASCADE;
+        """)
+        # PARTIAL UNIQUE: at most one company-private template per tenant. This is
+        # what makes the fork-on-write path safe under concurrency — two racing
+        # first-writes can't create two forks (the second INSERT conflicts and the
+        # code re-reads the winner). NULL (platform-owned) rows are unconstrained.
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_screen_template_owner
+            ON public.screen_template (owner_tenant_id)
+            WHERE owner_tenant_id IS NOT NULL;
+        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS public.screen_template_version (
                 id            BIGSERIAL PRIMARY KEY,

@@ -30,6 +30,9 @@ Route map (mounted WITHOUT prefix; full paths declared here):
     PUT    /platform/companies/{cid}/template        link/unlink {template_id|null}
   Company dashboard (require_tenant_context):
     GET    /company/template                                    linked template + zones
+    GET    /company/template/design                             company's own editable template (fork-on-write)
+    PUT    /company/template/design                             save company template (forks on first write)
+    POST   /company/template/design/publish                     publish + re-link the company to its own copy
     GET    /company/template-content                            company-wide default content
     PUT    /company/template-content/{zone_key}                 upsert payload (scope=company)
     POST   /company/template-content/{zone_key}/media           upload image/video
@@ -666,6 +669,7 @@ def list_templates(status: Optional[str] = None, ctx: TenantContext = Depends(re
                        (SELECT COUNT(*) FROM public.company c WHERE c.template_id = t.id) AS linked
                 FROM public.screen_template t
                 WHERE (%s::text IS NULL OR status = %s)
+                  AND owner_tenant_id IS NULL   -- hide company-forked private copies
                 ORDER BY updated_at DESC;
             """, (status, status))
             items = []
@@ -866,12 +870,18 @@ def link_company_template(cid: int, body: CompanyTemplateLinkIn,
             if not company:
                 raise HTTPException(status_code=404, detail="Company not found")
             if body.template_id is not None:
-                cur.execute("SELECT status FROM public.screen_template WHERE id = %s;", (body.template_id,))
+                cur.execute("SELECT status, owner_tenant_id FROM public.screen_template WHERE id = %s;",
+                            (body.template_id,))
                 trow = cur.fetchone()
                 if not trow:
                     raise HTTPException(status_code=404, detail="Template not found")
                 if trow[0] != "published":
                     raise HTTPException(status_code=422, detail="Only published templates can be linked")
+                # A company-owned (forked) template may only be linked back to the
+                # company that owns it — never shared to another tenant.
+                if trow[1] is not None and trow[1] != cid:
+                    raise HTTPException(status_code=422,
+                                        detail="That template is a company-private copy and can't be linked to another company")
             cur.execute("""
                 UPDATE public.company
                 SET template_id = %s,
@@ -938,6 +948,170 @@ def company_template(ctx: TenantContext = Depends(require_tenant_context)):
         return {"template": None}
     content_zones = [z for z in tpl["zones"] if (z.get("binding") or {}).get("source") == "content"]
     return {"template": tpl, "content_zones": content_zones}
+
+
+# ── Company-scoped designer ────────────────────────────────────────────────
+# A company admin can open the SAME designer for their own template. Editing is
+# always done on a company-private copy (owner_tenant_id = the tenant): on the
+# first write we fork the company's currently-linked platform template into an
+# owned draft. The company's live screens keep using their linked template until
+# the company publishes the fork — at which point we re-link them. This keeps
+# every company's layout independent and can never touch the shared platform
+# template or another tenant's copy.
+
+def _require_company_settings(ctx: TenantContext) -> int:
+    """Gate + resolve the active tenant for company-designer writes."""
+    if not ctx.has_permission("manage_company_settings"):
+        raise HTTPException(status_code=403, detail="Permission denied: manage_company_settings")
+    if ctx.active_tenant_id is None:
+        raise HTTPException(status_code=400, detail="No company context")
+    return ctx.active_tenant_id
+
+
+def _company_owned_template(cur, tenant_id: int) -> Optional[Dict]:
+    """The tenant's own editable template (draft or published), or None."""
+    cur.execute(f"""
+        SELECT {TEMPLATE_COLS} FROM public.screen_template
+        WHERE owner_tenant_id = %s ORDER BY id DESC LIMIT 1;
+    """, (tenant_id,))
+    row = cur.fetchone()
+    return _template_row_to_dict(row) if row else None
+
+
+def _fork_company_template(conn, cur, tenant_id: int, user_id: Optional[int]) -> Dict:
+    """Return the tenant-OWNED editable template, forking it from the company's
+    currently-linked published template on first use. Idempotent: a tenant has at
+    most one owned template. Does NOT re-link the company (that happens on publish),
+    so live screens are untouched until the company publishes."""
+    owned = _company_owned_template(cur, tenant_id)
+    if owned:
+        return owned
+    src = _tenant_template(cur, tenant_id)
+    if not src:
+        raise HTTPException(
+            status_code=409,
+            detail="No template is linked to your company yet — ask your platform administrator to link one before editing.")
+    # Conflict-safe against a concurrent first-write: the partial-unique index on
+    # owner_tenant_id lets the loser's INSERT no-op; it then re-reads the winner's
+    # fork. Guarantees exactly one owned template per tenant (no orphan / lost edits).
+    cur.execute(f"""
+        INSERT INTO public.screen_template
+            (name, description, orientation, design_width, design_height, zones,
+             status, version, owner_tenant_id, created_by)
+        VALUES (%s, %s, %s, %s, %s, %s::jsonb, 'draft', 0, %s, %s)
+        ON CONFLICT (owner_tenant_id) WHERE owner_tenant_id IS NOT NULL DO NOTHING
+        RETURNING {TEMPLATE_COLS};
+    """, (src["name"], src["description"], src["orientation"], src["design_width"],
+          src["design_height"], json.dumps(src["zones"]), tenant_id, user_id))
+    row = cur.fetchone()
+    if row is None:
+        existing = _company_owned_template(cur, tenant_id)
+        if existing:
+            return existing
+        raise HTTPException(status_code=500, detail="Could not create an editable template copy")
+    fork = _template_row_to_dict(row)
+    log_audit(conn, tenant_id, user_id, "template.company_fork", "screen_template", fork["id"],
+              details={"source_template_id": src["id"]})
+    return fork
+
+
+@router.get("/company/template/design")
+def company_template_design(ctx: TenantContext = Depends(require_tenant_context)):
+    """The template a company admin edits in the designer: their owned copy if one
+    exists, otherwise the linked platform template as a read-only starting point."""
+    tenant_id = _require_company_settings(ctx)
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            owned = _company_owned_template(cur, tenant_id)
+            if owned:
+                return {"template": owned, "owned": True}
+            linked = _tenant_template(cur, tenant_id)
+            return {"template": linked, "owned": False}
+
+
+@router.put("/company/template/design")
+def update_company_template_design(body: TemplateUpdateIn,
+                                   ctx: TenantContext = Depends(require_tenant_context)):
+    """Save the company's own template (forking on first write). Mirrors the
+    platform PUT shape so the shared designer component is drop-in."""
+    tenant_id = _require_company_settings(ctx)
+    if body.zones is not None:
+        errors = validate_zones(body.zones)
+        if errors:
+            raise HTTPException(status_code=422, detail={"zone_errors": errors})
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            tpl = _fork_company_template(conn, cur, tenant_id, ctx.user_id)
+            fields, values = [], []
+            for col in ("name", "description", "orientation", "design_width", "design_height"):
+                v = getattr(body, col)
+                if v is not None:
+                    fields.append(f"{col} = %s")
+                    values.append(v)
+            if body.zones is not None:
+                fields.append("zones = %s::jsonb")
+                values.append(json.dumps(body.zones))
+            if fields:
+                values.extend([tpl["id"], tenant_id])
+                # Double-scope: id AND owner — never touch a row we don't own.
+                cur.execute(f"""
+                    UPDATE public.screen_template
+                    SET {", ".join(fields)}, updated_at = NOW()
+                    WHERE id = %s AND owner_tenant_id = %s
+                    RETURNING {TEMPLATE_COLS};
+                """, values)
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="Editable template not found")
+                tpl = _template_row_to_dict(row)
+                log_audit(conn, tenant_id, ctx.user_id, "template.company_update",
+                          "screen_template", tpl["id"])
+        conn.commit()
+    tpl["owned"] = True
+    return tpl
+
+
+@router.post("/company/template/design/publish")
+def publish_company_template_design(ctx: TenantContext = Depends(require_tenant_context)):
+    """Publish the company's own template and (re)link the company to it, so its
+    screens switch to the company-edited layout on their next heartbeat."""
+    tenant_id = _require_company_settings(ctx)
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            tpl = _fork_company_template(conn, cur, tenant_id, ctx.user_id)
+            if not tpl["zones"]:
+                raise HTTPException(status_code=422, detail="Cannot publish a template with no zones")
+            errors = validate_zones(tpl["zones"])
+            if errors:
+                raise HTTPException(status_code=422, detail={"zone_errors": errors})
+            new_version = tpl["version"] + 1
+            cur.execute(f"""
+                UPDATE public.screen_template
+                SET status = 'published', version = %s, published_at = NOW(), updated_at = NOW()
+                WHERE id = %s AND owner_tenant_id = %s
+                RETURNING {TEMPLATE_COLS};
+            """, (new_version, tpl["id"], tenant_id))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Editable template not found")
+            published = _template_row_to_dict(row)
+            cur.execute("""
+                INSERT INTO public.screen_template_version
+                    (template_id, version, orientation, design_width, design_height, zones, published_by)
+                VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s);
+            """, (tpl["id"], new_version, published["orientation"], published["design_width"],
+                  published["design_height"], json.dumps(published["zones"]), ctx.user_id))
+            cur.execute("""
+                UPDATE public.company
+                SET template_id = %s, template_linked_at = NOW(), updated_at = NOW()
+                WHERE id = %s;
+            """, (tpl["id"], tenant_id))
+            log_audit(conn, tenant_id, ctx.user_id, "template.company_publish",
+                      "screen_template", tpl["id"], details={"version": new_version})
+        conn.commit()
+    published["companies"] = [{"id": tenant_id, "name": ctx.company_name}]
+    published["owned"] = True
+    return published
 
 
 def _get_scope_content(cur, tenant_id: int, scope: str, target_col: Optional[str], target_id: Optional[int]):
