@@ -511,14 +511,19 @@ def _canonical_s3_ref(link: str) -> str:
     return f"s3://{bucket}/{key}" if bucket and key else link
 
 
-def presign_content(uri: str, expires: int = CONTENT_PRESIGN_EXPIRES) -> Optional[str]:
+def presign_content(uri: str, expires: int = CONTENT_PRESIGN_EXPIRES,
+                    response_content_type: Optional[str] = None) -> Optional[str]:
     bucket, key = _s3_bucket_key(uri)
     if not bucket or not key:
         return None
+    params = {"Bucket": bucket, "Key": key}
+    # Override the object's stored Content-Type on the response — repairs images
+    # that were uploaded to the video stack with a video/mp4 content-type (they'd
+    # otherwise fail to render in a browser <img>).
+    if response_content_type:
+        params["ResponseContentType"] = response_content_type
     try:
-        return _s3_client().generate_presigned_url(
-            "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires
-        )
+        return _s3_client().generate_presigned_url("get_object", Params=params, ExpiresIn=expires)
     except Exception as e:
         logger.error("presign failed for %s: %s", uri, e)
         return None
@@ -1018,6 +1023,17 @@ def company_template_preview(scope: str = "company",
                 device_id if scope == "device" else -1)
             entity = {"company.name": ctx.company_name, "shop.name": shop_name, "device.name": device_name}
     zones = [resolve_zone(z, entity, content, presign_content) for z in tpl["zones"]]
+    # Repair browser rendering: an image uploaded to the video stack carries a
+    # video/mp4 content-type, which a preview <img> refuses. Re-presign S3-backed
+    # image media with an explicit image content-type so the preview shows it.
+    for rz in zones:
+        rc = rz.get("content") or {}
+        if rz.get("type") == "media" and rc.get("media_type") == "image" and rc.get("media_url"):
+            s3ref = (content.get(rz.get("key")) or {}).get("media_s3")
+            if s3ref:
+                fixed = presign_content(s3ref, response_content_type="image/jpeg")
+                if fixed:
+                    rc["media_url"] = fixed
     return {
         "template": {"name": tpl["name"], "version": tpl["version"], "orientation": tpl["orientation"],
                      "design_width": tpl["design_width"], "design_height": tpl["design_height"]},
