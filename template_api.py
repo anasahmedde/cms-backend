@@ -479,9 +479,41 @@ def _parse_s3_uri(uri: str):
     return bucket or None, key or None
 
 
+def _s3_bucket_key(link: str):
+    """Parse an S3 reference stored in ANY historical form → (bucket, key).
+    Accepts s3://bucket/key, an S3 https URL (virtual-hosted or path-style), or a
+    bare key (assumes S3_BUCKET). Mirrors the tolerance the rest of the app already
+    has (video_service._parse_s3_link) so a media-library item's s3_link resolves
+    no matter how it was stored. Returns (None, None) for a non-S3 URL (that belongs
+    in media_url, not media_s3)."""
+    s = (link or "").strip()
+    if not s:
+        return None, None
+    if s.startswith("s3://"):
+        return _parse_s3_uri(s)
+    if s.startswith(("http://", "https://")):
+        from urllib.parse import urlparse
+        u = urlparse(s)
+        host, path = u.netloc, (u.path or "").lstrip("/")
+        if "amazonaws" not in host:        # not an S3 URL — don't guess a bucket
+            return None, None
+        if ".s3" in host:                  # virtual-hosted: bucket.s3.<region>.amazonaws.com/key
+            return (host.split(".s3", 1)[0] or None), (path or None)
+        first, _, rest = path.partition("/")  # path-style: s3.<region>.amazonaws.com/bucket/key
+        return (first or None), (rest or None)
+    return S3_BUCKET, s                     # bare key
+
+
+def _canonical_s3_ref(link: str) -> str:
+    """Normalize any S3 reference to canonical s3://bucket/key; leave it unchanged
+    if it isn't parseable as S3 (so validation still rejects a genuine non-S3 value)."""
+    bucket, key = _s3_bucket_key(link)
+    return f"s3://{bucket}/{key}" if bucket and key else link
+
+
 def presign_content(uri: str, expires: int = CONTENT_PRESIGN_EXPIRES) -> Optional[str]:
-    bucket, key = _parse_s3_uri(uri)
-    if not bucket:
+    bucket, key = _s3_bucket_key(uri)
+    if not bucket or not key:
         return None
     try:
         return _s3_client().generate_presigned_url(
@@ -1137,6 +1169,14 @@ def _get_scope_content(cur, tenant_id: int, scope: str, target_col: Optional[str
 def _upsert_zone_content(conn, cur, tenant_id: int, zone: Dict, zone_key: str, scope: str,
                          shop_id: Optional[int], device_id: Optional[int],
                          payload: Dict, user_id: Optional[int]) -> Dict:
+    # A media-library item's s3_link may be stored as s3://, an S3 https URL, or a
+    # bare key. Canonicalize the S3 refs the user picked so a library image/video
+    # both passes validation (strict s3://) and resolves to a presigned URL on the
+    # player — the "library pick doesn't show on the device" bug.
+    for _f in ("media_s3", "bg_image_s3"):
+        v = payload.get(_f)
+        if isinstance(v, str) and v and not v.startswith("s3://"):
+            payload[_f] = _canonical_s3_ref(v)
     errors = validate_content_payload(zone["type"], payload)
     if errors:
         raise HTTPException(status_code=422, detail={"payload_errors": errors})

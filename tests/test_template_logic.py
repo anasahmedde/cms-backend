@@ -7,6 +7,8 @@ from template_api import (
     resolve_zone,
     validate_content_payload,
     validate_zones,
+    _canonical_s3_ref,
+    _s3_bucket_key,
 )
 
 # The whiteboard template: 15% header (shop name), 70% media, bottom 15%
@@ -276,3 +278,45 @@ class TestMakeQrPng:
         png = make_qr_png("https://example.com/menu")
         assert png[:8] == b"\x89PNG\r\n\x1a\n"
         assert len(png) > 200
+
+
+class TestS3RefNormalization:
+    """A media-library item's s3_link can be stored as s3://, an S3 https URL, or
+    a bare key. All must normalize to canonical s3://bucket/key so a library image
+    both saves and resolves on the player. A genuine non-S3 URL must NOT normalize."""
+
+    def test_s3_uri_unchanged(self):
+        assert _canonical_s3_ref("s3://digix-videos/ads/promo.jpg") == "s3://digix-videos/ads/promo.jpg"
+
+    def test_virtual_hosted_https(self):
+        assert _canonical_s3_ref(
+            "https://digix-videos.s3.us-east-2.amazonaws.com/ads/promo.jpg"
+        ) == "s3://digix-videos/ads/promo.jpg"
+
+    def test_path_style_https(self):
+        assert _canonical_s3_ref(
+            "https://s3.us-east-2.amazonaws.com/digix-videos/ads/promo.jpg"
+        ) == "s3://digix-videos/ads/promo.jpg"
+
+    def test_bare_key(self):
+        assert _canonical_s3_ref("ads/promo.jpg").endswith("/ads/promo.jpg")
+        assert _canonical_s3_ref("ads/promo.jpg").startswith("s3://")
+
+    def test_non_s3_url_left_alone(self):
+        # An external CDN URL is not an S3 object — leave it so validation rejects
+        # it (it belongs in media_url, not media_s3).
+        assert _canonical_s3_ref("https://cdn.example.com/promo.jpg") == "https://cdn.example.com/promo.jpg"
+        assert _s3_bucket_key("https://cdn.example.com/promo.jpg") == (None, None)
+
+    def test_normalized_ref_passes_validation(self):
+        payload = {"media_s3": _canonical_s3_ref(
+            "https://digix-videos.s3.amazonaws.com/ads/promo.jpg"), "media_type": "image"}
+        assert validate_content_payload("media", payload) == []
+
+    def test_media_zone_resolves_library_image_to_url(self):
+        zone = {"key": "media", "type": "media", "x": 0, "y": 0, "w": 30, "h": 30, "z": 1,
+                "binding": {"source": "content"}}
+        payload = {"media_s3": "s3://digix-videos/ads/promo.jpg", "media_type": "image"}
+        out = resolve_zone(zone, {}, {"media": payload}, lambda u: "https://signed/" + u)
+        assert out["content"]["media_url"].startswith("https://signed/")
+        assert out["content"]["media_type"] == "image"
