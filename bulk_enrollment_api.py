@@ -29,6 +29,7 @@ the normal group pipeline / template playlist.
 """
 import csv
 import io
+import json
 import logging
 import re
 import secrets
@@ -323,6 +324,80 @@ def _parse_row_content(cur, tenant_id, content_cols, raw_content):
     return payloads, errors
 
 
+def _content_summary(payload) -> str:
+    """Short human-readable value for a content payload (for the change preview)."""
+    if not payload:
+        return ""
+    if payload.get("text"):
+        return (payload["text"][:40])
+    if payload.get("qr_link"):
+        return payload["qr_link"]
+    if payload.get("media_url"):
+        return payload["media_url"].split("?")[0].split("/")[-1]
+    if payload.get("media_s3"):
+        return payload["media_s3"].split("/")[-1]
+    return "set"
+
+
+def _current_states(cur, tenant_id: int, mobile_ids) -> Dict[str, Dict[str, Any]]:
+    """{mobile_id: {id, name, shop, group, content:{zone_key: payload}}} for existing
+    devices in this tenant — the baseline a re-upload is diffed against."""
+    out: Dict[str, Dict[str, Any]] = {}
+    ids = [m for m in (mobile_ids or set()) if m]
+    if not ids:
+        return out
+    cur.execute("""
+        SELECT d.id, d.mobile_id, d.device_name, s.shop_name, g.gname
+        FROM public.device d
+        LEFT JOIN public.device_assignment da ON da.did = d.id
+        LEFT JOIN public.shop s ON s.id = da.sid
+        LEFT JOIN public."group" g ON g.id = da.gid
+        WHERE d.tenant_id = %s AND d.mobile_id = ANY(%s);
+    """, (tenant_id, ids))
+    did_to_mid: Dict[int, str] = {}
+    for did, mid, name, shop, grp in cur.fetchall():
+        out[mid] = {"id": did, "name": name or "", "shop": shop or "", "group": grp or "", "content": {}}
+        did_to_mid[did] = mid
+    if did_to_mid:
+        cur.execute("""
+            SELECT device_id, zone_key, payload FROM public.template_zone_content
+            WHERE tenant_id = %s AND scope = 'device' AND device_id = ANY(%s);
+        """, (tenant_id, list(did_to_mid.keys())))
+        for did, zk, payload in cur.fetchall():
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            mid = did_to_mid.get(did)
+            if mid:
+                out[mid]["content"][zk] = payload
+    return out
+
+
+def _row_changes(device_name: str, shop_name: str, group_name: str,
+                 row_content: Dict, current: Dict) -> List[Dict[str, str]]:
+    """What a re-upload row changes on an EXISTING device: [{field, from, to}].
+    A blank cell means 'leave as-is' — only a non-blank value that differs counts."""
+    changes: List[Dict[str, str]] = []
+
+    def diff(field, new_val, cur_val):
+        if new_val and new_val != (cur_val or ""):
+            changes.append({"field": field, "from": cur_val or "", "to": new_val})
+
+    diff("name", device_name, current.get("name"))
+    diff("location", shop_name, current.get("shop"))
+    diff("group", group_name, current.get("group"))
+    cur_content = current.get("content") or {}
+    for zk, payload in (row_content or {}).items():
+        cur_p = cur_content.get(zk) or {}
+        # Subset comparison: only the fields the sheet sets. The stored payload may
+        # carry extra server-added keys (e.g. qr_generated_s3) that the sheet never
+        # provides — a full-dict compare would flag every QR/media as changed.
+        if payload and any(cur_p.get(k) != v for k, v in payload.items()):
+            changes.append({"field": f"content.{zk}",
+                            "from": _content_summary(cur_p),
+                            "to": _content_summary(payload)})
+    return changes
+
+
 def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_devices: int,
                   mobile_ids_this_tenant: set, mobile_ids_other_tenant: set,
                   content_cols=None, cur=None, tenant_id=None) -> Dict[str, Any]:
@@ -334,6 +409,11 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
     with_id = 0
     pending = 0
     skipped = 0          # already exist in this tenant (idempotent re-run)
+    updated = 0          # existing devices with field/content changes
+    unchanged = 0        # existing devices the sheet leaves as-is
+    # Baseline for the change preview (existing devices only).
+    current_states = (_current_states(cur, tenant_id, mobile_ids_this_tenant)
+                      if (cur is not None and tenant_id is not None) else {})
 
     normalized: List[Dict[str, Any]] = []
     for i, rec in enumerate(rows):
@@ -363,12 +443,22 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
             row_errors.extend(content_errs)
 
         will = "error"
+        row_changes: List[Dict[str, str]] = []
         if not row_errors:
             if dev_id:
                 seen_ids[dev_id] = rownum
                 if dev_id in mobile_ids_this_tenant:
-                    will = "skip"      # already enrolled in this tenant
-                    skipped += 1
+                    # Existing screen — diff the row against its current state so the
+                    # operator sees exactly what a re-upload will change (and only that).
+                    row_changes = _row_changes(
+                        rec.get("device_name", "").strip(), rec.get("shop_name", "").strip(),
+                        rec.get("group_name", "").strip(), row_content, current_states.get(dev_id, {}))
+                    if row_changes:
+                        will = "update"
+                        updated += 1
+                    else:
+                        will = "unchanged"
+                        unchanged += 1
                 else:
                     will = "create"
                     valid_new += 1
@@ -394,6 +484,7 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
             "resolution": res,
             "action": will,
             "content": row_content,
+            "changes": row_changes,
         })
 
     after = existing_device_count + valid_new
@@ -409,6 +500,8 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
             "will_create": with_id,
             "will_pending": pending,
             "will_skip": skipped,
+            "will_update": updated,
+            "will_unchanged": unchanged,
             "error_rows": len({e["row"] for e in errors if e["row"] > 0}),
             "new_shops": sorted(shops),
             "new_groups": sorted(groups),
@@ -511,35 +604,75 @@ def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_cont
                 created = skipped = pending = updated = 0
                 content_written = 0
 
-                def write_row_content(did, row):
-                    """Per-device template content (device-scope override)."""
+                def write_row_content(did, row, only_zones=None):
+                    """Per-device template content (device-scope override). only_zones
+                    limits the write to the zones the change-preview flagged, so a
+                    re-upload doesn't rewrite (and re-stamp) unchanged content."""
                     nonlocal content_written
                     for zone_key, payload in (row.get("content") or {}).items():
+                        if only_zones is not None and zone_key not in only_zones:
+                            continue
                         zone = zone_map.get(zone_key)
                         if not zone or not payload:
                             continue
+                        # MERGE into the existing device-scope payload — the write is a
+                        # full replace, so writing only the sheet's sub-fields would wipe
+                        # a blank-left sibling column (e.g. .bg) or a UI-only field
+                        # (text_color / fit_mode / clock format). Mirrors _upload_zone_media.
+                        cur.execute("""
+                            SELECT payload FROM public.template_zone_content
+                            WHERE tenant_id = %s AND zone_key = %s AND scope = 'device' AND device_id = %s;
+                        """, (tenant_id, zone_key, did))
+                        prev = cur.fetchone()
+                        merged = {}
+                        if prev and prev[0]:
+                            merged = dict(prev[0] if isinstance(prev[0], dict) else json.loads(prev[0]))
+                        merged.update(dict(payload))
                         tpl_api._upsert_zone_content(conn, cur, tenant_id, zone, zone_key,
-                                                     "device", None, did, dict(payload), ctx.user_id)
+                                                     "device", None, did, merged, ctx.user_id)
                         content_written += 1
 
                 # 2) create devices row-by-row (safe + idempotent); assignment per device
                 for r in rows:
                     if r["action"] == "error":
                         continue
-                    if r["action"] == "skip":
-                        # The device already exists in this tenant. The sheet is
-                        # still the operator's source of truth for its CONTENT —
-                        # skipping it entirely left previously-enrolled screens
-                        # without the sheet's QR/media values while new screens
-                        # got them ("appears on one device but not the other").
-                        skipped += 1
-                        if r.get("content") and r.get("device_id"):
-                            cur.execute("SELECT id FROM public.device WHERE tenant_id = %s AND mobile_id = %s;",
-                                        (tenant_id, r["device_id"]))
-                            hit = cur.fetchone()
-                            if hit:
-                                write_row_content(hit[0], r)
-                                updated += 1
+                    if r["action"] in ("update", "unchanged", "skip"):
+                        # Existing screen in this tenant. Apply ONLY the fields the
+                        # change-preview flagged (name / location / group / content) —
+                        # a blank cell leaves that value as-is, and unchanged rows are
+                        # a no-op. (This replaces the old content-only "skip".)
+                        mid = r.get("device_id")
+                        chg = {c["field"] for c in (r.get("changes") or [])}
+                        if not mid or not chg:
+                            skipped += 1
+                            continue
+                        cur.execute("SELECT id FROM public.device WHERE tenant_id = %s AND mobile_id = %s;",
+                                    (tenant_id, mid))
+                        hit = cur.fetchone()
+                        if not hit:
+                            skipped += 1
+                            continue
+                        did = hit[0]
+                        if "name" in chg and r.get("device_name"):
+                            cur.execute("UPDATE public.device SET device_name = %s WHERE id = %s;",
+                                        (r["device_name"], did))
+                        loc_c, grp_c = ("location" in chg), ("group" in chg)
+                        if loc_c or grp_c:
+                            gid = group_ids.get(r["group_name"]) if r.get("group_name") else None
+                            sid = shop_ids.get(r["shop_name"]) if r.get("shop_name") else None
+                            cur.execute("""
+                                INSERT INTO public.device_assignment (did, gid, sid, tenant_id)
+                                VALUES (%s, %s, %s, %s)
+                                ON CONFLICT (did) DO UPDATE SET
+                                    gid = CASE WHEN %s THEN EXCLUDED.gid ELSE public.device_assignment.gid END,
+                                    sid = CASE WHEN %s THEN EXCLUDED.sid ELSE public.device_assignment.sid END,
+                                    updated_at = NOW();
+                            """, (did, gid, sid, tenant_id, grp_c, loc_c))
+                        changed_zones = {c["field"].split(".", 1)[1] for c in (r.get("changes") or [])
+                                         if c["field"].startswith("content.")}
+                        if changed_zones:
+                            write_row_content(did, r, only_zones=changed_zones)
+                        updated += 1
                         continue
                     if r["action"] == "pending":
                         code = _pending_code()
