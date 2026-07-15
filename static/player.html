@@ -175,6 +175,12 @@
     var c = z.content || {};
     applyBackground(el, c, st);
 
+    // Multiple positioned text items inside one zone (designer-composed).
+    if ((z.type === "text" || z.type === "ticker") && Array.isArray(c.runs) && c.runs.length) {
+      fillRuns(el, c.runs);
+      return el;
+    }
+
     switch (z.type) {
       case "text":      fillText(el, c.text || "", st, c); break;
       case "ticker":    fillTicker(el, c.text || "", st, c); break;
@@ -185,6 +191,29 @@
       default:          break;
     }
     return el;
+  }
+
+  // Render each run absolutely-positioned within the zone. x/y/w/font_size are
+  // percentages of the zone, so they scale with any screen resolution.
+  function fillRuns(el, runs) {
+    el.style.position = "relative";
+    el.style.containerType = "size";
+    runs.forEach(function (r) {
+      var d = document.createElement("div");
+      d.style.position = "absolute";
+      d.style.left = (r.x || 0) + "%";
+      d.style.top = (r.y || 0) + "%";
+      d.style.width = (typeof r.w === "number" ? r.w : (100 - (r.x || 0))) + "%";
+      d.style.color = r.text_color || "#ffffff";
+      d.style.fontSize = "min(" + (typeof r.font_size_vh === "number" ? r.font_size_vh : 20) + "cqh, 40vw)";
+      d.style.fontWeight = r.bold ? "700" : "400";
+      d.style.textAlign = r.align || "left";
+      d.style.lineHeight = "1.1";
+      d.style.whiteSpace = "pre-wrap";
+      d.style.overflow = "hidden";
+      d.textContent = r.text || "";
+      el.appendChild(d);
+    });
   }
 
   function textStyle(el, st, c) {

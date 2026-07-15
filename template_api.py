@@ -172,6 +172,13 @@ def validate_zones(zones: Any) -> List[str]:
             pp = style.get("padding_pct")
             if pp is not None and (isinstance(pp, bool) or not isinstance(pp, (int, float)) or not (0 <= pp <= 40)):
                 errors.append(f"{where}: style.padding_pct must be a number 0-40")
+        # Multiple positioned text items inside a text/ticker zone (designer-composed).
+        zcontent = zone.get("content")
+        if isinstance(zcontent, dict) and zcontent.get("runs") is not None:
+            if ztype not in ("text", "ticker"):
+                errors.append(f"{where}: content.runs is only valid on text/ticker zones")
+            else:
+                errors.extend(f"{where}: {e}" for e in _validate_text_runs(zcontent["runs"]))
         binding = zone.get("binding", {})
         if not isinstance(binding, dict):
             errors.append(f"{where}: 'binding' must be an object")
@@ -241,6 +248,39 @@ def validate_content_payload(zone_type: str, payload: Any) -> List[str]:
         if mode == "link" and not link:
             errors.append("qr_mode 'link' requires qr_link")
     return errors
+
+
+def _validate_text_runs(runs: Any) -> List[str]:
+    """Validate a text/ticker zone's content.runs — multiple positioned,
+    individually-styled text items placed inside the zone. Positions/size are
+    percentages relative to the zone (resolution-independent)."""
+    errs: List[str] = []
+    if not isinstance(runs, list):
+        return ["content.runs must be a list"]
+    if len(runs) > 40:
+        errs.append("content.runs may have at most 40 items")
+    for i, r in enumerate(runs):
+        at = f"content.runs[{i}]"
+        if not isinstance(r, dict):
+            errs.append(f"{at}: must be an object"); continue
+        if not isinstance(r.get("text"), str) or len(r.get("text", "")) > 2000:
+            errs.append(f"{at}.text must be a string of at most 2000 chars")
+        for k in ("x", "y"):
+            v = r.get(k)
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not (0 <= v <= 100):
+                errs.append(f"{at}.{k} must be a number 0-100 (percent of the zone)")
+        for k in ("w", "font_size_vh"):
+            v = r.get(k)
+            if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not (0 < v <= 100)):
+                errs.append(f"{at}.{k} must be a number in (0, 100]")
+        tc = r.get("text_color")
+        if tc is not None and (not isinstance(tc, str) or not HEX_COLOR_RE.match(tc)):
+            errs.append(f"{at}.text_color must be a hex color")
+        if r.get("bold") is not None and not isinstance(r.get("bold"), bool):
+            errs.append(f"{at}.bold must be a boolean")
+        if r.get("align") is not None and r.get("align") not in ("left", "center", "right"):
+            errs.append(f"{at}.align must be left|center|right")
+    return errs
 
 
 def _validate_gradient(grad: Any) -> List[str]:
@@ -346,8 +386,13 @@ def resolve_zone(zone: Dict, entity: Dict[str, Optional[str]],
         "style": zone.get("style", {}),
     }
     source = (zone.get("binding") or {}).get("source", "static")
+    zc = zone.get("content") if isinstance(zone.get("content"), dict) else {}
     if source == "static":
-        out["content"] = {"text": zone.get("content", {}).get("text") if isinstance(zone.get("content"), dict) else None}
+        out["content"] = {"text": zc.get("text")}
+        # Designer-composed multiple text items ride through as-is; percentages
+        # are relative to the zone, so players render them at any resolution.
+        if isinstance(zc.get("runs"), list) and zc["runs"]:
+            out["content"]["runs"] = zc["runs"]
     elif source == "device.playlist":
         out["content"] = {"playlist": True}
     elif source in ("company.name", "shop.name", "device.name"):
