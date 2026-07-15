@@ -387,9 +387,13 @@ def _row_changes(device_name: str, shop_name: str, group_name: str,
     diff("group", group_name, current.get("group"))
     cur_content = current.get("content") or {}
     for zk, payload in (row_content or {}).items():
-        if payload and payload != cur_content.get(zk):
+        cur_p = cur_content.get(zk) or {}
+        # Subset comparison: only the fields the sheet sets. The stored payload may
+        # carry extra server-added keys (e.g. qr_generated_s3) that the sheet never
+        # provides — a full-dict compare would flag every QR/media as changed.
+        if payload and any(cur_p.get(k) != v for k, v in payload.items()):
             changes.append({"field": f"content.{zk}",
-                            "from": _content_summary(cur_content.get(zk)),
+                            "from": _content_summary(cur_p),
                             "to": _content_summary(payload)})
     return changes
 
