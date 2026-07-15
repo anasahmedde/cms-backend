@@ -226,6 +226,7 @@
     t.style.fontSize = "min(" + (vh) + "cqh, 40vw)";
     el.style.containerType = "size";
     if (st.align) t.style.justifyContent = st.align === "left" ? "flex-start" : st.align === "right" ? "flex-end" : "center";
+    if (st.valign) t.style.alignItems = st.valign === "top" ? "flex-start" : st.valign === "bottom" ? "flex-end" : "center";
     if (st.direction === "rtl") { t.style.direction = "rtl"; }
     if (st.bold) t.style.fontWeight = "700";
     return t;
