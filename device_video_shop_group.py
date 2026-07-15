@@ -6265,6 +6265,22 @@ def _detect_video_content_type(filename: str) -> str:
     if ext == '.pdf': return "pdf"
     return "video"
 
+
+def _video_stack_s3_content_type(content_type: str, filename: str) -> str:
+    """The S3 object Content-Type for a video-stack upload. The stack accepts
+    images/HTML/PDF too, so hardcoding video/mp4 broke browser rendering of
+    images (a <img> refuses a video/mp4 object). Map to the real MIME."""
+    from pathlib import Path as _P
+    ext = _P(filename or "").suffix.lower().lstrip(".")
+    if content_type == "image":
+        return {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/jpeg")
+    if content_type == "html":
+        return "text/html"
+    if content_type == "pdf":
+        return "application/pdf"
+    return "video/mp4"
+
 def _video_s3_key_exists(key: str, bucket: str = None) -> bool:
     s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else boto3.client("s3")
     b = bucket or S3_BUCKET
@@ -6866,10 +6882,11 @@ async def standalone_upload_video(
     if not overwrite and _video_s3_key_exists(key):
         raise HTTPException(status_code=409, detail="Video exists. Use overwrite=true.")
     content_type = _detect_video_content_type(file.filename or video_name)
+    s3_content_type = _video_stack_s3_content_type(content_type, file.filename or video_name)
     s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else boto3.client("s3")
     from boto3.s3.transfer import TransferConfig
     cfg = TransferConfig(multipart_threshold=8*1024*1024, multipart_chunksize=16*1024*1024, max_concurrency=8, use_threads=True)
-    s3.upload_fileobj(file.file, S3_BUCKET, key, ExtraArgs={"ACL": "private", "ServerSideEncryption": "AES256", "ContentType": "video/mp4"}, Config=cfg)
+    s3.upload_fileobj(file.file, S3_BUCKET, key, ExtraArgs={"ACL": "private", "ServerSideEncryption": "AES256", "ContentType": s3_content_type}, Config=cfg)
     s3_uri = _to_video_s3_uri(key)
     with pg_conn() as conn:
         with conn.cursor() as cur:
