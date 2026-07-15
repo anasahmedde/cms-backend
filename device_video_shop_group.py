@@ -1311,7 +1311,7 @@ def _set_group_videos(conn, gid: int, vids: List[int]):
                 INSERT INTO public.group_video (gid, vid, display_order)
                 SELECT %s, v, row_number() OVER () - 1
                 FROM UNNEST(%s::bigint[]) AS v
-                ON CONFLICT (gid, vid) DO UPDATE SET updated_at = NOW()
+                ON CONFLICT (gid, vid) DO UPDATE SET display_order = EXCLUDED.display_order, updated_at = NOW()
                 RETURNING id, (xmax = 0) AS was_inserted
             ),
             del AS (
@@ -3857,7 +3857,12 @@ def set_group_video_by_name(gname: str, body: GroupVideoUpdateIn):
 def set_group_videos_by_names(gname: str, body: GroupVideosUpdateIn):
     with pg_conn() as conn:
         try:
-            vids = _resolve_video_ids(conn, body.video_names)
+            # An empty list clears the group's video rotation. This is a first-class
+            # state now that the playlist editor splits rotation vs layout-image
+            # panels (a group can legitimately have only layout/grid images).
+            # _resolve_video_ids rejects empty (guards other callers), so short-
+            # circuit it here — _set_group_videos([]) already clears cleanly.
+            vids = _resolve_video_ids(conn, body.video_names) if any(n.strip() for n in body.video_names) else []
             if gname.strip().lower() in NO_GROUP_SENTINELS:
                 ins, dele, upd, vnames, marked = _set_nogroup_videos(conn, vids)
                 conn.commit()
@@ -5877,14 +5882,18 @@ def _set_group_advertisements(conn, gid: int, aids: List[int]):
         inserted = 0
         deleted = 0
         
-        # Insert new links
+        # Upsert EVERY link with its submitted position, so display_order is a
+        # contiguous 0..n-1 sequence in the given order. Numbering only new links
+        # (the old behaviour) left existing rows with a stale order, so a mid-list
+        # removal silently reshuffled items the operator never touched.
         for i, aid in enumerate(aids):
+            cur.execute(
+                "INSERT INTO public.group_advertisement (gid, aid, display_order) VALUES (%s, %s, %s) "
+                "ON CONFLICT (gid, aid) DO UPDATE SET display_order = EXCLUDED.display_order;",
+                (gid, aid, i)
+            )
             if aid in to_insert:
-                cur.execute(
-                    "INSERT INTO public.group_advertisement (gid, aid, display_order) VALUES (%s, %s, %s) ON CONFLICT (gid, aid) DO NOTHING;",
-                    (gid, aid, i)
-                )
-                inserted += cur.rowcount
+                inserted += 1
         
         # Delete removed links
         if to_delete:
