@@ -3871,20 +3871,38 @@ def set_group_videos_by_names(gname: str, body: GroupVideosUpdateIn):
 
 
 # ---------- Video read + presign (for dashboard preview) ----------
+def _media_name_scope(name_col: str, name: str, user: Dict):
+    """WHERE fragment + params scoping a by-name media lookup to the caller's
+    tenant. Company users see only their own tenant's rows; platform users (no
+    active tenant) are unscoped. name_col is a code-literal, never user input.
+
+    These /video/{name} and /advertisement/{name} endpoints are DASHBOARD-ONLY
+    (the fleet fetches content solely via /device/{id}/videos/downloads), so
+    requiring a token here does not affect any device — it closes a cross-tenant
+    IDOR where any caller could read/mutate/delete another company's media by name.
+    """
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
+    if tenant_id is not None:
+        return f"{name_col} = %s AND tenant_id = %s", [name, tenant_id]
+    return f"{name_col} = %s", [name]
+
+
 @app.get("/video/{video_name}", response_model=VideoOut)
-def get_video_by_name(video_name: str = Path(..., description="Exact video_name to fetch")):
+def get_video_by_name(video_name: str = Path(..., description="Exact video_name to fetch"),
+                      user: Dict = Depends(get_current_user)):
     """Return video metadata stored in public.video."""
+    clause, params = _media_name_scope("video_name", video_name, user)
     with pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT id, video_name, s3_link, rotation, content_type, fit_mode, display_duration, created_at, updated_at
                 FROM public.video
-                WHERE video_name = %s
+                WHERE {clause}
                 ORDER BY id DESC
                 LIMIT 1;
                 """,
-                (video_name,),
+                params,
             )
             row = cur.fetchone()
             if not row:
@@ -3907,19 +3925,21 @@ def get_video_by_name(video_name: str = Path(..., description="Exact video_name 
 def presign_video(
     video_name: str = Path(..., description="Exact video_name to presign"),
     expires_in: int = Query(PRESIGN_EXPIRES, ge=60, le=604800, description="Presigned URL expiry in seconds"),
+    user: Dict = Depends(get_current_user),
 ):
     """Generate a presigned URL for the video using its s3_link (s3://bucket/key)."""
+    clause, params = _media_name_scope("video_name", video_name, user)
     with pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT s3_link
                 FROM public.video
-                WHERE video_name = %s
+                WHERE {clause}
                 ORDER BY id DESC
                 LIMIT 1;
                 """,
-                (video_name,),
+                params,
             )
             row = cur.fetchone()
             if not row:
@@ -3961,16 +3981,17 @@ def presign_video(
 
 # ---------- Video rotation and fit mode ----------
 @app.post("/video/{video_name}/rotation")
-def set_video_rotation(video_name: str, body: VideoRotationUpdateIn):
+def set_video_rotation(video_name: str, body: VideoRotationUpdateIn, user: Dict = Depends(get_current_user)):
     if body.rotation not in [0, 90, 180, 270]:
         raise HTTPException(status_code=400, detail="Rotation must be 0, 90, 180, or 270")
+    clause, params = _media_name_scope("video_name", video_name, user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(f"""
                     UPDATE public.video SET rotation = %s, updated_at = NOW()
-                    WHERE video_name = %s RETURNING id, rotation;
-                """, (body.rotation, video_name))
+                    WHERE {clause} RETURNING id, rotation;
+                """, [body.rotation] + params)
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Video not found")
@@ -3985,17 +4006,18 @@ def set_video_rotation(video_name: str, body: VideoRotationUpdateIn):
 
 
 @app.post("/video/{video_name}/fit_mode")
-def set_video_fit_mode(video_name: str, body: VideoFitModeUpdateIn):
+def set_video_fit_mode(video_name: str, body: VideoFitModeUpdateIn, user: Dict = Depends(get_current_user)):
     valid_modes = ["contain", "cover", "fill", "none"]
     if body.fit_mode not in valid_modes:
         raise HTTPException(status_code=400, detail=f"fit_mode must be one of: {', '.join(valid_modes)}")
+    clause, params = _media_name_scope("video_name", video_name, user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(f"""
                     UPDATE public.video SET fit_mode = %s, updated_at = NOW()
-                    WHERE video_name = %s RETURNING id, fit_mode;
-                """, (body.fit_mode, video_name))
+                    WHERE {clause} RETURNING id, fit_mode;
+                """, [body.fit_mode] + params)
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Video not found")
@@ -4014,15 +4036,16 @@ class VideoResolutionUpdateIn(BaseModel):
 
 
 @app.post("/video/{video_name}/resolution")
-def set_video_resolution(video_name: str, body: VideoResolutionUpdateIn):
+def set_video_resolution(video_name: str, body: VideoResolutionUpdateIn, user: Dict = Depends(get_current_user)):
     """Set default resolution for a video (e.g. 1920x1080, 1280x720)."""
+    clause, params = _media_name_scope("video_name", video_name, user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(f"""
                     UPDATE public.video SET resolution = %s, updated_at = NOW()
-                    WHERE video_name = %s RETURNING id, resolution;
-                """, (body.resolution, video_name))
+                    WHERE {clause} RETURNING id, resolution;
+                """, [body.resolution] + params)
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Video not found")
@@ -4037,12 +4060,13 @@ def set_video_resolution(video_name: str, body: VideoResolutionUpdateIn):
 
 
 @app.get("/video/{video_name}/groups")
-def get_video_groups(video_name: str):
+def get_video_groups(video_name: str, user: Dict = Depends(get_current_user)):
     """Get all groups where this video is linked."""
+    clause, params = _media_name_scope("video_name", video_name, user)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            # First get video ID
-            cur.execute("SELECT id FROM public.video WHERE video_name = %s LIMIT 1;", (video_name,))
+            # First get video ID (tenant-scoped)
+            cur.execute(f"SELECT id FROM public.video WHERE {clause} ORDER BY id DESC LIMIT 1;", params)
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Video not found")
@@ -5431,14 +5455,15 @@ def list_advertisements(q: Optional[str] = Query(None), limit: int = Query(50, g
             return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
 
 @app.get("/advertisement/{ad_name}")
-def get_advertisement(ad_name: str, presign: bool = Query(True)):
+def get_advertisement(ad_name: str, presign: bool = Query(True), user: Dict = Depends(get_current_user)):
     """Get a single advertisement by name."""
+    clause, params = _media_name_scope("ad_name", ad_name, user)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 SELECT id, ad_name, s3_link, rotation, fit_mode, display_duration, created_at, updated_at
-                FROM public.advertisement WHERE ad_name = %s LIMIT 1;
-            """, (ad_name,))
+                FROM public.advertisement WHERE {clause} ORDER BY id DESC LIMIT 1;
+            """, params)
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Advertisement not found")
@@ -5456,11 +5481,13 @@ def get_advertisement(ad_name: str, presign: bool = Query(True)):
             return result
 
 @app.get("/advertisement/{ad_name}/presign")
-def presign_advertisement(ad_name: str, expires_in: int = Query(AD_PRESIGN_EXPIRES, ge=60, le=7 * 24 * 3600)):
+def presign_advertisement(ad_name: str, expires_in: int = Query(AD_PRESIGN_EXPIRES, ge=60, le=7 * 24 * 3600),
+                          user: Dict = Depends(get_current_user)):
     """Get presigned URL for an advertisement."""
+    clause, params = _media_name_scope("ad_name", ad_name, user)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT s3_link FROM public.advertisement WHERE ad_name = %s LIMIT 1;", (ad_name,))
+            cur.execute(f"SELECT s3_link FROM public.advertisement WHERE {clause} ORDER BY id DESC LIMIT 1;", params)
             row = cur.fetchone()
             if not row or not row[0]:
                 raise HTTPException(status_code=404, detail="Advertisement not found")
@@ -5558,7 +5585,7 @@ async def upload_advertisement(
         raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
 
 @app.put("/advertisement/{ad_name}")
-def update_advertisement(ad_name: str, patch: AdvertisementUpdate):
+def update_advertisement(ad_name: str, patch: AdvertisementUpdate, user: Dict = Depends(get_current_user)):
     """Update an advertisement's metadata."""
     sets, params = [], []
     if patch.ad_name is not None:
@@ -5573,13 +5600,14 @@ def update_advertisement(ad_name: str, patch: AdvertisementUpdate):
         sets.append("display_duration = %s"); params.append(patch.display_duration)
     
     if not sets:
-        return get_advertisement(ad_name)
-    
+        return get_advertisement(ad_name, user=user)
+
+    clause, sparams = _media_name_scope("ad_name", ad_name, user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                params.append(ad_name)
-                cur.execute(f"UPDATE public.advertisement SET {', '.join(sets)}, updated_at = NOW() WHERE ad_name = %s RETURNING *;", params)
+                params.extend(sparams)
+                cur.execute(f"UPDATE public.advertisement SET {', '.join(sets)}, updated_at = NOW() WHERE {clause} RETURNING *;", params)
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Advertisement not found")
@@ -5594,16 +5622,16 @@ def update_advertisement(ad_name: str, patch: AdvertisementUpdate):
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/advertisement/{ad_name}/rotation")
-def set_advertisement_rotation(ad_name: str, body: AdvertisementRotationUpdate):
+def set_advertisement_rotation(ad_name: str, body: AdvertisementRotationUpdate, user: Dict = Depends(get_current_user)):
     """Update advertisement rotation."""
     if body.rotation not in (0, 90, 180, 270):
         raise HTTPException(status_code=400, detail="Rotation must be 0, 90, 180, or 270")
-    
+    clause, params = _media_name_scope("ad_name", ad_name, user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("UPDATE public.advertisement SET rotation = %s, updated_at = NOW() WHERE ad_name = %s RETURNING *;", 
-                           (body.rotation, ad_name))
+                cur.execute(f"UPDATE public.advertisement SET rotation = %s, updated_at = NOW() WHERE {clause} RETURNING *;",
+                           [body.rotation] + params)
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Advertisement not found")
@@ -5617,16 +5645,16 @@ def set_advertisement_rotation(ad_name: str, body: AdvertisementRotationUpdate):
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/advertisement/{ad_name}/fit_mode")
-def set_advertisement_fit_mode(ad_name: str, body: AdvertisementFitModeUpdate):
+def set_advertisement_fit_mode(ad_name: str, body: AdvertisementFitModeUpdate, user: Dict = Depends(get_current_user)):
     """Update advertisement fit mode."""
     if body.fit_mode not in ("cover", "contain", "fill", "none"):
         raise HTTPException(status_code=400, detail="fit_mode must be cover, contain, fill, or none")
-    
+    clause, params = _media_name_scope("ad_name", ad_name, user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("UPDATE public.advertisement SET fit_mode = %s, updated_at = NOW() WHERE ad_name = %s RETURNING *;", 
-                           (body.fit_mode, ad_name))
+                cur.execute(f"UPDATE public.advertisement SET fit_mode = %s, updated_at = NOW() WHERE {clause} RETURNING *;",
+                           [body.fit_mode] + params)
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Advertisement not found")
@@ -5640,12 +5668,13 @@ def set_advertisement_fit_mode(ad_name: str, body: AdvertisementFitModeUpdate):
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/advertisement/{ad_name}")
-def delete_advertisement(ad_name: str, force: bool = Query(False)):
+def delete_advertisement(ad_name: str, force: bool = Query(False), user: Dict = Depends(get_current_user)):
     """Delete an advertisement. Returns 409 with linked info if linked and force=false."""
+    clause, sparams = _media_name_scope("ad_name", ad_name, user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM public.advertisement WHERE ad_name = %s LIMIT 1;", (ad_name,))
+                cur.execute(f"SELECT id FROM public.advertisement WHERE {clause} ORDER BY id DESC LIMIT 1;", sparams)
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Advertisement not found")
@@ -5694,12 +5723,13 @@ def delete_advertisement(ad_name: str, force: bool = Query(False)):
 
 
 @app.get("/advertisement/{ad_name}/groups")
-def get_advertisement_groups(ad_name: str):
+def get_advertisement_groups(ad_name: str, user: Dict = Depends(get_current_user)):
     """Get all groups where this advertisement/image is linked."""
+    clause, params = _media_name_scope("ad_name", ad_name, user)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            # First get advertisement ID
-            cur.execute("SELECT id FROM public.advertisement WHERE ad_name = %s LIMIT 1;", (ad_name,))
+            # First get advertisement ID (tenant-scoped)
+            cur.execute(f"SELECT id FROM public.advertisement WHERE {clause} ORDER BY id DESC LIMIT 1;", params)
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Advertisement not found")
@@ -6895,7 +6925,7 @@ def standalone_list_videos(
     return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
 
 @app.put("/video/{video_name}")
-def standalone_update_video(video_name: str, patch: StandaloneVideoUpdate):
+def standalone_update_video(video_name: str, patch: StandaloneVideoUpdate, user: Dict = Depends(get_current_user)):
     sets, params = [], []
     if patch.video_name is not None: sets.append("video_name = %s"); params.append(patch.video_name)
     if patch.s3_link is not None: sets.append("s3_link = %s"); params.append(patch.s3_link)
@@ -6905,10 +6935,11 @@ def standalone_update_video(video_name: str, patch: StandaloneVideoUpdate):
     if patch.display_duration is not None: sets.append("display_duration = %s"); params.append(patch.display_duration)
     if not sets:
         raise HTTPException(status_code=400, detail="No fields to update")
-    params.append(video_name)
+    clause, sparams = _media_name_scope("video_name", video_name, user)
+    params.extend(sparams)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"UPDATE public.video SET {', '.join(sets)}, updated_at = NOW() WHERE video_name = %s RETURNING id, video_name, s3_link, rotation, content_type, fit_mode, display_duration, created_at, updated_at;", params)
+            cur.execute(f"UPDATE public.video SET {', '.join(sets)}, updated_at = NOW() WHERE {clause} RETURNING id, video_name, s3_link, rotation, content_type, fit_mode, display_duration, created_at, updated_at;", params)
             row = cur.fetchone()
         conn.commit()
     if not row:
@@ -6917,11 +6948,12 @@ def standalone_update_video(video_name: str, patch: StandaloneVideoUpdate):
             "content_type": row[4], "fit_mode": row[5], "display_duration": row[6], "created_at": row[7], "updated_at": row[8]}}
 
 @app.delete("/video/{video_name}")
-def standalone_delete_video(video_name: str, force: bool = Query(False)):
+def standalone_delete_video(video_name: str, force: bool = Query(False), user: Dict = Depends(get_current_user)):
+    clause, params = _media_name_scope("video_name", video_name, user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM public.video WHERE video_name = %s LIMIT 1;", (video_name,))
+                cur.execute(f"SELECT id FROM public.video WHERE {clause} ORDER BY id DESC LIMIT 1;", params)
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Video not found")
