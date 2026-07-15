@@ -1682,13 +1682,16 @@ def list_group_videos_by_name(gname: str):
             if gname.strip().lower() in NO_GROUP_SENTINELS:
                 # For "no group", still use device_video_shop_group (legacy behavior)
                 cur.execute("""
-                    SELECT DISTINCT v.id, v.video_name
+                    SELECT DISTINCT v.id, v.video_name, v.content_type
                     FROM public.device_video_shop_group l
                     JOIN public.video v ON v.id = l.vid
                     WHERE l.gid IS NULL ORDER BY v.video_name;
                 """)
                 rows = cur.fetchall() or []
-                return {"gid": None, "gname": None, "vids": [r[0] for r in rows], "video_names": [r[1] for r in rows], "count": len(rows)}
+                return {"gid": None, "gname": None, "vids": [r[0] for r in rows],
+                        "video_names": [r[1] for r in rows],
+                        "video_items": [{"name": r[1], "content_type": r[2] or "video"} for r in rows],
+                        "count": len(rows)}
             
             cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (gname,))
             grow = cur.fetchone()
@@ -1698,19 +1701,19 @@ def list_group_videos_by_name(gname: str):
             
             # Read from group_video table (primary source for group-level associations)
             cur.execute("""
-                SELECT v.id, v.video_name
+                SELECT v.id, v.video_name, v.content_type
                 FROM public.group_video gv
                 JOIN public.video v ON v.id = gv.vid
-                WHERE gv.gid = %s 
+                WHERE gv.gid = %s
                 ORDER BY gv.display_order, v.video_name;
             """, (gid,))
             rows = cur.fetchall() or []
             video_ids = {r[0] for r in rows}
-            videos = [{"id": r[0], "name": r[1]} for r in rows]
-            
+            videos = [{"id": r[0], "name": r[1], "content_type": r[2] or "video"} for r in rows]
+
             # Also check device_video_shop_group for additional video links
             cur.execute("""
-                SELECT DISTINCT v.id, v.video_name
+                SELECT DISTINCT v.id, v.video_name, v.content_type
                 FROM public.device_video_shop_group dvsg
                 JOIN public.video v ON v.id = dvsg.vid
                 WHERE dvsg.gid = %s
@@ -1718,14 +1721,15 @@ def list_group_videos_by_name(gname: str):
             """, (gid,))
             for r in cur.fetchall():
                 if r[0] not in video_ids:
-                    videos.append({"id": r[0], "name": r[1]})
+                    videos.append({"id": r[0], "name": r[1], "content_type": r[2] or "video"})
                     video_ids.add(r[0])
-            
+
             return {
-                "gid": gid, 
-                "gname": gname, 
-                "vids": [v["id"] for v in videos], 
-                "video_names": [v["name"] for v in videos], 
+                "gid": gid,
+                "gname": gname,
+                "vids": [v["id"] for v in videos],
+                "video_names": [v["name"] for v in videos],
+                "video_items": [{"name": v["name"], "content_type": v["content_type"]} for v in videos],
                 "count": len(videos)
             }
 
@@ -5452,8 +5456,12 @@ def list_advertisements(q: Optional[str] = Query(None), limit: int = Query(50, g
                 else:
                     cur.execute(base + " WHERE tenant_id = %s ORDER BY id DESC LIMIT %s OFFSET %s", (tenant_id, limit, offset))
                 rows = cur.fetchall()
+                # Advertisements are always images — report content_type so the UI
+                # can classify them without guessing (the /videos stack carries a
+                # real content_type; the ad stack has no such column).
                 items = [{"id": r[0], "ad_name": r[1], "s3_link": r[2], "rotation": r[3],
-                          "fit_mode": r[4], "display_duration": r[5], "created_at": r[6], "updated_at": r[7]} 
+                          "fit_mode": r[4], "display_duration": r[5], "created_at": r[6], "updated_at": r[7],
+                          "content_type": "image"}
                          for r in rows]
             else:
                 # Platform admin: include company name
@@ -5468,7 +5476,7 @@ def list_advertisements(q: Optional[str] = Query(None), limit: int = Query(50, g
                 rows = cur.fetchall()
                 items = [{"id": r[0], "ad_name": r[1], "s3_link": r[2], "rotation": r[3],
                           "fit_mode": r[4], "display_duration": r[5], "created_at": r[6], "updated_at": r[7],
-                          "company_name": r[8], "company_slug": r[9]} 
+                          "company_name": r[8], "company_slug": r[9], "content_type": "image"}
                          for r in rows]
             return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
 
@@ -5486,8 +5494,9 @@ def get_advertisement(ad_name: str, presign: bool = Query(True), user: Dict = De
             if not row:
                 raise HTTPException(status_code=404, detail="Advertisement not found")
             result = {"id": row[0], "ad_name": row[1], "s3_link": row[2], "rotation": row[3],
-                      "fit_mode": row[4], "display_duration": row[5], "created_at": row[6], "updated_at": row[7]}
-            
+                      "fit_mode": row[4], "display_duration": row[5], "created_at": row[6], "updated_at": row[7],
+                      "content_type": "image"}
+
             if presign and result.get("s3_link"):
                 try:
                     url, filename = ad_presign_get_object(result["s3_link"], AD_PRESIGN_EXPIRES)
