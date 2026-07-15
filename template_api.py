@@ -167,6 +167,8 @@ def validate_zones(zones: Any) -> List[str]:
                 errors.append(f"{where}: style.font_size_vh must be a number 1-100")
             if style.get("align") is not None and style["align"] not in ("left", "center", "right"):
                 errors.append(f"{where}: style.align must be left|center|right")
+            if style.get("valign") is not None and style["valign"] not in ("top", "middle", "bottom"):
+                errors.append(f"{where}: style.valign must be top|middle|bottom")
             if style.get("direction") is not None and style["direction"] not in ("ltr", "rtl"):
                 errors.append(f"{where}: style.direction must be ltr|rtl")
             if style.get("bold") is not None and not isinstance(style["bold"], bool):
