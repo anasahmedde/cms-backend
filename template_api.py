@@ -157,6 +157,10 @@ def validate_zones(zones: Any) -> List[str]:
                                     or not biu.startswith(("http://", "https://"))
                                     or len(biu) > 2048):
                 errors.append(f"{where}: style.bg_image_url must be an http(s) URL (max 2048 chars)")
+            # Media-library background (s3:// object; presigned by the resolver).
+            bis = style.get("bg_image_s3")
+            if bis is not None and (not isinstance(bis, str) or not bis.startswith("s3://")):
+                errors.append(f"{where}: style.bg_image_s3 must be an s3:// URI")
             # Typography / layout knobs the players already consume.
             fsv = style.get("font_size_vh")
             if fsv is not None and (isinstance(fsv, bool) or not isinstance(fsv, (int, float)) or not (1 <= fsv <= 100)):
@@ -461,6 +465,12 @@ def resolve_zone(zone: Dict, entity: Dict[str, Optional[str]],
         c = out["content"]
         if c.get("bg_gradient") is None and style.get("bg_gradient") is not None:
             c["bg_gradient"] = style["bg_gradient"]
+        # A designer-picked media-library background (s3://) is presigned here so
+        # players get an https URL — same as an uploaded content background.
+        if not c.get("bg_image") and style.get("bg_image_s3"):
+            signed = presign(style["bg_image_s3"])
+            if signed:
+                c["bg_image"] = signed
         if not c.get("bg_image") and style.get("bg_image_url"):
             c["bg_image"] = style["bg_image_url"]
         # Solid color too — the Android renderer draws content-level backgrounds;
