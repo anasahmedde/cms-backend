@@ -4,7 +4,32 @@ import io
 
 import pytest
 
-from bulk_enrollment_api import _parse_csv, _pending_code, validate_rows
+from bulk_enrollment_api import _parse_csv, _pending_code, validate_rows, _row_changes
+
+
+class TestRowChanges:
+    CUR = {"name": "Old", "shop": "Shop A", "group": "North",
+           "content": {"qr": {"qr_link": "https://old"}}}
+
+    def test_no_changes_when_identical(self):
+        assert _row_changes("Old", "Shop A", "North", {"qr": {"qr_link": "https://old"}}, self.CUR) == []
+
+    def test_blank_leaves_as_is(self):
+        # A blank group cell must NOT clear the current group.
+        assert _row_changes("Old", "Shop A", "", {}, self.CUR) == []
+
+    def test_only_the_changed_field(self):
+        ch = _row_changes("New", "Shop A", "North", {}, self.CUR)
+        assert ch == [{"field": "name", "from": "Old", "to": "New"}]
+
+    def test_shop_group_and_content_change(self):
+        ch = _row_changes("Old", "Shop B", "South", {"qr": {"qr_link": "https://new"}}, self.CUR)
+        fields = {c["field"] for c in ch}
+        assert fields == {"location", "group", "content.qr"}
+
+    def test_new_device_all_fields_are_changes(self):
+        ch = _row_changes("A", "S", "G", {}, {})
+        assert {c["field"] for c in ch} == {"name", "location", "group"}
 
 
 def rows(*recs):
@@ -51,12 +76,15 @@ class TestValidateRows:
         v = validate_rows(r, 0, 50, set(), {"foreign"})
         assert any("another company" in e["reason"] for e in v["errors"])
 
-    def test_device_id_existing_in_tenant_is_skipped_not_error(self):
+    def test_device_id_existing_in_tenant_is_update_not_create(self):
+        # An existing screen is valid and never counts as a new create; without a DB
+        # baseline (cur=None) its non-blank fields read as an update.
         r = rows({"device_name": "A", "shop_name": "S", "device_id": "mine"})
         v = validate_rows(r, 1, 50, {"mine"}, set())
         assert v["summary"]["valid"] is True
-        assert v["summary"]["will_skip"] == 1
-        assert v["rows"][0]["action"] == "skip"
+        assert v["summary"]["will_create"] == 0
+        assert v["summary"]["will_update"] + v["summary"]["will_unchanged"] == 1
+        assert v["rows"][0]["action"] in ("update", "unchanged")
 
     def test_bad_resolution(self):
         r = rows({"device_name": "A", "shop_name": "S", "resolution": "huge"})
