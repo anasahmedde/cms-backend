@@ -511,14 +511,19 @@ def _canonical_s3_ref(link: str) -> str:
     return f"s3://{bucket}/{key}" if bucket and key else link
 
 
-def presign_content(uri: str, expires: int = CONTENT_PRESIGN_EXPIRES) -> Optional[str]:
+def presign_content(uri: str, expires: int = CONTENT_PRESIGN_EXPIRES,
+                    response_content_type: Optional[str] = None) -> Optional[str]:
     bucket, key = _s3_bucket_key(uri)
     if not bucket or not key:
         return None
+    params = {"Bucket": bucket, "Key": key}
+    # Override the object's stored Content-Type on the response — repairs images
+    # that were uploaded to the video stack with a video/mp4 content-type (they'd
+    # otherwise fail to render in a browser <img>).
+    if response_content_type:
+        params["ResponseContentType"] = response_content_type
     try:
-        return _s3_client().generate_presigned_url(
-            "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires
-        )
+        return _s3_client().generate_presigned_url("get_object", Params=params, ExpiresIn=expires)
     except Exception as e:
         logger.error("presign failed for %s: %s", uri, e)
         return None
@@ -982,6 +987,60 @@ def company_template(ctx: TenantContext = Depends(require_tenant_context)):
     return {"template": tpl, "content_zones": content_zones}
 
 
+@router.get("/company/template/preview")
+def company_template_preview(scope: str = "company",
+                             shop_id: Optional[int] = None,
+                             device_id: Optional[int] = None,
+                             ctx: TenantContext = Depends(require_tenant_context)):
+    """Resolved + presigned zones for a WYSIWYG dashboard preview — what a screen
+    actually renders at the given scope (company default / a location / a screen).
+    Media is presigned so the dashboard can show the real image/video."""
+    tenant_id = ctx.active_tenant_id
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            tpl = _tenant_template(cur, tenant_id)
+            if not tpl:
+                return {"template": None, "zones": []}
+            shop_name = device_name = None
+            eff_shop = None
+            if scope == "device" and device_id:
+                cur.execute("SELECT device_name FROM public.device WHERE id = %s AND tenant_id = %s;",
+                            (device_id, tenant_id))
+                r = cur.fetchone(); device_name = r[0] if r else None
+                # The device's location, so location-scope content resolves too.
+                cur.execute("""SELECT da.sid, s.shop_name FROM public.device_assignment da
+                               JOIN public.shop s ON s.id = da.sid WHERE da.did = %s LIMIT 1;""", (device_id,))
+                sr = cur.fetchone()
+                if sr: eff_shop, shop_name = sr[0], sr[1]
+            elif scope == "shop" and shop_id:
+                cur.execute("SELECT shop_name FROM public.shop WHERE id = %s AND tenant_id = %s;",
+                            (shop_id, tenant_id))
+                r = cur.fetchone(); shop_name = r[0] if r else None
+                eff_shop = shop_id
+            content = _collapse_content(
+                cur, tenant_id,
+                eff_shop if scope in ("shop", "device") else None,
+                device_id if scope == "device" else -1)
+            entity = {"company.name": ctx.company_name, "shop.name": shop_name, "device.name": device_name}
+    zones = [resolve_zone(z, entity, content, presign_content) for z in tpl["zones"]]
+    # Repair browser rendering: an image uploaded to the video stack carries a
+    # video/mp4 content-type, which a preview <img> refuses. Re-presign S3-backed
+    # image media with an explicit image content-type so the preview shows it.
+    for rz in zones:
+        rc = rz.get("content") or {}
+        if rz.get("type") == "media" and rc.get("media_type") == "image" and rc.get("media_url"):
+            s3ref = (content.get(rz.get("key")) or {}).get("media_s3")
+            if s3ref:
+                fixed = presign_content(s3ref, response_content_type="image/jpeg")
+                if fixed:
+                    rc["media_url"] = fixed
+    return {
+        "template": {"name": tpl["name"], "version": tpl["version"], "orientation": tpl["orientation"],
+                     "design_width": tpl["design_width"], "design_height": tpl["design_height"]},
+        "zones": zones,
+    }
+
+
 # ── Company-scoped designer ────────────────────────────────────────────────
 # A company admin can open the SAME designer for their own template. Editing is
 # always done on a company-private copy (owner_tenant_id = the tenant): on the
@@ -1264,6 +1323,52 @@ def company_template_content(ctx: TenantContext = Depends(require_tenant_context
              if (z.get("binding") or {}).get("source") == "content"]
     return {"template_linked": tpl is not None,
             "content_zones": zones, "content": content}
+
+
+@router.get("/company/template-content/overrides")
+def company_content_overrides(ctx: TenantContext = Depends(require_tenant_context)):
+    """Per-zone summary of MORE-SPECIFIC content overrides (location + screen) that
+    shadow the company-wide default. Content resolves screen > location > company, so
+    a box pinned on a location/screen makes a company edit look like it 'didn't update'
+    — this lets the dashboard surface and clear those overrides."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.zone_key, 'shop' AS scope, s.id, s.shop_name
+                FROM public.template_zone_content c
+                JOIN public.shop s ON s.id = c.shop_id
+                WHERE c.tenant_id = %s AND c.scope = 'shop'
+                UNION ALL
+                SELECT c.zone_key, 'device', d.id, d.device_name
+                FROM public.template_zone_content c
+                JOIN public.device d ON d.id = c.device_id
+                WHERE c.tenant_id = %s AND c.scope = 'device';
+            """, (ctx.active_tenant_id, ctx.active_tenant_id))
+            out = {}
+            for zone_key, scope, tid, name in cur.fetchall():
+                e = out.setdefault(zone_key, {"shops": [], "devices": []})
+                (e["shops"] if scope == "shop" else e["devices"]).append({"id": tid, "name": name})
+    return {"overrides": out}
+
+
+@router.delete("/company/template-content/{zone_key}/overrides")
+def clear_company_zone_overrides(zone_key: str,
+                                 ctx: TenantContext = Depends(require_tenant_context)):
+    """Remove ALL location + screen overrides for one zone so the company-wide
+    default takes effect everywhere. Bumps the content stamp → screens refetch."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM public.template_zone_content
+                WHERE tenant_id = %s AND zone_key = %s AND scope IN ('shop', 'device')
+                RETURNING id;
+            """, (ctx.active_tenant_id, zone_key))
+            cleared = len(cur.fetchall())
+            if cleared:
+                log_audit(conn, ctx.active_tenant_id, ctx.user_id, "template.content.clear_overrides",
+                          "template_zone_content", None, details={"zone_key": zone_key, "cleared": cleared})
+        conn.commit()
+    return {"zone_key": zone_key, "cleared": cleared}
 
 
 @router.put("/company/template-content/{zone_key}")
