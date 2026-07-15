@@ -615,8 +615,21 @@ def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_cont
                         zone = zone_map.get(zone_key)
                         if not zone or not payload:
                             continue
+                        # MERGE into the existing device-scope payload — the write is a
+                        # full replace, so writing only the sheet's sub-fields would wipe
+                        # a blank-left sibling column (e.g. .bg) or a UI-only field
+                        # (text_color / fit_mode / clock format). Mirrors _upload_zone_media.
+                        cur.execute("""
+                            SELECT payload FROM public.template_zone_content
+                            WHERE tenant_id = %s AND zone_key = %s AND scope = 'device' AND device_id = %s;
+                        """, (tenant_id, zone_key, did))
+                        prev = cur.fetchone()
+                        merged = {}
+                        if prev and prev[0]:
+                            merged = dict(prev[0] if isinstance(prev[0], dict) else json.loads(prev[0]))
+                        merged.update(dict(payload))
                         tpl_api._upsert_zone_content(conn, cur, tenant_id, zone, zone_key,
-                                                     "device", None, did, dict(payload), ctx.user_id)
+                                                     "device", None, did, merged, ctx.user_id)
                         content_written += 1
 
                 # 2) create devices row-by-row (safe + idempotent); assignment per device
