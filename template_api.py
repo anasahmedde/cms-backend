@@ -1266,6 +1266,52 @@ def company_template_content(ctx: TenantContext = Depends(require_tenant_context
             "content_zones": zones, "content": content}
 
 
+@router.get("/company/template-content/overrides")
+def company_content_overrides(ctx: TenantContext = Depends(require_tenant_context)):
+    """Per-zone summary of MORE-SPECIFIC content overrides (location + screen) that
+    shadow the company-wide default. Content resolves screen > location > company, so
+    a box pinned on a location/screen makes a company edit look like it 'didn't update'
+    — this lets the dashboard surface and clear those overrides."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.zone_key, 'shop' AS scope, s.id, s.shop_name
+                FROM public.template_zone_content c
+                JOIN public.shop s ON s.id = c.shop_id
+                WHERE c.tenant_id = %s AND c.scope = 'shop'
+                UNION ALL
+                SELECT c.zone_key, 'device', d.id, d.device_name
+                FROM public.template_zone_content c
+                JOIN public.device d ON d.id = c.device_id
+                WHERE c.tenant_id = %s AND c.scope = 'device';
+            """, (ctx.active_tenant_id, ctx.active_tenant_id))
+            out = {}
+            for zone_key, scope, tid, name in cur.fetchall():
+                e = out.setdefault(zone_key, {"shops": [], "devices": []})
+                (e["shops"] if scope == "shop" else e["devices"]).append({"id": tid, "name": name})
+    return {"overrides": out}
+
+
+@router.delete("/company/template-content/{zone_key}/overrides")
+def clear_company_zone_overrides(zone_key: str,
+                                 ctx: TenantContext = Depends(require_tenant_context)):
+    """Remove ALL location + screen overrides for one zone so the company-wide
+    default takes effect everywhere. Bumps the content stamp → screens refetch."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM public.template_zone_content
+                WHERE tenant_id = %s AND zone_key = %s AND scope IN ('shop', 'device')
+                RETURNING id;
+            """, (ctx.active_tenant_id, zone_key))
+            cleared = len(cur.fetchall())
+            if cleared:
+                log_audit(conn, ctx.active_tenant_id, ctx.user_id, "template.content.clear_overrides",
+                          "template_zone_content", None, details={"zone_key": zone_key, "cleared": cleared})
+        conn.commit()
+    return {"zone_key": zone_key, "cleared": cleared}
+
+
 @router.put("/company/template-content/{zone_key}")
 def put_company_zone_content(zone_key: str, body: ZoneContentIn,
                              ctx: TenantContext = Depends(require_tenant_context)):
