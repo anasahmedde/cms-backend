@@ -208,7 +208,7 @@ def validate_content_payload(zone_type: str, payload: Any) -> List[str]:
         return ["payload must be an object"]
     # Background can be a color, a gradient, or an image (URL or uploaded S3).
     bg_keys = {"bg_color", "bg_gradient", "bg_image_url", "bg_image_s3"}
-    media_keys = {"media_s3", "media_url", "media_type"}
+    media_keys = {"media_s3", "media_url", "media_type", "fit_mode"}
     allowed = {
         "text": {"text", "text_color"} | bg_keys,
         "media": media_keys,
@@ -240,6 +240,9 @@ def validate_content_payload(zone_type: str, payload: Any) -> List[str]:
         sv = payload.get(s3_field)
         if sv is not None and (not isinstance(sv, str) or not sv.startswith("s3://")):
             errors.append(f"{s3_field} must be an s3:// URI")
+    fm = payload.get("fit_mode")
+    if fm is not None and fm not in ("cover", "contain", "fill", "none"):
+        errors.append("fit_mode must be cover, contain, fill, or none")
     if zone_type == "qr":
         mode = payload.get("qr_mode")
         if mode is not None and mode not in QR_MODES:
@@ -386,7 +389,7 @@ def resolve_zone(zone: Dict, entity: Dict[str, Optional[str]],
         "x": zone.get("x"), "y": zone.get("y"),
         "w": zone.get("w"), "h": zone.get("h"),
         "z": zone.get("z", 1),
-        "style": zone.get("style", {}),
+        "style": dict(zone.get("style") or {}),
     }
     source = (zone.get("binding") or {}).get("source", "static")
     zc = zone.get("content") if isinstance(zone.get("content"), dict) else {}
@@ -442,6 +445,11 @@ def resolve_zone(zone: Dict, entity: Dict[str, Optional[str]],
         bg_img = media_url_of(payload.get("bg_image_s3"), payload.get("bg_image_url"))
         if bg_img:
             resolved["bg_image"] = bg_img
+        # Per-content fit (cover = fill+crop, contain = show whole). Folded into
+        # style, which every player already reads (style.fit_mode), so a per-image
+        # fit works with no player change and overrides the zone's designer default.
+        if payload.get("fit_mode") in ("cover", "contain", "fill", "none"):
+            out["style"]["fit_mode"] = payload["fit_mode"]
         out["content"] = resolved
 
     # Designer-set zone backgrounds (style.bg_gradient / style.bg_image_url)
