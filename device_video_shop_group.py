@@ -3887,6 +3887,21 @@ def _media_name_scope(name_col: str, name: str, user: Dict):
     return f"{name_col} = %s", [name]
 
 
+def _require_media_manage(user: Dict):
+    """Guard the MUTATING by-name media endpoints. A company user is already
+    confined to its own tenant by _media_name_scope, so its existing behaviour is
+    preserved. A platform principal, however, gets the UNSCOPED clause (it can act
+    across tenants), so it must additionally hold a manage permission — otherwise a
+    view-only platform role (e.g. 'support_agent') could rename/delete any company's
+    media. Reads stay open to any authenticated, tenant-scoped caller."""
+    if user.get("user_type") != "platform":
+        return
+    perms = user.get("permissions") or []
+    if "company.full_access" in perms or "manage_videos" in perms or "manage_advertisements" in perms:
+        return
+    raise HTTPException(status_code=403, detail="Permission denied: media management requires manage rights")
+
+
 @app.get("/video/{video_name}", response_model=VideoOut)
 def get_video_by_name(video_name: str = Path(..., description="Exact video_name to fetch"),
                       user: Dict = Depends(get_current_user)):
@@ -3982,6 +3997,7 @@ def presign_video(
 # ---------- Video rotation and fit mode ----------
 @app.post("/video/{video_name}/rotation")
 def set_video_rotation(video_name: str, body: VideoRotationUpdateIn, user: Dict = Depends(get_current_user)):
+    _require_media_manage(user)
     if body.rotation not in [0, 90, 180, 270]:
         raise HTTPException(status_code=400, detail="Rotation must be 0, 90, 180, or 270")
     clause, params = _media_name_scope("video_name", video_name, user)
@@ -4007,6 +4023,7 @@ def set_video_rotation(video_name: str, body: VideoRotationUpdateIn, user: Dict 
 
 @app.post("/video/{video_name}/fit_mode")
 def set_video_fit_mode(video_name: str, body: VideoFitModeUpdateIn, user: Dict = Depends(get_current_user)):
+    _require_media_manage(user)
     valid_modes = ["contain", "cover", "fill", "none"]
     if body.fit_mode not in valid_modes:
         raise HTTPException(status_code=400, detail=f"fit_mode must be one of: {', '.join(valid_modes)}")
@@ -4038,6 +4055,7 @@ class VideoResolutionUpdateIn(BaseModel):
 @app.post("/video/{video_name}/resolution")
 def set_video_resolution(video_name: str, body: VideoResolutionUpdateIn, user: Dict = Depends(get_current_user)):
     """Set default resolution for a video (e.g. 1920x1080, 1280x720)."""
+    _require_media_manage(user)
     clause, params = _media_name_scope("video_name", video_name, user)
     with pg_conn() as conn:
         try:
@@ -5587,6 +5605,7 @@ async def upload_advertisement(
 @app.put("/advertisement/{ad_name}")
 def update_advertisement(ad_name: str, patch: AdvertisementUpdate, user: Dict = Depends(get_current_user)):
     """Update an advertisement's metadata."""
+    _require_media_manage(user)
     sets, params = [], []
     if patch.ad_name is not None:
         sets.append("ad_name = %s"); params.append(patch.ad_name)
@@ -5624,6 +5643,7 @@ def update_advertisement(ad_name: str, patch: AdvertisementUpdate, user: Dict = 
 @app.post("/advertisement/{ad_name}/rotation")
 def set_advertisement_rotation(ad_name: str, body: AdvertisementRotationUpdate, user: Dict = Depends(get_current_user)):
     """Update advertisement rotation."""
+    _require_media_manage(user)
     if body.rotation not in (0, 90, 180, 270):
         raise HTTPException(status_code=400, detail="Rotation must be 0, 90, 180, or 270")
     clause, params = _media_name_scope("ad_name", ad_name, user)
@@ -5647,6 +5667,7 @@ def set_advertisement_rotation(ad_name: str, body: AdvertisementRotationUpdate, 
 @app.post("/advertisement/{ad_name}/fit_mode")
 def set_advertisement_fit_mode(ad_name: str, body: AdvertisementFitModeUpdate, user: Dict = Depends(get_current_user)):
     """Update advertisement fit mode."""
+    _require_media_manage(user)
     if body.fit_mode not in ("cover", "contain", "fill", "none"):
         raise HTTPException(status_code=400, detail="fit_mode must be cover, contain, fill, or none")
     clause, params = _media_name_scope("ad_name", ad_name, user)
@@ -5670,6 +5691,7 @@ def set_advertisement_fit_mode(ad_name: str, body: AdvertisementFitModeUpdate, u
 @app.delete("/advertisement/{ad_name}")
 def delete_advertisement(ad_name: str, force: bool = Query(False), user: Dict = Depends(get_current_user)):
     """Delete an advertisement. Returns 409 with linked info if linked and force=false."""
+    _require_media_manage(user)
     clause, sparams = _media_name_scope("ad_name", ad_name, user)
     with pg_conn() as conn:
         try:
@@ -6926,6 +6948,7 @@ def standalone_list_videos(
 
 @app.put("/video/{video_name}")
 def standalone_update_video(video_name: str, patch: StandaloneVideoUpdate, user: Dict = Depends(get_current_user)):
+    _require_media_manage(user)
     sets, params = [], []
     if patch.video_name is not None: sets.append("video_name = %s"); params.append(patch.video_name)
     if patch.s3_link is not None: sets.append("s3_link = %s"); params.append(patch.s3_link)
@@ -6949,6 +6972,7 @@ def standalone_update_video(video_name: str, patch: StandaloneVideoUpdate, user:
 
 @app.delete("/video/{video_name}")
 def standalone_delete_video(video_name: str, force: bool = Query(False), user: Dict = Depends(get_current_user)):
+    _require_media_manage(user)
     clause, params = _media_name_scope("video_name", video_name, user)
     with pg_conn() as conn:
         try:
