@@ -347,7 +347,15 @@ def resolve_media_value(cur, tenant_id: int, value: str) -> Dict[str, Any]:
     row = cur.fetchone()
     if row:
         return {"media_s3": row[0], "media_type": "image"}
-    raise ValueError(f"'{v}' is not a URL and no video/advertisement has that name")
+    # Not found — suggest the closest library names so a typo is a one-edit fix.
+    import difflib
+    cur.execute("SELECT video_name FROM public.video WHERE tenant_id = %s;", (tenant_id,))
+    names = [r[0] for r in cur.fetchall() if r[0]]
+    cur.execute("SELECT ad_name FROM public.advertisement WHERE tenant_id = %s;", (tenant_id,))
+    names += [r[0] for r in cur.fetchall() if r[0]]
+    close = difflib.get_close_matches(v, names, n=2, cutoff=0.6)
+    hint = f" — did you mean {' or '.join(repr(c) for c in close)}?" if close else ""
+    raise ValueError(f"'{v}' is not a URL and no video/advertisement has that name{hint}")
 
 
 def parse_bg_value(cur, tenant_id: int, value: str) -> Dict[str, Any]:
