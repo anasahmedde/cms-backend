@@ -368,16 +368,22 @@ def _current_states(cur, tenant_id: int, mobile_ids) -> Dict[str, Dict[str, Any]
     ids = [m for m in (mobile_ids or set()) if m]
     if not ids:
         return out
+    # id ASC so that with duplicate mobile_ids (stale ghost rows) the NEWEST row
+    # ends up in out[mid] — the same row the player resolves and the commit writes.
     cur.execute("""
         SELECT d.id, d.mobile_id, d.device_name, s.shop_name, g.gname
         FROM public.device d
         LEFT JOIN public.device_assignment da ON da.did = d.id
         LEFT JOIN public.shop s ON s.id = da.sid
         LEFT JOIN public."group" g ON g.id = da.gid
-        WHERE d.tenant_id = %s AND d.mobile_id = ANY(%s);
+        WHERE d.tenant_id = %s AND d.mobile_id = ANY(%s)
+        ORDER BY d.id ASC;
     """, (tenant_id, ids))
     did_to_mid: Dict[int, str] = {}
     for did, mid, name, shop, grp in cur.fetchall():
+        stale = out.get(mid)
+        if stale:  # older duplicate loses its reverse mapping too
+            did_to_mid.pop(stale["id"], None)
         out[mid] = {"id": did, "name": name or "", "shop": shop or "", "group": grp or "", "content": {}}
         did_to_mid[did] = mid
     if did_to_mid:
@@ -676,7 +682,13 @@ def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_cont
                         if not mid or not chg:
                             skipped += 1
                             continue
-                        cur.execute("SELECT id FROM public.device WHERE tenant_id = %s AND mobile_id = %s;",
+                        # Newest row per mobile_id — the SAME row the player resolves
+                        # (device_template orders id DESC). Without this, a stale
+                        # duplicate row could receive the content while the screen
+                        # keeps rendering from the newest row: "diff showed but the
+                        # device never updated".
+                        cur.execute("SELECT id FROM public.device WHERE tenant_id = %s AND mobile_id = %s"
+                                    " ORDER BY id DESC LIMIT 1;",
                                     (tenant_id, mid))
                         hit = cur.fetchone()
                         if not hit:
@@ -712,8 +724,9 @@ def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_cont
                         mobile_id = r["device_id"]
                         activation = None
                         # Guard: it may exist by now (idempotent re-run) — still
-                        # refresh its content from the sheet.
-                        cur.execute("SELECT id FROM public.device WHERE tenant_id = %s AND mobile_id = %s;",
+                        # refresh its content from the sheet (newest row, like the player).
+                        cur.execute("SELECT id FROM public.device WHERE tenant_id = %s AND mobile_id = %s"
+                                    " ORDER BY id DESC LIMIT 1;",
                                     (tenant_id, mobile_id))
                         existing_row = cur.fetchone()
                         if existing_row:
