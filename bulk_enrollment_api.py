@@ -46,6 +46,15 @@ import template_api as tpl_api
 logger = logging.getLogger("bulk_enrollment_api")
 router = APIRouter()
 
+
+def _require_manage_devices(ctx: TenantContext):
+    """Bulk device import creates/updates screens + per-screen content, so it
+    needs the same authority as managing devices. The routes are directly
+    callable, so this server-side check — not just a hidden button — is the
+    real gate."""
+    if not ctx.has_permission("manage_devices"):
+        raise HTTPException(status_code=403, detail="Permission denied: manage_devices required")
+
 BASE_COLUMNS = ["device_name", "shop_name", "group_name", "device_id", "resolution", "notes"]
 COLUMNS = BASE_COLUMNS  # back-compat alias
 REQUIRED = ["device_name", "shop_name"]
@@ -160,6 +169,7 @@ class ClaimIn(BaseModel):
 
 @router.get("/bulk-devices/template.csv")
 def template_csv(ctx: TenantContext = Depends(require_tenant_context)):
+    _require_manage_devices(ctx)
     headers, example, instructions, _ = _template_bundle(ctx.active_tenant_id)
     return StreamingResponse(
         io.BytesIO(_csv_bytes(headers, example, instructions)), media_type="text/csv",
@@ -169,6 +179,7 @@ def template_csv(ctx: TenantContext = Depends(require_tenant_context)):
 
 @router.get("/bulk-devices/template.xlsx")
 def template_xlsx(ctx: TenantContext = Depends(require_tenant_context)):
+    _require_manage_devices(ctx)
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill
@@ -344,6 +355,9 @@ def _content_summary(payload) -> str:
         return payload["media_url"].split("?")[0].split("/")[-1]
     if payload.get("media_s3"):
         return payload["media_s3"].split("/")[-1]
+    # A style-only payload (e.g. just Fit) — describe it, don't imply media set.
+    if payload.get("fit_mode"):
+        return f"fit: {payload['fit_mode']}"
     return "set"
 
 
@@ -525,6 +539,7 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
 
 @router.post("/bulk-devices/validate")
 async def bulk_validate(file: UploadFile = File(...), ctx: TenantContext = Depends(require_tenant_context)):
+    _require_manage_devices(ctx)
     tenant_id = ctx.active_tenant_id
     data = await file.read()
     if not data:
@@ -572,6 +587,7 @@ async def bulk_validate(file: UploadFile = File(...), ctx: TenantContext = Depen
 
 @router.post("/bulk-devices/commit")
 def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_context)):
+    _require_manage_devices(ctx)
     tenant_id = ctx.active_tenant_id
     with pg_conn() as conn:
         try:
@@ -617,24 +633,30 @@ def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_cont
                     limits the write to the zones the change-preview flagged, so a
                     re-upload doesn't rewrite (and re-stamp) unchanged content."""
                     nonlocal content_written
+                    # Resolve the device's location + group so a PARTIAL content write
+                    # layers onto the EFFECTIVE content (device > group > location >
+                    # company), not just the device-scope row. Without this, setting only
+                    # a sub-field (e.g. .fit) on a screen that INHERITS its media would
+                    # write a media-less device override that shadows the inherited media
+                    # and blanks the zone. Seeding from the effective content keeps the
+                    # shown media and applies the edit on top (a per-screen override, which
+                    # is exactly what bulk device content is).
+                    cur.execute("SELECT sid, gid FROM public.device_assignment WHERE did = %s LIMIT 1;", (did,))
+                    _asg = cur.fetchone()
+                    _sid, _gid = (_asg[0], _asg[1]) if _asg else (None, None)
+                    effective = tpl_api._collapse_content(cur, tenant_id, _sid, did, _gid)
                     for zone_key, payload in (row.get("content") or {}).items():
                         if only_zones is not None and zone_key not in only_zones:
                             continue
                         zone = zone_map.get(zone_key)
                         if not zone or not payload:
                             continue
-                        # MERGE into the existing device-scope payload — the write is a
-                        # full replace, so writing only the sheet's sub-fields would wipe
-                        # a blank-left sibling column (e.g. .bg) or a UI-only field
-                        # (text_color / fit_mode / clock format). Mirrors _upload_zone_media.
-                        cur.execute("""
-                            SELECT payload FROM public.template_zone_content
-                            WHERE tenant_id = %s AND zone_key = %s AND scope = 'device' AND device_id = %s;
-                        """, (tenant_id, zone_key, did))
-                        prev = cur.fetchone()
-                        merged = {}
-                        if prev and prev[0]:
-                            merged = dict(prev[0] if isinstance(prev[0], dict) else json.loads(prev[0]))
+                        # Full replace at write time, so seed from the effective payload
+                        # and layer the sheet's sub-fields on top — never dropping a
+                        # blank-left sibling (.bg), a UI-only field (text_color/fit_mode)
+                        # or inherited media. Drop the server-managed QR image (regenerated).
+                        merged = dict(effective.get(zone_key) or {})
+                        merged.pop("qr_generated_s3", None)
                         merged.update(dict(payload))
                         tpl_api._upsert_zone_content(conn, cur, tenant_id, zone, zone_key,
                                                      "device", None, did, merged, ctx.user_id)
@@ -748,6 +770,7 @@ def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_cont
 
 @router.get("/bulk-devices/jobs/{job_id}")
 def bulk_job(job_id: int, ctx: TenantContext = Depends(require_tenant_context)):
+    _require_manage_devices(ctx)
     with pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -767,6 +790,7 @@ def bulk_job(job_id: int, ctx: TenantContext = Depends(require_tenant_context)):
 @router.get("/bulk-devices/pending")
 def bulk_pending(ctx: TenantContext = Depends(require_tenant_context)):
     """Devices created without a device_id, awaiting an ANDROID_ID (claim)."""
+    _require_manage_devices(ctx)
     with pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -789,6 +813,7 @@ def bulk_pending(ctx: TenantContext = Depends(require_tenant_context)):
 def bulk_claim(body: ClaimIn, ctx: TenantContext = Depends(require_tenant_context)):
     """Bind a real ANDROID_ID to a pending device row. The physical device then
     auto-enrolls on its next GET /device/{id}/online poll."""
+    _require_manage_devices(ctx)
     tenant_id = ctx.active_tenant_id
     mobile_id = body.mobile_id.strip()
     if not MOBILE_ID_RE.match(mobile_id) or mobile_id.startswith(PENDING_PREFIX):

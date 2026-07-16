@@ -4,7 +4,19 @@ import io
 
 import pytest
 
-from bulk_enrollment_api import _parse_csv, _pending_code, validate_rows, _row_changes, content_columns_for
+from bulk_enrollment_api import _parse_csv, _pending_code, validate_rows, _row_changes, content_columns_for, _content_summary
+
+
+class TestContentSummary:
+    def test_fit_only_payload_reads_as_fit(self):
+        # A style-only (Fit) change must not read as "set" (which implies media).
+        assert _content_summary({"fit_mode": "contain"}) == "fit: contain"
+
+    def test_media_still_wins_over_fit(self):
+        assert _content_summary({"media_s3": "s3://b/promo.jpg", "fit_mode": "cover"}) == "promo.jpg"
+
+    def test_empty_is_blank(self):
+        assert _content_summary({}) == ""
 
 
 class TestContentColumns:
