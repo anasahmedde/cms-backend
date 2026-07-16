@@ -673,19 +673,29 @@ def _linked_companies(cur, tid: int) -> List[Dict]:
             for r in cur.fetchall()]
 
 
-def _company_template_stamp(cur, tenant_id: int):
-    """(template_version, template_stamp) for a company, or (None, None).
+def _company_template_stamp(cur, tenant_id: int, device_id: Optional[int] = None):
+    """(template_version, template_stamp) for a company — or, with device_id,
+    for THAT device's effective template (screen > group > company default), so
+    re-assigning a screen/group to another template changes the stamp and the
+    player refetches. (None, None) when nothing is linked.
 
-    The stamp changes when the template is re-published OR any zone content of
-    the tenant changes — players re-fetch /template when the stamp differs.
+    The stamp changes when the resolved template changes (id or re-publish) OR
+    any zone content of the tenant changes — players re-fetch /template when
+    the stamp differs.
     """
-    cur.execute("""
-        SELECT st.id, st.version
-        FROM public.company c
-        JOIN public.screen_template st ON st.id = c.template_id AND st.status = 'published'
-        WHERE c.id = %s;
-    """, (tenant_id,))
-    row = cur.fetchone()
+    row = None
+    if device_id is not None:
+        eff = _effective_template(cur, tenant_id, device_id=device_id)
+        if eff:
+            row = (eff["id"], eff["version"])
+    else:
+        cur.execute("""
+            SELECT st.id, st.version
+            FROM public.company c
+            JOIN public.screen_template st ON st.id = c.template_id AND st.status = 'published'
+            WHERE c.id = %s;
+        """, (tenant_id,))
+        row = cur.fetchone()
     if not row:
         return None, None
     # Max updated_at across BOTH content tables — a group-scope edit must bump
@@ -701,12 +711,14 @@ def _company_template_stamp(cur, tenant_id: int):
     return row[1], f"{row[0]}.{row[1]}.{content_epoch}"
 
 
-def heartbeat_template_fields(cur, tenant_id) -> Dict[str, Any]:
-    """Fields merged into the device heartbeat response. Never raises."""
+def heartbeat_template_fields(cur, tenant_id, device_id: Optional[int] = None) -> Dict[str, Any]:
+    """Fields merged into the device heartbeat response. Never raises.
+    device_id makes the stamp track the device's EFFECTIVE template (screen >
+    group > company), so template re-assignment triggers a refetch."""
     try:
         if not tenant_id:
             return {"template_version": None, "template_stamp": None}
-        version, stamp = _company_template_stamp(cur, tenant_id)
+        version, stamp = _company_template_stamp(cur, tenant_id, device_id=device_id)
         return {"template_version": version, "template_stamp": stamp}
     except Exception as e:
         logger.warning("heartbeat template fields skipped (tenant %s): %s", tenant_id, e)
@@ -1004,6 +1016,77 @@ def _tenant_template(cur, tenant_id: int) -> Optional[Dict]:
     return _template_row_to_dict(row) if row else None
 
 
+def _template_if_usable(cur, template_id: Optional[int], tenant_id: int) -> Optional[Dict]:
+    """The template when it is published and visible to this tenant (a shared
+    platform template or the tenant's own private fork) — else None. Dangling
+    or foreign ids resolve to None so callers fall through to the next level."""
+    if not template_id:
+        return None
+    cur.execute(f"""
+        SELECT {TEMPLATE_COLS_ST}
+        FROM public.screen_template st
+        WHERE st.id = %s AND st.status = 'published'
+          AND (st.owner_tenant_id IS NULL OR st.owner_tenant_id = %s);
+    """, (template_id, tenant_id))
+    row = cur.fetchone()
+    return _template_row_to_dict(row) if row else None
+
+
+def _effective_template(cur, tenant_id: int, device_id: Optional[int] = None,
+                        group_id: Optional[int] = None) -> Optional[Dict]:
+    """The template a screen actually renders: screen > group > company default
+    (the same precedence as zone content, so the platform has ONE override
+    model). Pass device_id for a screen, group_id for a group's view; with
+    neither this is the company default."""
+    if device_id is not None:
+        cur.execute("""
+            SELECT d.template_id, da.gid FROM public.device d
+            LEFT JOIN public.device_assignment da ON da.did = d.id
+            WHERE d.id = %s AND d.tenant_id = %s;
+        """, (device_id, tenant_id))
+        row = cur.fetchone()
+        if row:
+            dev_tpl, gid = row
+            tpl = _template_if_usable(cur, dev_tpl, tenant_id)
+            if tpl:
+                return tpl
+            if gid is not None and group_id is None:
+                group_id = gid
+    if group_id is not None:
+        cur.execute('SELECT template_id FROM public."group" WHERE id = %s AND tenant_id = %s;',
+                    (group_id, tenant_id))
+        row = cur.fetchone()
+        if row:
+            tpl = _template_if_usable(cur, row[0], tenant_id)
+            if tpl:
+                return tpl
+    return _tenant_template(cur, tenant_id)
+
+
+def _company_template_choices(cur, tenant_id: int) -> List[Dict]:
+    """Templates this company may assign: the default + platform-linked set +
+    the company's own fork. Published only; default first."""
+    cur.execute(f"""
+        SELECT DISTINCT ON (st.id) {TEMPLATE_COLS_ST}, (st.id = c.template_id) AS is_default
+        FROM public.screen_template st
+        JOIN public.company c ON c.id = %s
+        LEFT JOIN public.company_template ct
+               ON ct.template_id = st.id AND ct.company_id = c.id
+        WHERE st.status = 'published'
+          AND (st.owner_tenant_id IS NULL OR st.owner_tenant_id = c.id)
+          AND (st.id = c.template_id OR ct.template_id IS NOT NULL
+               OR st.owner_tenant_id = c.id)
+        ORDER BY st.id;
+    """, (tenant_id,))
+    out = []
+    for row in cur.fetchall():
+        tpl = _template_row_to_dict(row[:-1])
+        tpl["is_default"] = bool(row[-1])
+        out.append(tpl)
+    out.sort(key=lambda t: (not t["is_default"], t["name"].lower()))
+    return out
+
+
 def _content_zone_or_422(template: Dict, zone_key: str) -> Dict:
     zone = next((z for z in template["zones"] if z.get("key") == zone_key), None)
     if zone is None:
@@ -1062,6 +1145,137 @@ def company_template(ctx: TenantContext = Depends(require_tenant_context)):
         return {"template": None}
     content_zones = [z for z in tpl["zones"] if (z.get("binding") or {}).get("source") == "content"]
     return {"template": tpl, "content_zones": content_zones}
+
+
+# ── Multi-template: a company can use several templates at once ──────────────
+# (mixed fleets: landscape TVs + portrait totems). Assignment precedence
+# mirrors content precedence: screen > group > company default.
+
+class TemplateAssignIn(BaseModel):
+    template_id: Optional[int] = None  # null = clear the override (inherit)
+
+
+def _require_manage_devices(ctx: TenantContext):
+    if not ctx.has_permission("manage_devices"):
+        raise HTTPException(status_code=403, detail="Permission denied: manage_devices required")
+
+
+def _assignable_or_422(cur, template_id: Optional[int], tenant_id: int) -> Optional[Dict]:
+    """The template must be one this company may use (default, platform-linked,
+    or its own fork) — prevents pointing screens at arbitrary/foreign templates."""
+    if template_id is None:
+        return None
+    choices = {t["id"]: t for t in _company_template_choices(cur, tenant_id)}
+    tpl = choices.get(template_id)
+    if not tpl:
+        raise HTTPException(status_code=422,
+                            detail="That template isn't available to your company — "
+                                   "ask the platform admin to link it first")
+    return tpl
+
+
+@router.get("/company/templates")
+def company_templates(ctx: TenantContext = Depends(require_tenant_context)):
+    """Every template this company can assign (default first) — drives pickers."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            items = _company_template_choices(cur, ctx.active_tenant_id)
+    return {"items": [{k: t[k] for k in ("id", "name", "version", "orientation",
+                                         "design_width", "design_height", "is_default")}
+                      for t in items]}
+
+
+@router.put("/group/{group_id}/template")
+def set_group_template(group_id: int, body: TemplateAssignIn,
+                       ctx: TenantContext = Depends(require_tenant_context)):
+    """Assign a template to every screen in a group (null clears → company default).
+    Screens refetch within a heartbeat: their template_stamp changes."""
+    _require_manage_devices(ctx)
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            _group_of_tenant(cur, group_id, ctx.active_tenant_id)
+            tpl = _assignable_or_422(cur, body.template_id, ctx.active_tenant_id)
+            cur.execute('UPDATE public."group" SET template_id = %s WHERE id = %s AND tenant_id = %s;',
+                        (body.template_id, group_id, ctx.active_tenant_id))
+            log_audit(conn, ctx.active_tenant_id, ctx.user_id, "template.assign.group",
+                      "group", group_id, details={"template_id": body.template_id})
+        conn.commit()
+    return {"group_id": group_id, "template_id": body.template_id,
+            "template_name": tpl["name"] if tpl else None}
+
+
+@router.put("/device-config/{device_id}/template")
+def set_device_template(device_id: int, body: TemplateAssignIn,
+                        ctx: TenantContext = Depends(require_tenant_context)):
+    """Per-screen template override (null clears → group/company)."""
+    _require_manage_devices(ctx)
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            _device_of_tenant(cur, device_id, ctx.active_tenant_id)
+            tpl = _assignable_or_422(cur, body.template_id, ctx.active_tenant_id)
+            cur.execute("UPDATE public.device SET template_id = %s WHERE id = %s AND tenant_id = %s;",
+                        (body.template_id, device_id, ctx.active_tenant_id))
+            log_audit(conn, ctx.active_tenant_id, ctx.user_id, "template.assign.device",
+                      "device", device_id, details={"template_id": body.template_id})
+        conn.commit()
+    return {"device_id": device_id, "template_id": body.template_id,
+            "template_name": tpl["name"] if tpl else None}
+
+
+@router.get("/platform/companies/{cid}/templates")
+def platform_company_templates(cid: int, ctx: TenantContext = Depends(require_platform_user)):
+    """The company's template set: default + linked extras (platform view)."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            items = _company_template_choices(cur, cid)
+    return {"items": [{k: t[k] for k in ("id", "name", "version", "orientation",
+                                         "design_width", "design_height", "is_default")}
+                      for t in items]}
+
+
+@router.post("/platform/companies/{cid}/templates/{tid}")
+def platform_link_company_template(cid: int, tid: int,
+                                   ctx: TenantContext = Depends(require_platform_user)):
+    """Add a template to a company's set (idempotent). The default link stays
+    on company.template_id (PUT /platform/companies/{cid}/template)."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            _get_template(cur, tid)  # 404 when it doesn't exist
+            cur.execute("SELECT owner_tenant_id FROM public.screen_template WHERE id = %s;", (tid,))
+            owner = (cur.fetchone() or [None])[0]
+            if owner is not None and owner != cid:
+                raise HTTPException(status_code=422, detail="That template belongs to another company")
+            cur.execute("""
+                INSERT INTO public.company_template (company_id, template_id)
+                VALUES (%s, %s) ON CONFLICT DO NOTHING;
+            """, (cid, tid))
+            log_audit(conn, cid, ctx.user_id, "template.set.link", "company_template", tid,
+                      details={"company_id": cid, "template_id": tid})
+        conn.commit()
+    return {"company_id": cid, "template_id": tid, "linked": True}
+
+
+@router.delete("/platform/companies/{cid}/templates/{tid}")
+def platform_unlink_company_template(cid: int, tid: int,
+                                     ctx: TenantContext = Depends(require_platform_user)):
+    """Remove a template from a company's set. Screens/groups still pointing at
+    it fall back to the company default on their next heartbeat."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM public.company_template WHERE company_id = %s AND template_id = %s;",
+                        (cid, tid))
+            removed = cur.rowcount
+            # Clear now-dangling overrides so pickers/exports don't show a
+            # template the company can no longer use (resolver would fall
+            # through anyway — this keeps state tidy).
+            cur.execute('UPDATE public."group" SET template_id = NULL WHERE tenant_id = %s AND template_id = %s;',
+                        (cid, tid))
+            cur.execute("UPDATE public.device SET template_id = NULL WHERE tenant_id = %s AND template_id = %s;",
+                        (cid, tid))
+            log_audit(conn, cid, ctx.user_id, "template.set.unlink", "company_template", tid,
+                      details={"company_id": cid, "template_id": tid})
+        conn.commit()
+    return {"company_id": cid, "template_id": tid, "removed": bool(removed)}
 
 
 @router.get("/company/template/preview")
@@ -1441,7 +1655,7 @@ def company_template_content(ctx: TenantContext = Depends(require_tenant_context
             content = _get_scope_content(cur, ctx.active_tenant_id, "company", None, None)
     zones = [z for z in (tpl["zones"] if tpl else [])
              if (z.get("binding") or {}).get("source") == "content"]
-    return {"template_linked": tpl is not None, **_design_size_of(tpl),
+    return {"template_linked": tpl is not None, "template": tpl, **_design_size_of(tpl),
             "content_zones": zones, "content": content}
 
 
@@ -1542,7 +1756,7 @@ def shop_template_content(shop_id: int, ctx: TenantContext = Depends(require_ten
             content = _get_scope_content(cur, ctx.active_tenant_id, "shop", "shop_id", shop_id)
     zones = [z for z in (tpl["zones"] if tpl else [])
              if (z.get("binding") or {}).get("source") == "content"]
-    return {"shop_id": shop_id, "template_linked": tpl is not None,
+    return {"shop_id": shop_id, "template_linked": tpl is not None, "template": tpl,
             **_design_size_of(tpl), "content_zones": zones, "content": content}
 
 
@@ -1585,11 +1799,11 @@ def group_template_content(group_id: int, ctx: TenantContext = Depends(require_t
     with pg_conn() as conn:
         with conn.cursor() as cur:
             _group_of_tenant(cur, group_id, ctx.active_tenant_id)
-            tpl = _tenant_template(cur, ctx.active_tenant_id)
+            tpl = _effective_template(cur, ctx.active_tenant_id, group_id=group_id)
             content = _get_scope_content(cur, ctx.active_tenant_id, "group", None, group_id)
     zones = [z for z in (tpl["zones"] if tpl else [])
              if (z.get("binding") or {}).get("source") == "content"]
-    return {"group_id": group_id, "template_linked": tpl is not None,
+    return {"group_id": group_id, "template_linked": tpl is not None, "template": tpl,
             **_design_size_of(tpl), "content_zones": zones, "content": content}
 
 
@@ -1599,7 +1813,7 @@ def put_group_zone_content(group_id: int, zone_key: str, body: ZoneContentIn,
     with pg_conn() as conn:
         with conn.cursor() as cur:
             _group_of_tenant(cur, group_id, ctx.active_tenant_id)
-            tpl = _tenant_template(cur, ctx.active_tenant_id)
+            tpl = _effective_template(cur, ctx.active_tenant_id, group_id=group_id)
             if not tpl:
                 raise HTTPException(status_code=422, detail="Company has no linked template")
             zone = _content_zone_or_422(tpl, zone_key)
@@ -1637,7 +1851,7 @@ async def upload_group_zone_media(group_id: int, zone_key: str, file: UploadFile
     with pg_conn() as conn:
         with conn.cursor() as cur:
             _group_of_tenant(cur, group_id, ctx.active_tenant_id)
-            tpl = _tenant_template(cur, ctx.active_tenant_id)
+            tpl = _effective_template(cur, ctx.active_tenant_id, group_id=group_id)
             if not tpl:
                 raise HTTPException(status_code=422, detail="Company has no linked template")
             zone = _content_zone_or_422(tpl, zone_key)
@@ -1653,13 +1867,13 @@ def device_template_content(device_id: int, ctx: TenantContext = Depends(require
     with pg_conn() as conn:
         with conn.cursor() as cur:
             dev = _device_of_tenant(cur, device_id, ctx.active_tenant_id)
-            tpl = _tenant_template(cur, ctx.active_tenant_id)
+            tpl = _effective_template(cur, ctx.active_tenant_id, device_id=device_id)
             content = _get_scope_content(cur, ctx.active_tenant_id, "device", "device_id", device_id)
     zones = [z for z in (tpl["zones"] if tpl else [])
              if (z.get("binding") or {}).get("source") == "content"]
     # reported_resolution ("1920x1080", from the device heartbeat) lets the
     # dashboard show zone pixel sizes for THIS screen, not just the design canvas.
-    return {"device_id": device_id, "template_linked": tpl is not None,
+    return {"device_id": device_id, "template_linked": tpl is not None, "template": tpl,
             **_design_size_of(tpl), "reported_resolution": dev[2],
             "content_zones": zones, "content": content}
 
@@ -1670,7 +1884,7 @@ def put_device_zone_content(device_id: int, zone_key: str, body: ZoneContentIn,
     with pg_conn() as conn:
         with conn.cursor() as cur:
             _device_of_tenant(cur, device_id, ctx.active_tenant_id)
-            tpl = _tenant_template(cur, ctx.active_tenant_id)
+            tpl = _effective_template(cur, ctx.active_tenant_id, device_id=device_id)
             if not tpl:
                 raise HTTPException(status_code=422, detail="Company has no linked template")
             zone = _content_zone_or_422(tpl, zone_key)
@@ -1707,7 +1921,7 @@ async def upload_device_zone_media(device_id: int, zone_key: str, file: UploadFi
     with pg_conn() as conn:
         with conn.cursor() as cur:
             _device_of_tenant(cur, device_id, ctx.active_tenant_id)
-            tpl = _tenant_template(cur, ctx.active_tenant_id)
+            tpl = _effective_template(cur, ctx.active_tenant_id, device_id=device_id)
             if not tpl:
                 raise HTTPException(status_code=422, detail="Company has no linked template")
             zone = _content_zone_or_422(tpl, zone_key)
@@ -1798,7 +2012,8 @@ def device_template(mobile_id: str):
                 access = check_company_access(tenant_id)
                 if not access["accessible"]:
                     raise HTTPException(status_code=403, detail=access["message"])
-            tpl = _tenant_template(cur, tenant_id) if tenant_id else None
+            # Effective template: screen > group > company default.
+            tpl = _effective_template(cur, tenant_id, device_id=did) if tenant_id else None
             if not tpl:
                 raise HTTPException(status_code=404, detail="No template linked")
 
@@ -1828,7 +2043,7 @@ def device_template(mobile_id: str):
 
             entity = {"company.name": company_name, "shop.name": shop_name, "device.name": device_name}
             content = _collapse_content(cur, tenant_id, shop_id, did, group_id)
-            _, stamp = _company_template_stamp(cur, tenant_id)
+            _, stamp = _company_template_stamp(cur, tenant_id, device_id=did)
 
     zones = [resolve_zone(z, entity, content, presign_content) for z in tpl["zones"]]
     return {
