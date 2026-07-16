@@ -77,6 +77,8 @@ _ZONE_HELP = {
     "text": ("50% OFF this week", "the text to show on this screen"),
     "bg": ("#111827  (or  #0a1628 -> #f59e0b @135  for a gradient, or an image URL)",
            "a #hex color, a gradient like '#0a1628 -> #f59e0b @135', or an image URL/name"),
+    "fit": ("contain",
+            "how the image/video fits its box: cover (fill & crop), contain (show the whole thing), fill (stretch), or none. Blank = leave as-is."),
 }
 
 
@@ -94,6 +96,7 @@ def content_columns_for(zones) -> list:
             cols.append((f"content.{key}.bg", key, "bg", zt))
         elif zt == "media":
             cols.append((f"content.{key}.media", key, "media", zt))
+            cols.append((f"content.{key}.fit", key, "fit", zt))
         elif zt == "qr":
             cols.append((f"content.{key}.qr", key, "qr", zt))
     return cols
@@ -314,6 +317,11 @@ def _parse_row_content(cur, tenant_id, content_cols, raw_content):
                 pl.update(tpl_api.parse_bg_value(cur, tenant_id, val))
             elif field == "media":
                 pl.update(tpl_api.resolve_media_value(cur, tenant_id, val))
+            elif field == "fit":
+                # Sets only the media Fit; validate_content_payload rejects a bad
+                # value. Written into fit_mode, which the players read (style.fit_mode)
+                # — the same field the "Screen content" Fit dropdown controls.
+                pl["fit_mode"] = val.lower()
             elif field == "qr":
                 pl.update(tpl_api.parse_qr_value(cur, tenant_id, val))
         except ValueError as e:

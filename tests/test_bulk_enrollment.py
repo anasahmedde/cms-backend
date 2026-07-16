@@ -4,7 +4,26 @@ import io
 
 import pytest
 
-from bulk_enrollment_api import _parse_csv, _pending_code, validate_rows, _row_changes
+from bulk_enrollment_api import _parse_csv, _pending_code, validate_rows, _row_changes, content_columns_for
+
+
+class TestContentColumns:
+    def test_media_zone_gets_media_and_fit_columns(self):
+        zones = [{"key": "promo", "type": "media", "binding": {"source": "content"}}]
+        cols = content_columns_for(zones)
+        headers = [c[0] for c in cols]
+        assert headers == ["content.promo.media", "content.promo.fit"]
+        # the fit column is tagged so the parser routes it to fit_mode
+        assert ("content.promo.fit", "promo", "fit", "media") in cols
+
+    def test_text_zone_unaffected(self):
+        zones = [{"key": "hdr", "type": "text", "binding": {"source": "content"}}]
+        headers = [c[0] for c in content_columns_for(zones)]
+        assert headers == ["content.hdr.text", "content.hdr.bg"]
+
+    def test_non_content_zone_skipped(self):
+        zones = [{"key": "main", "type": "media", "binding": {"source": "device.playlist"}}]
+        assert content_columns_for(zones) == []
 
 
 class TestRowChanges:
