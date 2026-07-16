@@ -588,9 +588,27 @@ def _row_changes(device_name: str, shop_name: str, group_name: str,
     return changes
 
 
+def _normalize_name(v: str) -> str:
+    return " ".join((v or "").split()).casefold()
+
+
+def _name_guard(raw: str, existing: Optional[Dict[str, str]], kind: str) -> Optional[str]:
+    """None if `raw` is an exact existing name or a genuinely NEW one; an error
+    message when it near-misses an existing name (case/spacing) — those are
+    typos that would silently auto-create a junk duplicate."""
+    if not raw or existing is None:
+        return None
+    canonical = existing.get(_normalize_name(raw))
+    if canonical is not None and canonical != raw:
+        return f"{kind} '{raw}' doesn't match any existing {kind} exactly — use '{canonical}'"
+    return None
+
+
 def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_devices: int,
                   mobile_ids_this_tenant: set, mobile_ids_other_tenant: set,
-                  content_cols=None, cur=None, tenant_id=None) -> Dict[str, Any]:
+                  content_cols=None, cur=None, tenant_id=None,
+                  existing_shops: Optional[Dict[str, str]] = None,
+                  existing_groups: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Pure validation. Returns preview {rows, errors, summary}. Writes nothing."""
     errors: List[Dict[str, Any]] = []
     seen_ids: Dict[str, int] = {}
@@ -618,6 +636,11 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
             for col in REQUIRED:
                 if not rec.get(col):
                     row_errors.append(f"{col} is required")
+        for raw, existing, kind in ((rec.get("shop_name", "").strip(), existing_shops, "location"),
+                                    (rec.get("group_name", "").strip(), existing_groups, "group")):
+            guard = _name_guard(raw, existing, kind)
+            if guard:
+                row_errors.append(guard)
         if dev_id:
             if not MOBILE_ID_RE.match(dev_id):
                 row_errors.append("device_id has invalid characters")
@@ -665,9 +688,12 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
                 will = "pending"
                 valid_new += 1
                 pending += 1
-            if rec.get("shop_name"):
+            # Only genuinely NEW names — the preview's "will be created" list.
+            if rec.get("shop_name") and (existing_shops is None
+                                         or _normalize_name(rec["shop_name"]) not in existing_shops):
                 shops.add(rec["shop_name"])
-            if rec.get("group_name"):
+            if rec.get("group_name") and (existing_groups is None
+                                          or _normalize_name(rec["group_name"]) not in existing_groups):
                 groups.add(rec["group_name"])
         else:
             for e in row_errors:
@@ -745,8 +771,17 @@ async def bulk_validate(file: UploadFile = File(...), ctx: TenantContext = Depen
             content_zones, _tpl = _tenant_content_zones(cur, tenant_id)
             content_cols = content_columns_for(content_zones)
 
+            # Existing location/group names (normalized -> canonical) so a
+            # case/spacing near-miss errors with the real name instead of
+            # silently auto-creating a duplicate.
+            cur.execute("SELECT shop_name FROM public.shop WHERE tenant_id = %s;", (tenant_id,))
+            existing_shops = {_normalize_name(r[0]): r[0] for r in cur.fetchall() if r[0]}
+            cur.execute('SELECT gname FROM public."group" WHERE tenant_id = %s;', (tenant_id,))
+            existing_groups = {_normalize_name(r[0]): r[0] for r in cur.fetchall() if r[0]}
+
             preview = validate_rows(rows, existing, max_devices, mine, other,
-                                    content_cols=content_cols, cur=cur, tenant_id=tenant_id)
+                                    content_cols=content_cols, cur=cur, tenant_id=tenant_id,
+                                    existing_shops=existing_shops, existing_groups=existing_groups)
 
             cur.execute("""
                 INSERT INTO public.bulk_import_job

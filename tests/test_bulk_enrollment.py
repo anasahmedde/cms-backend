@@ -256,3 +256,43 @@ class TestPendingRoundTrip:
         out = validate_rows(rows, existing_device_count=0, max_devices=0,
                             mobile_ids_this_tenant=set(), mobile_ids_other_tenant=set())
         assert any("shop_name is required" in e["reason"] for e in out["errors"])
+
+
+class TestNameGuards:
+    """Location/group cells must match existing names exactly; a case/spacing
+    near-miss is a typo that would auto-create a junk duplicate — hard error."""
+
+    EXISTING = {"lahore shop": "Lahore Shop", "north region": "North Region"}
+
+    def _row(self, shop, group=""):
+        return [{"device_name": "S1", "shop_name": shop, "group_name": group,
+                 "device_id": "dev1", "resolution": "", "notes": ""}]
+
+    def _run(self, rows):
+        return validate_rows(rows, existing_device_count=0, max_devices=0,
+                             mobile_ids_this_tenant=set(), mobile_ids_other_tenant=set(),
+                             existing_shops=self.EXISTING, existing_groups=self.EXISTING)
+
+    def test_exact_match_ok(self):
+        out = self._run(self._row("Lahore Shop", "North Region"))
+        assert out["summary"]["valid"] is True
+        assert out["summary"]["new_shops"] == []  # existing, not "new"
+
+    def test_case_mismatch_is_error_with_suggestion(self):
+        out = self._run(self._row("lahore shop"))
+        assert any("use 'Lahore Shop'" in e["reason"] for e in out["errors"])
+
+    def test_spacing_mismatch_is_error(self):
+        out = self._run(self._row("North  Region", "north region"))
+        # shop cell 'North  Region' → but EXISTING keys are for shops here too
+        assert any("use 'North Region'" in e["reason"] for e in out["errors"])
+
+    def test_genuinely_new_name_allowed_and_listed(self):
+        out = self._run(self._row("Shop Karachi 13"))
+        assert out["summary"]["valid"] is True
+        assert out["summary"]["new_shops"] == ["Shop Karachi 13"]
+
+    def test_no_guard_when_names_not_supplied(self):
+        out = validate_rows(self._row("lahore shop"), existing_device_count=0, max_devices=0,
+                            mobile_ids_this_tenant=set(), mobile_ids_other_tenant=set())
+        assert out["summary"]["valid"] is True
