@@ -1008,12 +1008,21 @@ def _group_of_tenant(cur, group_id: int, tenant_id: int):
 
 
 def _device_of_tenant(cur, device_id: int, tenant_id: int):
-    cur.execute("SELECT id, device_name FROM public.device WHERE id = %s AND tenant_id = %s;",
+    cur.execute("SELECT id, device_name, reported_resolution FROM public.device"
+                " WHERE id = %s AND tenant_id = %s;",
                 (device_id, tenant_id))
     row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Device not found")
     return row
+
+
+def _design_size_of(tpl: Optional[Dict]) -> Dict[str, Any]:
+    """Template design canvas size — lets the dashboard translate a zone's %
+    geometry into concrete pixels ("make this image 1152×486") wherever content
+    is authored."""
+    return {"design_width": tpl["design_width"] if tpl else None,
+            "design_height": tpl["design_height"] if tpl else None}
 
 
 @router.get("/company/template")
@@ -1402,7 +1411,7 @@ def company_template_content(ctx: TenantContext = Depends(require_tenant_context
             content = _get_scope_content(cur, ctx.active_tenant_id, "company", None, None)
     zones = [z for z in (tpl["zones"] if tpl else [])
              if (z.get("binding") or {}).get("source") == "content"]
-    return {"template_linked": tpl is not None,
+    return {"template_linked": tpl is not None, **_design_size_of(tpl),
             "content_zones": zones, "content": content}
 
 
@@ -1504,7 +1513,7 @@ def shop_template_content(shop_id: int, ctx: TenantContext = Depends(require_ten
     zones = [z for z in (tpl["zones"] if tpl else [])
              if (z.get("binding") or {}).get("source") == "content"]
     return {"shop_id": shop_id, "template_linked": tpl is not None,
-            "content_zones": zones, "content": content}
+            **_design_size_of(tpl), "content_zones": zones, "content": content}
 
 
 @router.put("/shop/{shop_id}/template-content/{zone_key}")
@@ -1551,7 +1560,7 @@ def group_template_content(group_id: int, ctx: TenantContext = Depends(require_t
     zones = [z for z in (tpl["zones"] if tpl else [])
              if (z.get("binding") or {}).get("source") == "content"]
     return {"group_id": group_id, "template_linked": tpl is not None,
-            "content_zones": zones, "content": content}
+            **_design_size_of(tpl), "content_zones": zones, "content": content}
 
 
 @router.put("/group/{group_id}/template-content/{zone_key}")
@@ -1613,12 +1622,15 @@ async def upload_group_zone_media(group_id: int, zone_key: str, file: UploadFile
 def device_template_content(device_id: int, ctx: TenantContext = Depends(require_tenant_context)):
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            _device_of_tenant(cur, device_id, ctx.active_tenant_id)
+            dev = _device_of_tenant(cur, device_id, ctx.active_tenant_id)
             tpl = _tenant_template(cur, ctx.active_tenant_id)
             content = _get_scope_content(cur, ctx.active_tenant_id, "device", "device_id", device_id)
     zones = [z for z in (tpl["zones"] if tpl else [])
              if (z.get("binding") or {}).get("source") == "content"]
+    # reported_resolution ("1920x1080", from the device heartbeat) lets the
+    # dashboard show zone pixel sizes for THIS screen, not just the design canvas.
     return {"device_id": device_id, "template_linked": tpl is not None,
+            **_design_size_of(tpl), "reported_resolution": dev[2],
             "content_zones": zones, "content": content}
 
 
