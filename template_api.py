@@ -1185,6 +1185,21 @@ def company_templates(ctx: TenantContext = Depends(require_tenant_context)):
                       for t in items]}
 
 
+@router.get("/group/{group_id}/template")
+def get_group_template(group_id: int, ctx: TenantContext = Depends(require_tenant_context)):
+    """The group's OWN template override (null = inherits the company default)."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            _group_of_tenant(cur, group_id, ctx.active_tenant_id)
+            cur.execute("""
+                SELECT g.template_id, st.name FROM public."group" g
+                LEFT JOIN public.screen_template st ON st.id = g.template_id
+                WHERE g.id = %s;
+            """, (group_id,))
+            row = cur.fetchone() or (None, None)
+    return {"group_id": group_id, "template_id": row[0], "template_name": row[1]}
+
+
 @router.put("/group/{group_id}/template")
 def set_group_template(group_id: int, body: TemplateAssignIn,
                        ctx: TenantContext = Depends(require_tenant_context)):
@@ -1202,6 +1217,22 @@ def set_group_template(group_id: int, body: TemplateAssignIn,
         conn.commit()
     return {"group_id": group_id, "template_id": body.template_id,
             "template_name": tpl["name"] if tpl else None}
+
+
+@router.get("/device-config/{device_id}/template")
+def get_device_template_assignment(device_id: int,
+                                   ctx: TenantContext = Depends(require_tenant_context)):
+    """The screen's OWN template override (null = inherits group/company)."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            _device_of_tenant(cur, device_id, ctx.active_tenant_id)
+            cur.execute("""
+                SELECT d.template_id, st.name FROM public.device d
+                LEFT JOIN public.screen_template st ON st.id = d.template_id
+                WHERE d.id = %s;
+            """, (device_id,))
+            row = cur.fetchone() or (None, None)
+    return {"device_id": device_id, "template_id": row[0], "template_name": row[1]}
 
 
 @router.put("/device-config/{device_id}/template")
