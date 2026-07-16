@@ -6446,6 +6446,19 @@ def standalone_list_devices(
                 cur.execute(base_sql + " ORDER BY d.id DESC LIMIT %s OFFSET %s;", tenant_params + [limit, offset])
             rows = cur.fetchall()
 
+            # Does this tenant have a published screen template linked? Screens
+            # render it regardless of playlist videos, so "0 videos" must not
+            # read as "No content" on template-driven fleets.
+            template_linked = False
+            if tenant_id:
+                cur.execute("""
+                    SELECT 1 FROM public.company c
+                    JOIN public.screen_template st
+                      ON st.id = c.template_id AND st.status = 'published'
+                    WHERE c.id = %s;
+                """, (tenant_id,))
+                template_linked = cur.fetchone() is not None
+
     items = []
     for r in rows:
         is_online = r[9] if len(r) > 9 else False
@@ -6460,7 +6473,9 @@ def standalone_list_devices(
         # - pending: Content assigned but not yet downloaded
         # - unknown: No content assigned or device hasn't checked in
         if video_count == 0:
-            content_status = "no_content"
+            # A linked template plays even with an empty rotation — the screen
+            # is template-driven, not contentless.
+            content_status = "template" if template_linked else "no_content"
         elif download_status and is_online:
             content_status = "synced"
         elif is_online and not download_status:
@@ -6492,6 +6507,9 @@ def standalone_list_devices(
             # Fleet telemetry (self-reported by the player heartbeat)
             "app_version": r[16] if len(r) > 16 else None,
             "reported_resolution": r[17] if len(r) > 17 else None,
+            # Lets the dashboard recompute content_status client-side (WS
+            # online/offline patches) with the same template awareness.
+            "template_linked": template_linked,
         })
     
     return {"items": items, "total": total, "count": len(items), "limit": limit, "offset": offset, "query": q}
