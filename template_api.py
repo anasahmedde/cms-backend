@@ -1321,7 +1321,11 @@ def company_template_preview(scope: str = "company",
     tenant_id = ctx.active_tenant_id
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            tpl = _tenant_template(cur, tenant_id)
+            # Preview the EFFECTIVE template for the scope (a screen/group may
+            # render a different template than the company default).
+            tpl = _effective_template(cur, tenant_id,
+                                      device_id=device_id if scope == "device" else None,
+                                      group_id=group_id if scope == "group" else None)
             if not tpl:
                 return {"template": None, "zones": []}
             shop_name = device_name = None
