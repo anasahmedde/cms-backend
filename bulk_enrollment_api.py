@@ -119,36 +119,186 @@ def _tenant_content_zones(cur, tenant_id: int):
     return zones, tpl
 
 
+def _library_names(cur, tenant_id: int) -> Dict[str, str]:
+    """s3_link -> library item name (videos + advertisements). Exported cells
+    prefer the NAME: it is what users recognize, and re-parsing a name restores
+    media_type from the library row (an s3://-only cell would re-derive it from
+    the file extension, which can disagree for extension-less objects)."""
+    names: Dict[str, str] = {}
+    cur.execute("SELECT s3_link, ad_name FROM public.advertisement WHERE tenant_id = %s;", (tenant_id,))
+    names.update({r[0]: r[1] for r in cur.fetchall() if r[0] and r[1]})
+    # Videos AFTER ads: resolve_media_value checks the video table first, so on a
+    # name collision the video row wins the lookup — let it win the export too.
+    cur.execute("SELECT s3_link, video_name FROM public.video WHERE tenant_id = %s;", (tenant_id,))
+    names.update({r[0]: r[1] for r in cur.fetchall() if r[0] and r[1]})
+    return names
+
+
+def _media_cell(pl: Dict, lib_names: Dict[str, str]) -> str:
+    """A media payload → sheet cell that parses back to the SAME payload."""
+    name = lib_names.get(pl.get("media_s3") or "")
+    if name:
+        return name
+    v = pl.get("media_url") or pl.get("media_s3") or ""
+    if not v:
+        return ""
+    derived = "video" if tpl_api.VIDEO_EXT_RE.search(v) else "image"
+    if pl.get("media_type") and pl["media_type"] != derived:
+        # The cell grammar can't carry an explicit type (it re-derives from the
+        # extension). Exporting this value would flip the type on re-upload —
+        # leave it blank instead (blank = leave as-is; the read-only sheet still
+        # shows what plays).
+        return ""
+    return v
+
+
+def _cell_of(field: str, pl: Dict, lib_names: Dict[str, str]) -> str:
+    """Inverse of _parse_row_content for one column: a cell value that re-parses
+    to the stored payload, so re-uploading an unmodified export is a no-op."""
+    if not pl:
+        return ""
+    if field == "text":
+        return pl.get("text") or ""
+    if field == "fit":
+        return pl.get("fit_mode") or ""
+    if field == "bg":
+        g = pl.get("bg_gradient") or {}
+        if g.get("stops"):
+            return f"{' -> '.join(g['stops'])} @{g.get('angle', 135)}"
+        return pl.get("bg_color") or pl.get("bg_image_url") or pl.get("bg_image_s3") or ""
+    if field == "media":
+        return _media_cell(pl, lib_names)
+    if field == "qr":
+        if pl.get("qr_link"):
+            return pl["qr_link"]
+        return _media_cell(pl, lib_names)
+    return ""
+
+
+def _fleet_rows(cur, tenant_id: int, ccols) -> Tuple[list, list]:
+    """(sheet_rows, devices) — one row per existing screen (newest row per
+    mobile_id, the row the player resolves). Content cells carry the screen's
+    OWN device-scope values; blank = inherits group/location/company."""
+    cur.execute("""
+        SELECT DISTINCT ON (d.mobile_id)
+               d.id, d.mobile_id, d.device_name,
+               COALESCE(d.reported_resolution, d.resolution, ''),
+               COALESCE(s.shop_name, ''), COALESCE(g.gname, ''), d.activation_code
+        FROM public.device d
+        LEFT JOIN public.device_assignment da ON da.did = d.id
+        LEFT JOIN public.shop s ON s.id = da.sid
+        LEFT JOIN public."group" g ON g.id = da.gid
+        WHERE d.tenant_id = %s
+        ORDER BY d.mobile_id, d.id DESC;
+    """, (tenant_id,))
+    devs = sorted(cur.fetchall(), key=lambda r: (r[4], r[2] or ""))
+    if not devs:
+        return [], []
+    lib_names = _library_names(cur, tenant_id) if ccols else {}
+    own: Dict[int, Dict[str, Dict]] = {}
+    if ccols:
+        cur.execute("""
+            SELECT device_id, zone_key, payload FROM public.template_zone_content
+            WHERE tenant_id = %s AND scope = 'device' AND device_id = ANY(%s);
+        """, (tenant_id, [d[0] for d in devs]))
+        for did, zk, pl in cur.fetchall():
+            own.setdefault(did, {})[zk] = json.loads(pl) if isinstance(pl, str) else pl
+    rows = []
+    for did, mid, name, res, shop, grp, activation in devs:
+        pending = mid.startswith(PENDING_PREFIX)
+        note = f"pending — claim on site (code {activation})" if pending and activation else ""
+        base = [name or "", shop, grp, mid or "", res, note]
+        rows.append(base + [_cell_of(f, (own.get(did) or {}).get(k) or {}, lib_names)
+                            for (_h, k, f, _zt) in ccols])
+    return rows, devs
+
+
+def _effective_playback(cur, tenant_id: int, devs, ccols) -> list:
+    """Read-only rows: what each screen actually renders per editable box right
+    now, and which level set it (screen > group > location > company)."""
+    zone_keys = list(dict.fromkeys(k for (_h, k, _f, _zt) in ccols))
+    if not zone_keys or not devs:
+        return []
+    cur.execute("SELECT did, sid, gid FROM public.device_assignment WHERE did = ANY(%s);",
+                ([d[0] for d in devs],))
+    asg = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+    company: Dict[str, Dict] = {}
+    by_shop: Dict[int, Dict[str, Dict]] = {}
+    by_dev: Dict[int, Dict[str, Dict]] = {}
+    by_grp: Dict[int, Dict[str, Dict]] = {}
+    cur.execute("SELECT zone_key, scope, shop_id, device_id, payload"
+                " FROM public.template_zone_content WHERE tenant_id = %s;", (tenant_id,))
+    for zk, scope, sid, did, pl in cur.fetchall():
+        pl = json.loads(pl) if isinstance(pl, str) else pl
+        if scope == "company":
+            company[zk] = pl
+        elif scope == "shop" and sid is not None:
+            by_shop.setdefault(sid, {})[zk] = pl
+        elif scope == "device" and did is not None:
+            by_dev.setdefault(did, {})[zk] = pl
+    cur.execute("SELECT zone_key, group_id, payload"
+                " FROM public.template_zone_group_content WHERE tenant_id = %s;", (tenant_id,))
+    for zk, gid, pl in cur.fetchall():
+        by_grp.setdefault(gid, {})[zk] = json.loads(pl) if isinstance(pl, str) else pl
+    out = []
+    for did, mid, name, _res, shop, grp, _act in devs:
+        sid, gid = asg.get(did, (None, None))
+        for zk in zone_keys:
+            for level, store in (("this screen", by_dev.get(did)),
+                                 ("its group", by_grp.get(gid) if gid else None),
+                                 ("its location", by_shop.get(sid) if sid else None),
+                                 ("company default", company)):
+                pl = (store or {}).get(zk)
+                if pl:
+                    out.append([name or mid, shop, grp, zk, level, _content_summary(pl)])
+                    break
+            else:
+                out.append([name or mid, shop, grp, zk, "", "(nothing set — box is blank)"])
+    return out
+
+
 def _template_bundle(tenant_id: int):
-    """Columns, example rows, and instructions for the tenant's linked template."""
+    """Columns, current-fleet rows (or example rows for an empty fleet),
+    read-only playback rows, and instructions for the tenant's linked template."""
     with pg_conn() as conn:
         with conn.cursor() as cur:
             content_cols, tpl = _tenant_content_zones(cur, tenant_id)
-    ccols = content_columns_for(content_cols)
+            ccols = content_columns_for(content_cols)
+            fleet, devs = _fleet_rows(cur, tenant_id, ccols)
+            playback = _effective_playback(cur, tenant_id, devs, ccols)
     headers = BASE_COLUMNS + [h for (h, _, _, _) in ccols]
-    example = [list(r) + ["" for _ in ccols] for r in BASE_EXAMPLE]
-    if ccols and example:
-        for i, (_h, _k, field, _zt) in enumerate(ccols):
-            example[0][len(BASE_COLUMNS) + i] = _ZONE_HELP.get(field, ("", ""))[0]
+    if fleet:
+        rows = fleet
+    else:
+        rows = [list(r) + ["" for _ in ccols] for r in BASE_EXAMPLE]
+        if ccols and rows:
+            for i, (_h, _k, field, _zt) in enumerate(ccols):
+                rows[0][len(BASE_COLUMNS) + i] = _ZONE_HELP.get(field, ("", ""))[0]
     instructions = list(BASE_INSTRUCTIONS)
+    if fleet:
+        instructions.insert(1, f"This file lists your CURRENT {len(fleet)} screen(s) — one row each. "
+                               "Edit a value or append new rows, then upload. A blank cell always means "
+                               "'leave as-is', so re-uploading an untouched file changes nothing.")
     if ccols:
         instructions.append("")
-        instructions.append(f"Screen content (from the linked template '{tpl['name']}') — filled PER SCREEN; blank = inherit the shop's content:")
+        instructions.append(f"Screen content (from the linked template '{tpl['name']}' v{tpl.get('version', 1)}) — "
+                            "applies to THAT screen only and OVERRIDES its group/location/company content; "
+                            "blank = keep inheriting:")
         for (h, _k, field, _zt) in ccols:
             instructions.append(f"{h}: {_ZONE_HELP.get(field, ('', 'content'))[1]}")
     else:
         instructions.append("")
         instructions.append("(No screen template is linked to this company yet, so there are no content columns.)")
-    return headers, example, instructions, ccols
+    return headers, rows, instructions, ccols, playback
 
 
-def _csv_bytes(headers, example, instructions) -> bytes:
+def _csv_bytes(headers, rows, instructions) -> bytes:
     buf = io.StringIO()
     w = csv.writer(buf)
     for line in instructions:
         w.writerow(["# " + line] if line else [])
     w.writerow(headers)
-    for row in example:
+    for row in rows:
         w.writerow(row)
     return buf.getvalue().encode("utf-8")
 
@@ -170,9 +320,9 @@ class ClaimIn(BaseModel):
 @router.get("/bulk-devices/template.csv")
 def template_csv(ctx: TenantContext = Depends(require_tenant_context)):
     _require_manage_devices(ctx)
-    headers, example, instructions, _ = _template_bundle(ctx.active_tenant_id)
+    headers, rows, instructions, _ccols, _playback = _template_bundle(ctx.active_tenant_id)
     return StreamingResponse(
-        io.BytesIO(_csv_bytes(headers, example, instructions)), media_type="text/csv",
+        io.BytesIO(_csv_bytes(headers, rows, instructions)), media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="digix-devices-template.csv"'},
     )
 
@@ -185,7 +335,7 @@ def template_xlsx(ctx: TenantContext = Depends(require_tenant_context)):
         from openpyxl.styles import Font, PatternFill
     except ImportError:
         raise HTTPException(status_code=501, detail="XLSX export unavailable; use the CSV template")
-    headers, example, instructions, ccols = _template_bundle(ctx.active_tenant_id)
+    headers, rows, instructions, _ccols, playback = _template_bundle(ctx.active_tenant_id)
     wb = Workbook()
     ws = wb.active
     ws.title = "Devices"
@@ -196,10 +346,22 @@ def template_xlsx(ctx: TenantContext = Depends(require_tenant_context)):
     for i, cell in enumerate(ws[1]):
         cell.fill = content_fill if i >= len(BASE_COLUMNS) else header_fill
         cell.font = header_font
-    for row in example:
+    for row in rows:
         ws.append(row)
     for i in range(len(headers)):
         ws.column_dimensions[_col_letter(i + 1)].width = 30 if i >= len(BASE_COLUMNS) else [26, 22, 18, 22, 12, 30][i]
+    if playback:
+        # Visibility, not input: what every screen renders in each editable box
+        # and which level set it. Only the first sheet is read on upload.
+        pb = wb.create_sheet("Current playback (read-only)")
+        pb.append(["screen", "location", "group", "box", "set at", "currently showing"])
+        for cell in pb[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+        for row in playback:
+            pb.append(row)
+        for i, width in enumerate([26, 22, 18, 20, 18, 44]):
+            pb.column_dimensions[_col_letter(i + 1)].width = width
     info = wb.create_sheet("Instructions")
     for line in instructions:
         info.append([line])
@@ -447,10 +609,15 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
     for i, rec in enumerate(rows):
         rownum = i + 1
         row_errors = []
-        for col in REQUIRED:
-            if not rec.get(col):
-                row_errors.append(f"{col} is required")
         dev_id = rec.get("device_id", "").strip()
+        # Required fields gate NEW rows only. For a screen that already exists
+        # (fleet-export round trip) a blank cell means "leave as-is" — a screen
+        # with no location yet must re-upload cleanly, not fail "shop_name is
+        # required".
+        if dev_id not in mobile_ids_this_tenant:
+            for col in REQUIRED:
+                if not rec.get(col):
+                    row_errors.append(f"{col} is required")
         if dev_id:
             if not MOBILE_ID_RE.match(dev_id):
                 row_errors.append("device_id has invalid characters")
@@ -458,7 +625,10 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
                 row_errors.append(f"duplicate device_id (also on row {seen_ids[dev_id]})")
             elif dev_id in mobile_ids_other_tenant:
                 row_errors.append("device_id already belongs to another company")
-            if dev_id and dev_id.startswith(PENDING_PREFIX):
+            if (dev_id and dev_id.startswith(PENDING_PREFIX)
+                    and dev_id not in mobile_ids_this_tenant):
+                # A pending id that IS ours round-trips from the fleet export —
+                # it flows through the normal update/unchanged path above.
                 row_errors.append("device_id must be a real device id, not a placeholder")
         res = rec.get("resolution", "").strip()
         if res and not RESOLUTION_RE.match(res):

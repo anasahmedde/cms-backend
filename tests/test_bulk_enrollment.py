@@ -172,3 +172,87 @@ def test_pending_code_is_unambiguous():
         c = _pending_code()
         assert len(c) == 6
         assert not (set(c) & set("O0I1"))
+
+
+class TestFleetExportCells:
+    """_cell_of must be the exact inverse of _parse_row_content's grammar, so
+    re-uploading an unmodified fleet export diffs to zero."""
+
+    def test_text_and_fit_round_trip(self):
+        from bulk_enrollment_api import _cell_of
+        assert _cell_of("text", {"text": "50% OFF"}, {}) == "50% OFF"
+        assert _cell_of("fit", {"fit_mode": "contain"}, {}) == "contain"
+        assert _cell_of("text", {}, {}) == ""
+
+    def test_bg_color_gradient_and_image(self):
+        from bulk_enrollment_api import _cell_of
+        assert _cell_of("bg", {"bg_color": "#111827"}, {}) == "#111827"
+        cell = _cell_of("bg", {"bg_gradient": {"stops": ["#0a1628", "#f59e0b"], "angle": 90}}, {})
+        assert cell == "#0a1628 -> #f59e0b @90"
+        assert _cell_of("bg", {"bg_image_url": "https://cdn/x.jpg"}, {}) == "https://cdn/x.jpg"
+
+    def test_gradient_cell_reparses_identically(self):
+        # The exported gradient string must re-parse to the same payload.
+        import re as _re
+        from bulk_enrollment_api import _cell_of
+        cell = _cell_of("bg", {"bg_gradient": {"stops": ["#0a1628", "#f59e0b"], "angle": 135}}, {})
+        hexes = _re.findall(r"#[0-9a-fA-F]{3,8}", cell)
+        angle = int(_re.search(r"@(\d{1,3})", cell).group(1))
+        assert hexes == ["#0a1628", "#f59e0b"] and angle == 135
+
+    def test_media_prefers_library_name(self):
+        from bulk_enrollment_api import _cell_of
+        lib = {"s3://bucket/videos/promo.mp4": "Summer Promo"}
+        assert _cell_of("media", {"media_s3": "s3://bucket/videos/promo.mp4",
+                                  "media_type": "video"}, lib) == "Summer Promo"
+
+    def test_media_type_mismatch_exports_blank(self):
+        # An extension-less video URL can't round-trip (the parser would re-derive
+        # "image" and downgrade the zone) — the cell must stay blank.
+        from bulk_enrollment_api import _cell_of
+        assert _cell_of("media", {"media_url": "https://stream.example.com/live",
+                                  "media_type": "video"}, {}) == ""
+        # …but a matching extension exports fine.
+        assert _cell_of("media", {"media_url": "https://cdn/x.mp4",
+                                  "media_type": "video"}, {}) == "https://cdn/x.mp4"
+
+    def test_qr_link_wins(self):
+        from bulk_enrollment_api import _cell_of
+        assert _cell_of("qr", {"qr_mode": "link", "qr_link": "https://menu.example.com",
+                               "qr_generated_s3": "s3://b/qr.png"}, {}) == "https://menu.example.com"
+
+
+class TestPendingRoundTrip:
+    def test_existing_pending_id_is_unchanged_not_error(self):
+        # A fleet export carries pending:CODE ids; re-uploading them must be a
+        # no-op (update path), not "must be a real device id".
+        rows = [{"device_name": "Lobby", "shop_name": "Shop A", "group_name": "",
+                 "device_id": "pending:ABC123", "resolution": "", "notes": ""}]
+        out = validate_rows(rows, existing_device_count=1, max_devices=0,
+                            mobile_ids_this_tenant={"pending:ABC123"},
+                            mobile_ids_other_tenant=set())
+        assert out["summary"]["valid"] is True
+        assert out["rows"][0]["action"] in ("unchanged", "update")
+
+    def test_unknown_pending_id_still_rejected(self):
+        rows = [{"device_name": "Lobby", "shop_name": "Shop A", "group_name": "",
+                 "device_id": "pending:TYPED", "resolution": "", "notes": ""}]
+        out = validate_rows(rows, existing_device_count=0, max_devices=0,
+                            mobile_ids_this_tenant=set(), mobile_ids_other_tenant=set())
+        assert any("placeholder" in e["reason"] for e in out["errors"])
+
+    def test_existing_screen_without_location_round_trips(self):
+        # Fleet export writes blank shop_name for screens with no location —
+        # blank means "leave as-is" for EXISTING ids, so it must validate clean.
+        rows = [{"device_name": "Orphan", "shop_name": "", "group_name": "",
+                 "device_id": "abc123", "resolution": "", "notes": ""}]
+        out = validate_rows(rows, existing_device_count=1, max_devices=0,
+                            mobile_ids_this_tenant={"abc123"}, mobile_ids_other_tenant=set())
+        assert out["summary"]["valid"] is True
+
+    def test_new_row_still_requires_shop(self):
+        rows = [{"device_name": "New Screen", "shop_name": "", "group_name": "",
+                 "device_id": "newdev1", "resolution": "", "notes": ""}]
+        out = validate_rows(rows, existing_device_count=0, max_devices=0,
+                            mobile_ids_this_tenant=set(), mobile_ids_other_tenant=set())
+        assert any("shop_name is required" in e["reason"] for e in out["errors"])
