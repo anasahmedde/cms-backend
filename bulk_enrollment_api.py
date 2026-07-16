@@ -55,7 +55,8 @@ def _require_manage_devices(ctx: TenantContext):
     if not ctx.has_permission("manage_devices"):
         raise HTTPException(status_code=403, detail="Permission denied: manage_devices required")
 
-BASE_COLUMNS = ["device_name", "shop_name", "group_name", "device_id", "resolution", "notes"]
+BASE_COLUMNS = ["device_name", "shop_name", "group_name", "template", "device_id", "resolution", "notes"]
+BASE_WIDTHS = [26, 22, 18, 22, 22, 12, 30]
 COLUMNS = BASE_COLUMNS  # back-compat alias
 REQUIRED = ["device_name", "shop_name"]
 RESOLUTION_RE = re.compile(r"^\d{2,5}x\d{2,5}$")
@@ -65,14 +66,15 @@ MAX_ROWS = 20000
 COMMIT_BATCH = 500
 
 BASE_EXAMPLE = [
-    ["Main Entrance Screen", "Shop Karachi 12", "North Region", "a1b2c3d4e5f6a7b8", "1080x1920", "landscape TV at door"],
-    ["Checkout Screen", "Shop Karachi 12", "North Region", "", "", "device id unknown - will be claimed on site"],
+    ["Main Entrance Screen", "Shop Karachi 12", "North Region", "", "a1b2c3d4e5f6a7b8", "1080x1920", "landscape TV at door"],
+    ["Checkout Screen", "Shop Karachi 12", "North Region", "", "", "", "device id unknown - will be claimed on site"],
 ]
 BASE_INSTRUCTIONS = [
     "DIGIX bulk device import — fill one row per screen, then upload this file.",
     "device_name (required): a friendly name for the screen.",
     "shop_name (required): the shop this screen belongs to; created automatically if new.",
     "group_name (optional): a group for the screen; created automatically if new.",
+    "template (optional): the screen template THIS screen should render, by exact name. Blank = inherit from its group / the company default. Templates are never created from this sheet — the name must match one linked to your company.",
     "device_id (optional): the device's ANDROID_ID. If you know it, the screen auto-enrolls when it powers on. Leave blank to create a 'pending' screen you claim on site.",
     "resolution (optional): e.g. 1080x1920. Auto-detected from the device if blank.",
     "notes (optional): free text, not shown on screens.",
@@ -112,11 +114,23 @@ def content_columns_for(zones) -> list:
 
 
 def _tenant_content_zones(cur, tenant_id: int):
-    tpl = tpl_api._tenant_template(cur, tenant_id)
-    if not tpl:
-        return [], None
-    zones = [z for z in tpl["zones"] if (z.get("binding") or {}).get("source") == "content"]
-    return zones, tpl
+    """(content_zones, default_template, all_usable_templates).
+
+    Zones are the UNION across every template the company can use (default
+    first; the first definition of a key wins) — content is keyed by zone_key,
+    so one 'promo' column fills the promo box on every template that has it.
+    """
+    templates = tpl_api._company_template_choices(cur, tenant_id)
+    if not templates:
+        return [], None, []
+    default = next((t for t in templates if t.get("is_default")), templates[0])
+    seen: Dict[str, Dict] = {}
+    for t in templates:
+        for z in t["zones"]:
+            if (z.get("binding") or {}).get("source") != "content":
+                continue
+            seen.setdefault(z.get("key"), z)
+    return list(seen.values()), default, templates
 
 
 def _library_names(cur, tenant_id: int) -> Dict[str, str]:
@@ -183,11 +197,13 @@ def _fleet_rows(cur, tenant_id: int, ccols) -> Tuple[list, list]:
         SELECT DISTINCT ON (d.mobile_id)
                d.id, d.mobile_id, d.device_name,
                COALESCE(d.reported_resolution, d.resolution, ''),
-               COALESCE(s.shop_name, ''), COALESCE(g.gname, ''), d.activation_code
+               COALESCE(s.shop_name, ''), COALESCE(g.gname, ''), d.activation_code,
+               COALESCE(st.name, ''), g.template_id
         FROM public.device d
         LEFT JOIN public.device_assignment da ON da.did = d.id
         LEFT JOIN public.shop s ON s.id = da.sid
         LEFT JOIN public."group" g ON g.id = da.gid
+        LEFT JOIN public.screen_template st ON st.id = d.template_id
         WHERE d.tenant_id = %s
         ORDER BY d.mobile_id, d.id DESC;
     """, (tenant_id,))
@@ -204,21 +220,25 @@ def _fleet_rows(cur, tenant_id: int, ccols) -> Tuple[list, list]:
         for did, zk, pl in cur.fetchall():
             own.setdefault(did, {})[zk] = json.loads(pl) if isinstance(pl, str) else pl
     rows = []
-    for did, mid, name, res, shop, grp, activation in devs:
+    for did, mid, name, res, shop, grp, activation, tpl_override, _grp_tpl in devs:
         pending = mid.startswith(PENDING_PREFIX)
         note = f"pending — claim on site (code {activation})" if pending and activation else ""
-        base = [name or "", shop, grp, mid or "", res, note]
+        # template cell = the screen's OWN override only; blank = inherits
+        # (group/company) — mirrors the blank-means-leave-as-is grammar.
+        base = [name or "", shop, grp, tpl_override, mid or "", res, note]
         rows.append(base + [_cell_of(f, (own.get(did) or {}).get(k) or {}, lib_names)
                             for (_h, k, f, _zt) in ccols])
     return rows, devs
 
 
-def _effective_playback(cur, tenant_id: int, devs, ccols) -> list:
+def _effective_playback(cur, tenant_id: int, devs, ccols, templates=None) -> list:
     """Read-only rows: what each screen actually renders per editable box right
     now, and which level set it (screen > group > location > company)."""
     zone_keys = list(dict.fromkeys(k for (_h, k, _f, _zt) in ccols))
     if not zone_keys or not devs:
         return []
+    tpl_names = {t["id"]: t["name"] for t in (templates or [])}
+    default_tpl = next((t["name"] for t in (templates or []) if t.get("is_default")), "")
     cur.execute("SELECT did, sid, gid FROM public.device_assignment WHERE did = ANY(%s);",
                 ([d[0] for d in devs],))
     asg = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
@@ -241,8 +261,10 @@ def _effective_playback(cur, tenant_id: int, devs, ccols) -> list:
     for zk, gid, pl in cur.fetchall():
         by_grp.setdefault(gid, {})[zk] = json.loads(pl) if isinstance(pl, str) else pl
     out = []
-    for did, mid, name, _res, shop, grp, _act in devs:
+    for did, mid, name, _res, shop, grp, _act, tpl_override, grp_tpl_id in devs:
         sid, gid = asg.get(did, (None, None))
+        # Effective template: screen override > group override > company default.
+        eff_tpl = tpl_override or tpl_names.get(grp_tpl_id, "") or default_tpl
         for zk in zone_keys:
             for level, store in (("this screen", by_dev.get(did)),
                                  ("its group", by_grp.get(gid) if gid else None),
@@ -250,10 +272,10 @@ def _effective_playback(cur, tenant_id: int, devs, ccols) -> list:
                                  ("company default", company)):
                 pl = (store or {}).get(zk)
                 if pl:
-                    out.append([name or mid, shop, grp, zk, level, _content_summary(pl)])
+                    out.append([name or mid, shop, grp, eff_tpl, zk, level, _content_summary(pl)])
                     break
             else:
-                out.append([name or mid, shop, grp, zk, "", "(nothing set — box is blank)"])
+                out.append([name or mid, shop, grp, eff_tpl, zk, "", "(nothing set — box is blank)"])
     return out
 
 
@@ -262,10 +284,10 @@ def _template_bundle(tenant_id: int):
     read-only playback rows, and instructions for the tenant's linked template."""
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            content_cols, tpl = _tenant_content_zones(cur, tenant_id)
+            content_cols, tpl, templates = _tenant_content_zones(cur, tenant_id)
             ccols = content_columns_for(content_cols)
             fleet, devs = _fleet_rows(cur, tenant_id, ccols)
-            playback = _effective_playback(cur, tenant_id, devs, ccols)
+            playback = _effective_playback(cur, tenant_id, devs, ccols, templates)
     headers = BASE_COLUMNS + [h for (h, _, _, _) in ccols]
     if fleet:
         rows = fleet
@@ -279,11 +301,19 @@ def _template_bundle(tenant_id: int):
         instructions.insert(1, f"This file lists your CURRENT {len(fleet)} screen(s) — one row each. "
                                "Edit a value or append new rows, then upload. A blank cell always means "
                                "'leave as-is', so re-uploading an untouched file changes nothing.")
+    if templates and len(templates) > 1:
+        names = ", ".join(f"'{t['name']}' ({t['orientation']} {t['design_width']}×{t['design_height']})"
+                          for t in templates)
+        instructions.insert(2 if fleet else 1,
+                            f"Templates available to the template column: {names}. "
+                            f"Default (used when blank): '{tpl['name']}'.")
     if ccols:
         instructions.append("")
-        instructions.append(f"Screen content (from the linked template '{tpl['name']}' v{tpl.get('version', 1)}) — "
-                            "applies to THAT screen only and OVERRIDES its group/location/company content; "
-                            "blank = keep inheriting:")
+        instructions.append(f"Screen content (from the linked template '{tpl['name']}' v{tpl.get('version', 1)}"
+                            + (f" plus {len(templates) - 1} more linked template(s); a column fills the box with "
+                               f"that name on WHICHEVER template a screen renders" if len(templates) > 1 else "")
+                            + ") — applies to THAT screen only and OVERRIDES its group/location/company content; "
+                              "blank = keep inheriting:")
         for (h, _k, field, _zt) in ccols:
             instructions.append(f"{h}: {_ZONE_HELP.get(field, ('', 'content'))[1]}")
     else:
@@ -349,18 +379,18 @@ def template_xlsx(ctx: TenantContext = Depends(require_tenant_context)):
     for row in rows:
         ws.append(row)
     for i in range(len(headers)):
-        ws.column_dimensions[_col_letter(i + 1)].width = 30 if i >= len(BASE_COLUMNS) else [26, 22, 18, 22, 12, 30][i]
+        ws.column_dimensions[_col_letter(i + 1)].width = 30 if i >= len(BASE_COLUMNS) else BASE_WIDTHS[i]
     if playback:
         # Visibility, not input: what every screen renders in each editable box
         # and which level set it. Only the first sheet is read on upload.
         pb = wb.create_sheet("Current playback (read-only)")
-        pb.append(["screen", "location", "group", "box", "set at", "currently showing"])
+        pb.append(["screen", "location", "group", "template", "box", "set at", "currently showing"])
         for cell in pb[1]:
             cell.fill = header_fill
             cell.font = header_font
         for row in playback:
             pb.append(row)
-        for i, width in enumerate([26, 22, 18, 20, 18, 44]):
+        for i, width in enumerate([26, 22, 18, 22, 20, 18, 44]):
             pb.column_dimensions[_col_letter(i + 1)].width = width
     info = wb.create_sheet("Instructions")
     for line in instructions:
@@ -533,20 +563,22 @@ def _current_states(cur, tenant_id: int, mobile_ids) -> Dict[str, Dict[str, Any]
     # id ASC so that with duplicate mobile_ids (stale ghost rows) the NEWEST row
     # ends up in out[mid] — the same row the player resolves and the commit writes.
     cur.execute("""
-        SELECT d.id, d.mobile_id, d.device_name, s.shop_name, g.gname
+        SELECT d.id, d.mobile_id, d.device_name, s.shop_name, g.gname, st.name
         FROM public.device d
         LEFT JOIN public.device_assignment da ON da.did = d.id
         LEFT JOIN public.shop s ON s.id = da.sid
         LEFT JOIN public."group" g ON g.id = da.gid
+        LEFT JOIN public.screen_template st ON st.id = d.template_id
         WHERE d.tenant_id = %s AND d.mobile_id = ANY(%s)
         ORDER BY d.id ASC;
     """, (tenant_id, ids))
     did_to_mid: Dict[int, str] = {}
-    for did, mid, name, shop, grp in cur.fetchall():
+    for did, mid, name, shop, grp, tpl_name in cur.fetchall():
         stale = out.get(mid)
         if stale:  # older duplicate loses its reverse mapping too
             did_to_mid.pop(stale["id"], None)
-        out[mid] = {"id": did, "name": name or "", "shop": shop or "", "group": grp or "", "content": {}}
+        out[mid] = {"id": did, "name": name or "", "shop": shop or "", "group": grp or "",
+                    "template": tpl_name or "", "content": {}}
         did_to_mid[did] = mid
     if did_to_mid:
         cur.execute("""
@@ -563,7 +595,7 @@ def _current_states(cur, tenant_id: int, mobile_ids) -> Dict[str, Dict[str, Any]
 
 
 def _row_changes(device_name: str, shop_name: str, group_name: str,
-                 row_content: Dict, current: Dict) -> List[Dict[str, str]]:
+                 row_content: Dict, current: Dict, template_name: str = "") -> List[Dict[str, str]]:
     """What a re-upload row changes on an EXISTING device: [{field, from, to}].
     A blank cell means 'leave as-is' — only a non-blank value that differs counts."""
     changes: List[Dict[str, str]] = []
@@ -575,6 +607,7 @@ def _row_changes(device_name: str, shop_name: str, group_name: str,
     diff("name", device_name, current.get("name"))
     diff("location", shop_name, current.get("shop"))
     diff("group", group_name, current.get("group"))
+    diff("template", template_name, current.get("template"))
     cur_content = current.get("content") or {}
     for zk, payload in (row_content or {}).items():
         cur_p = cur_content.get(zk) or {}
@@ -608,7 +641,8 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
                   mobile_ids_this_tenant: set, mobile_ids_other_tenant: set,
                   content_cols=None, cur=None, tenant_id=None,
                   existing_shops: Optional[Dict[str, str]] = None,
-                  existing_groups: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+                  existing_groups: Optional[Dict[str, str]] = None,
+                  template_names: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Pure validation. Returns preview {rows, errors, summary}. Writes nothing."""
     errors: List[Dict[str, Any]] = []
     seen_ids: Dict[str, int] = {}
@@ -641,6 +675,16 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
             guard = _name_guard(raw, existing, kind)
             if guard:
                 row_errors.append(guard)
+        # Templates are NEVER created from the sheet — the cell must name one
+        # of the company's linked templates exactly (blank = inherit).
+        tpl_cell = rec.get("template", "").strip()
+        if tpl_cell and template_names is not None and tpl_cell not in template_names.values():
+            canonical = template_names.get(_normalize_name(tpl_cell))
+            if canonical:
+                row_errors.append(f"template '{tpl_cell}' doesn't match exactly — use '{canonical}'")
+            else:
+                avail = ", ".join(sorted(template_names.values())) or "none linked yet"
+                row_errors.append(f"template '{tpl_cell}' isn't linked to your company (available: {avail})")
         if dev_id:
             if not MOBILE_ID_RE.match(dev_id):
                 row_errors.append("device_id has invalid characters")
@@ -673,7 +717,8 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
                     # operator sees exactly what a re-upload will change (and only that).
                     row_changes = _row_changes(
                         rec.get("device_name", "").strip(), rec.get("shop_name", "").strip(),
-                        rec.get("group_name", "").strip(), row_content, current_states.get(dev_id, {}))
+                        rec.get("group_name", "").strip(), row_content, current_states.get(dev_id, {}),
+                        template_name=rec.get("template", "").strip())
                     if row_changes:
                         will = "update"
                         updated += 1
@@ -704,6 +749,7 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
             "device_name": rec.get("device_name", ""),
             "shop_name": rec.get("shop_name", ""),
             "group_name": rec.get("group_name", ""),
+            "template": rec.get("template", "").strip(),
             "device_id": dev_id,
             "resolution": res,
             "action": will,
@@ -767,9 +813,11 @@ async def bulk_validate(file: UploadFile = File(...), ctx: TenantContext = Depen
                 for mid, tid in cur.fetchall():
                     (mine if tid == tenant_id else other).add(mid)
 
-            # Content columns come from the company's linked template (if any).
-            content_zones, _tpl = _tenant_content_zones(cur, tenant_id)
+            # Content columns come from the company's usable templates (if any).
+            content_zones, _tpl, _templates = _tenant_content_zones(cur, tenant_id)
             content_cols = content_columns_for(content_zones)
+            # Template names the `template` column may reference (never created).
+            template_names = {_normalize_name(t["name"]): t["name"] for t in _templates}
 
             # Existing location/group names (normalized -> canonical) so a
             # case/spacing near-miss errors with the real name instead of
@@ -781,7 +829,8 @@ async def bulk_validate(file: UploadFile = File(...), ctx: TenantContext = Depen
 
             preview = validate_rows(rows, existing, max_devices, mine, other,
                                     content_cols=content_cols, cur=cur, tenant_id=tenant_id,
-                                    existing_shops=existing_shops, existing_groups=existing_groups)
+                                    existing_shops=existing_shops, existing_groups=existing_groups,
+                                    template_names=template_names)
 
             cur.execute("""
                 INSERT INTO public.bulk_import_job
@@ -832,9 +881,11 @@ def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_cont
                 group_ids = _upsert_named(cur, '"group"', "gname",
                                           {r["group_name"] for r in rows if r["group_name"]}, tenant_id)
 
-                # Content zones of the linked template, for writing per-device content.
-                content_zones, _tpl = _tenant_content_zones(cur, tenant_id)
+                # Content zones of the company's usable templates, for writing
+                # per-device content; template names for the `template` column.
+                content_zones, _tpl, _templates = _tenant_content_zones(cur, tenant_id)
                 zone_map = {z["key"]: z for z in content_zones}
+                template_ids_by_name = {t["name"]: t["id"] for t in _templates}
 
                 created = skipped = pending = updated = 0
                 content_written = 0
@@ -903,6 +954,9 @@ def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_cont
                         if "name" in chg and r.get("device_name"):
                             cur.execute("UPDATE public.device SET device_name = %s WHERE id = %s;",
                                         (r["device_name"], did))
+                        if "template" in chg and r.get("template") in template_ids_by_name:
+                            cur.execute("UPDATE public.device SET template_id = %s WHERE id = %s;",
+                                        (template_ids_by_name[r["template"]], did))
                         loc_c, grp_c = ("location" in chg), ("group" in chg)
                         if loc_c or grp_c:
                             gid = group_ids.get(r["group_name"]) if r.get("group_name") else None
@@ -943,10 +997,11 @@ def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_cont
                     cur.execute("""
                         INSERT INTO public.device
                             (mobile_id, download_status, is_online, is_active, last_online_at,
-                             resolution, device_name, tenant_id, activation_code)
-                        VALUES (%s, FALSE, FALSE, TRUE, NOW(), %s, %s, %s, %s)
+                             resolution, device_name, tenant_id, activation_code, template_id)
+                        VALUES (%s, FALSE, FALSE, TRUE, NOW(), %s, %s, %s, %s, %s)
                         RETURNING id;
-                    """, (mobile_id, r["resolution"] or None, r["device_name"] or None, tenant_id, activation))
+                    """, (mobile_id, r["resolution"] or None, r["device_name"] or None, tenant_id,
+                          activation, template_ids_by_name.get(r.get("template") or "")))
                     did = cur.fetchone()[0]
                     gid = group_ids.get(r["group_name"]) if r["group_name"] else None
                     sid = shop_ids.get(r["shop_name"]) if r["shop_name"] else None

@@ -83,6 +83,7 @@ from migrations.bulk_import_schema import ensure_bulk_import_schema
 from migrations.reported_resolution_schema import ensure_reported_resolution_schema
 from migrations.auth_session_schema import ensure_auth_session_schema
 from migrations.company_features_schema import ensure_company_features_schema
+from migrations.multi_template_schema import ensure_multi_template_schema
 
 load_dotenv()
 
@@ -229,6 +230,7 @@ async def startup_event():
             ensure_reported_resolution_schema(conn)  # NEW: device-reported resolution provenance
             ensure_auth_session_schema(conn)  # NEW: durable auth sessions (survive deploys)
             ensure_company_features_schema(conn)  # NEW: per-company feature flags
+            ensure_multi_template_schema(conn)  # NEW: per-group/per-device template overrides
         print("[APP] All schema migrations verified")
     except Exception as e:
         print(f"[APP] Schema migration warning: {e}")
@@ -3519,8 +3521,10 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                     print(f"is_muted/ble_device_id check skipped: {e}")
 
                 # Screen-template change detection (template_version/template_stamp).
-                # Never raises; returns nulls when no template is linked.
-                template_fields = heartbeat_template_fields(cur, tenant_id)
+                # Never raises; returns nulls when no template is linked. Passing
+                # the device row makes the stamp track ITS effective template
+                # (screen > group > company), so re-assignment refetches.
+                template_fields = heartbeat_template_fields(cur, tenant_id, device_id=did)
 
                 # Log status change if it actually changed
                 if previous_status != body.is_online:

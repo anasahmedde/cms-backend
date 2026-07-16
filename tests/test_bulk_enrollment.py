@@ -296,3 +296,41 @@ class TestNameGuards:
         out = validate_rows(self._row("lahore shop"), existing_device_count=0, max_devices=0,
                             mobile_ids_this_tenant=set(), mobile_ids_other_tenant=set())
         assert out["summary"]["valid"] is True
+
+
+class TestTemplateColumn:
+    NAMES = {"portrait menu": "Portrait Menu", "landscape promo": "Landscape Promo"}
+
+    def _row(self, template, dev="dev1"):
+        return [{"device_name": "S1", "shop_name": "Shop A", "group_name": "",
+                 "template": template, "device_id": dev, "resolution": "", "notes": ""}]
+
+    def _run(self, rows, mine=None):
+        return validate_rows(rows, existing_device_count=0, max_devices=0,
+                             mobile_ids_this_tenant=mine or set(), mobile_ids_other_tenant=set(),
+                             template_names=self.NAMES)
+
+    def test_exact_name_ok_and_diffed(self):
+        out = self._run(self._row("Portrait Menu"), mine={"dev1"})
+        assert out["summary"]["valid"] is True
+        row = out["rows"][0]
+        assert row["action"] == "update"
+        assert any(c["field"] == "template" and c["to"] == "Portrait Menu" for c in row["changes"])
+
+    def test_near_miss_errors_with_exact_name(self):
+        out = self._run(self._row("portrait menu"))
+        assert any("use 'Portrait Menu'" in e["reason"] for e in out["errors"])
+
+    def test_unknown_template_is_error_listing_available(self):
+        out = self._run(self._row("Does Not Exist"))
+        assert any("isn't linked to your company" in e["reason"]
+                   and "Landscape Promo" in e["reason"] for e in out["errors"])
+
+    def test_blank_template_is_inherit(self):
+        out = self._run(self._row(""))
+        assert out["summary"]["valid"] is True
+
+    def test_no_guard_when_templates_not_supplied(self):
+        out = validate_rows(self._row("Anything"), existing_device_count=0, max_devices=0,
+                            mobile_ids_this_tenant=set(), mobile_ids_other_tenant=set())
+        assert out["summary"]["valid"] is True
