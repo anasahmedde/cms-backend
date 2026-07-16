@@ -9,7 +9,64 @@ from template_api import (
     validate_zones,
     _canonical_s3_ref,
     _s3_bucket_key,
+    _collapse_content,
 )
+
+
+class FakeCursor:
+    """Minimal cursor: routes each execute() to canned rows for the base
+    (template_zone_content) query vs the group (template_zone_group_content)
+    query, so _collapse_content precedence can be tested with no DB."""
+
+    def __init__(self, base_rows, group_rows):
+        self._base = base_rows
+        self._group = group_rows
+        self._pending = []
+
+    def execute(self, sql, params=None):
+        self._pending = self._group if "template_zone_group_content" in sql else self._base
+
+    def fetchall(self):
+        return self._pending
+
+
+class TestCollapsePrecedence:
+    # Precedence must be screen > group > location > company.
+    def test_group_overrides_location_and_company(self):
+        base = [("z1", "company", {"t": "C"}), ("z1", "shop", {"t": "S"})]
+        group = [("z1", {"t": "G"})]
+        out = _collapse_content(FakeCursor(base, group), 1, shop_id=10, device_id=99, group_id=5)
+        assert out["z1"] == {"t": "G"}
+
+    def test_screen_overrides_group(self):
+        base = [("z1", "shop", {"t": "S"}), ("z1", "device", {"t": "D"})]
+        group = [("z1", {"t": "G"})]
+        out = _collapse_content(FakeCursor(base, group), 1, shop_id=10, device_id=99, group_id=5)
+        assert out["z1"] == {"t": "D"}
+
+    def test_group_applies_regardless_of_shop(self):
+        # A device with no shop-scope content still gets the group's content.
+        base = [("z1", "company", {"t": "C"})]
+        group = [("z1", {"t": "G"})]
+        out = _collapse_content(FakeCursor(base, group), 1, shop_id=None, device_id=99, group_id=5)
+        assert out["z1"] == {"t": "G"}
+
+    def test_no_group_id_ignores_group_table(self):
+        # group_id=None must NOT run the group query at all.
+        base = [("z1", "company", {"t": "C"})]
+        exploding = [("z1", {"t": "SHOULD_NOT_APPEAR"})]
+        out = _collapse_content(FakeCursor(base, exploding), 1, shop_id=None, device_id=99, group_id=None)
+        assert out["z1"] == {"t": "C"}
+
+    def test_per_zone_layering(self):
+        # Different zones resolve at different levels independently.
+        base = [("hdr", "company", {"t": "C"}), ("hdr", "device", {"t": "D"}),
+                ("promo", "shop", {"t": "S"})]
+        group = [("promo", {"t": "G"}), ("banner", {"t": "GB"})]
+        out = _collapse_content(FakeCursor(base, group), 1, shop_id=10, device_id=99, group_id=5)
+        assert out["hdr"] == {"t": "D"}      # screen wins
+        assert out["promo"] == {"t": "G"}    # group beats shop
+        assert out["banner"] == {"t": "GB"}  # group-only zone
 
 # The whiteboard template: 15% header (shop name), 70% media, bottom 15%
 # split into QR / promo pic / promo text.

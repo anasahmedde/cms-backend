@@ -10,6 +10,8 @@ Tables:
   screen_template_version  — immutable snapshots created on every publish
   template_zone_content    — tenant-scoped content for zones bound to 'content'
                              (scope: company | shop | device, device overrides shop)
+  template_zone_group_content — group-scoped content (own table; screen > group
+                             > location > company at resolve time)
 
 Columns added:
   company.template_id / company.template_linked_at — the company→template link
@@ -111,5 +113,34 @@ def ensure_template_schema(conn):
         cur.execute("""
             ALTER TABLE public.device
             ADD COLUMN IF NOT EXISTS app_version TEXT;
+        """)
+        # Group-scoped zone content lives in its OWN table (not a 4th scope in
+        # template_zone_content) on purpose: adding group_id to that table would
+        # force a widened unique index, and old tasks still running during a
+        # rolling deploy do ON CONFLICT on the exact 5-column signature — a
+        # reshaped index would break them. A separate additive table keeps the
+        # existing table/index byte-for-byte unchanged, so old tasks are safe.
+        # Precedence at resolve time: screen > group > location > company.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS public.template_zone_group_content (
+                id         BIGSERIAL PRIMARY KEY,
+                tenant_id  BIGINT NOT NULL REFERENCES public.company(id) ON DELETE CASCADE,
+                zone_key   TEXT NOT NULL,
+                group_id   BIGINT NOT NULL REFERENCES public."group"(id) ON DELETE CASCADE,
+                payload    JSONB NOT NULL DEFAULT '{}'::jsonb,
+                updated_by BIGINT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """)
+        # One content row per (tenant, zone, group).
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tzgc_unique
+            ON public.template_zone_group_content (tenant_id, zone_key, group_id);
+        """)
+        # Heartbeat change-detection reads MAX(updated_at) per tenant.
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tzgc_tenant_updated
+            ON public.template_zone_group_content (tenant_id, updated_at);
         """)
     conn.commit()

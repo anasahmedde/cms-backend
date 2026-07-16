@@ -39,6 +39,10 @@ Route map (mounted WITHOUT prefix; full paths declared here):
     GET    /shop/{shop_id}/template-content                     all zone content for shop
     PUT    /shop/{shop_id}/template-content/{zone_key}          upsert payload
     POST   /shop/{shop_id}/template-content/{zone_key}/media    upload image/video
+    GET    /group/{group_id}/template-content                   all zone content for group
+    PUT    /group/{group_id}/template-content/{zone_key}        upsert payload (scope=group)
+    DELETE /group/{group_id}/template-content/{zone_key}
+    POST   /group/{group_id}/template-content/{zone_key}/media  upload image/video
     GET    /device-config/{device_id}/template-content           device overrides
     PUT    /device-config/{device_id}/template-content/{zone_key}
     DELETE /device-config/{device_id}/template-content/{zone_key}
@@ -89,7 +93,7 @@ ORIENTATIONS = ("landscape", "portrait")
 TEMPLATE_STATUSES = ("draft", "published", "archived")
 ZONE_TYPES = ("text", "media", "playlist", "qr", "clock", "ticker")
 BINDING_SOURCES = ("static", "content", "company.name", "shop.name", "device.name", "device.playlist")
-CONTENT_SCOPES = ("company", "shop", "device")
+CONTENT_SCOPES = ("company", "shop", "group", "device")
 QR_MODES = ("image", "link", "media")
 HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{3,8}$")
 ZONE_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_\-]{0,63}$")
@@ -670,10 +674,15 @@ def _company_template_stamp(cur, tenant_id: int):
     row = cur.fetchone()
     if not row:
         return None, None
+    # Max updated_at across BOTH content tables — a group-scope edit must bump
+    # the stamp too, or devices in that group never re-fetch the new content.
     cur.execute("""
-        SELECT COALESCE((MAX(EXTRACT(EPOCH FROM updated_at)) * 1000)::bigint, 0)
-        FROM public.template_zone_content WHERE tenant_id = %s;
-    """, (tenant_id,))
+        SELECT COALESCE((MAX(EXTRACT(EPOCH FROM updated_at)) * 1000)::bigint, 0) FROM (
+            SELECT updated_at FROM public.template_zone_content WHERE tenant_id = %s
+            UNION ALL
+            SELECT updated_at FROM public.template_zone_group_content WHERE tenant_id = %s
+        ) AS all_content;
+    """, (tenant_id, tenant_id))
     content_epoch = cur.fetchone()[0] or 0
     return row[1], f"{row[0]}.{row[1]}.{content_epoch}"
 
@@ -986,6 +995,18 @@ def _shop_of_tenant(cur, shop_id: int, tenant_id: int):
     return row
 
 
+def _group_of_tenant(cur, group_id: int, tenant_id: int):
+    # Groups are tenant-scoped via tenant_id (the column every other group query
+    # uses — company_id from an older migration is unpopulated by the create
+    # path). Never let one company read/write another company's group content.
+    cur.execute('SELECT id, gname FROM public."group" WHERE id = %s AND tenant_id = %s;',
+                (group_id, tenant_id))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Group not found")
+    return row
+
+
 def _device_of_tenant(cur, device_id: int, tenant_id: int):
     cur.execute("SELECT id, device_name FROM public.device WHERE id = %s AND tenant_id = %s;",
                 (device_id, tenant_id))
@@ -1011,10 +1032,11 @@ def company_template(ctx: TenantContext = Depends(require_tenant_context)):
 def company_template_preview(scope: str = "company",
                              shop_id: Optional[int] = None,
                              device_id: Optional[int] = None,
+                             group_id: Optional[int] = None,
                              ctx: TenantContext = Depends(require_tenant_context)):
     """Resolved + presigned zones for a WYSIWYG dashboard preview — what a screen
-    actually renders at the given scope (company default / a location / a screen).
-    Media is presigned so the dashboard can show the real image/video."""
+    actually renders at the given scope (company default / a location / a group /
+    a screen). Media is presigned so the dashboard can show the real image/video."""
     tenant_id = ctx.active_tenant_id
     with pg_conn() as conn:
         with conn.cursor() as cur:
@@ -1023,15 +1045,16 @@ def company_template_preview(scope: str = "company",
                 return {"template": None, "zones": []}
             shop_name = device_name = None
             eff_shop = None
+            eff_group = group_id if scope == "group" else None
             if scope == "device" and device_id:
                 cur.execute("SELECT device_name FROM public.device WHERE id = %s AND tenant_id = %s;",
                             (device_id, tenant_id))
                 r = cur.fetchone(); device_name = r[0] if r else None
-                # The device's location, so location-scope content resolves too.
-                cur.execute("""SELECT da.sid, s.shop_name FROM public.device_assignment da
-                               JOIN public.shop s ON s.id = da.sid WHERE da.did = %s LIMIT 1;""", (device_id,))
+                # The device's location + group, so those layers resolve too.
+                cur.execute("""SELECT da.sid, s.shop_name, da.gid FROM public.device_assignment da
+                               LEFT JOIN public.shop s ON s.id = da.sid WHERE da.did = %s LIMIT 1;""", (device_id,))
                 sr = cur.fetchone()
-                if sr: eff_shop, shop_name = sr[0], sr[1]
+                if sr: eff_shop, shop_name, eff_group = sr[0], sr[1], sr[2]
             elif scope == "shop" and shop_id:
                 cur.execute("SELECT shop_name FROM public.shop WHERE id = %s AND tenant_id = %s;",
                             (shop_id, tenant_id))
@@ -1040,7 +1063,8 @@ def company_template_preview(scope: str = "company",
             content = _collapse_content(
                 cur, tenant_id,
                 eff_shop if scope in ("shop", "device") else None,
-                device_id if scope == "device" else -1)
+                device_id if scope == "device" else -1,
+                eff_group)
             entity = {"company.name": ctx.company_name, "shop.name": shop_name, "device.name": device_name}
     zones = [resolve_zone(z, entity, content, presign_content) for z in tpl["zones"]]
     # Repair browser rendering: an image uploaded to the video stack carries a
@@ -1226,7 +1250,13 @@ def publish_company_template_design(ctx: TenantContext = Depends(require_tenant_
 
 
 def _get_scope_content(cur, tenant_id: int, scope: str, target_col: Optional[str], target_id: Optional[int]):
-    if scope == "company":
+    if scope == "group":
+        # Group content has its own table (see migration note).
+        cur.execute("""
+            SELECT zone_key, payload, updated_at FROM public.template_zone_group_content
+            WHERE tenant_id = %s AND group_id = %s;
+        """, (tenant_id, target_id))
+    elif scope == "company":
         cur.execute("""
             SELECT zone_key, payload, updated_at FROM public.template_zone_content
             WHERE tenant_id = %s AND scope = 'company';
@@ -1245,9 +1275,22 @@ def _get_scope_content(cur, tenant_id: int, scope: str, target_col: Optional[str
     return out
 
 
+def _scope_target_id(scope: str, tenant_id: int, shop_id: Optional[int],
+                     device_id: Optional[int], group_id: Optional[int]) -> int:
+    """The id used in the S3 key path for this scope's uploaded media/QR."""
+    if scope == "device":
+        return device_id
+    if scope == "shop":
+        return shop_id
+    if scope == "group":
+        return group_id
+    return tenant_id
+
+
 def _upsert_zone_content(conn, cur, tenant_id: int, zone: Dict, zone_key: str, scope: str,
                          shop_id: Optional[int], device_id: Optional[int],
-                         payload: Dict, user_id: Optional[int]) -> Dict:
+                         payload: Dict, user_id: Optional[int],
+                         group_id: Optional[int] = None) -> Dict:
     # A media-library item's s3_link may be stored as s3://, an S3 https URL, or a
     # bare key. Canonicalize the S3 refs the user picked so a library image/video
     # both passes validation (strict s3://) and resolves to a presigned URL on the
@@ -1265,7 +1308,7 @@ def _upsert_zone_content(conn, cur, tenant_id: int, zone: Dict, zone_key: str, s
                                  (payload.get("qr_link") and not payload.get("qr_mode"))):
         payload["qr_mode"] = "link"
         slug = _tenant_slug(cur, tenant_id)
-        target_id = device_id if scope == "device" else (shop_id if scope == "shop" else tenant_id)
+        target_id = _scope_target_id(scope, tenant_id, shop_id, device_id, group_id)
         try:
             png = make_qr_png(payload["qr_link"])
             payload["qr_generated_s3"] = _upload_bytes(
@@ -1274,26 +1317,38 @@ def _upsert_zone_content(conn, cur, tenant_id: int, zone: Dict, zone_key: str, s
             logger.error("QR generation failed (tenant %s zone %s): %s", tenant_id, zone_key, e)
             raise HTTPException(status_code=502, detail="QR code generation/upload failed")
 
-    cur.execute("""
-        INSERT INTO public.template_zone_content
-            (tenant_id, zone_key, scope, shop_id, device_id, payload, updated_by)
-        VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
-        ON CONFLICT (tenant_id, zone_key, scope, COALESCE(shop_id, 0), COALESCE(device_id, 0))
-        DO UPDATE SET payload = EXCLUDED.payload, updated_by = EXCLUDED.updated_by, updated_at = NOW()
-        RETURNING payload;
-    """, (tenant_id, zone_key, scope, shop_id, device_id, json.dumps(payload), user_id))
+    if scope == "group":
+        # Group content: separate table keyed by group_id (see migration note).
+        cur.execute("""
+            INSERT INTO public.template_zone_group_content
+                (tenant_id, zone_key, group_id, payload, updated_by)
+            VALUES (%s, %s, %s, %s::jsonb, %s)
+            ON CONFLICT (tenant_id, zone_key, group_id)
+            DO UPDATE SET payload = EXCLUDED.payload, updated_by = EXCLUDED.updated_by, updated_at = NOW()
+            RETURNING payload;
+        """, (tenant_id, zone_key, group_id, json.dumps(payload), user_id))
+    else:
+        cur.execute("""
+            INSERT INTO public.template_zone_content
+                (tenant_id, zone_key, scope, shop_id, device_id, payload, updated_by)
+            VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
+            ON CONFLICT (tenant_id, zone_key, scope, COALESCE(shop_id, 0), COALESCE(device_id, 0))
+            DO UPDATE SET payload = EXCLUDED.payload, updated_by = EXCLUDED.updated_by, updated_at = NOW()
+            RETURNING payload;
+        """, (tenant_id, zone_key, scope, shop_id, device_id, json.dumps(payload), user_id))
     saved = cur.fetchone()[0]
     if isinstance(saved, str):
         saved = json.loads(saved)
     log_audit(conn, tenant_id, user_id, "template.content.update", "template_zone_content",
               None, details={"zone_key": zone_key, "scope": scope,
-                             "shop_id": shop_id, "device_id": device_id})
+                             "shop_id": shop_id, "device_id": device_id, "group_id": group_id})
     return saved
 
 
 async def _upload_zone_media(conn, cur, tenant_id: int, zone: Dict, zone_key: str, scope: str,
                              shop_id: Optional[int], device_id: Optional[int],
-                             file: UploadFile, user_id: Optional[int]) -> Dict:
+                             file: UploadFile, user_id: Optional[int],
+                             group_id: Optional[int] = None) -> Dict:
     ext = (file.filename or "").rsplit(".", 1)[-1].lower()
     media_type = MEDIA_EXTENSIONS.get(ext)
     if not media_type:
@@ -1305,7 +1360,7 @@ async def _upload_zone_media(conn, cur, tenant_id: int, zone: Dict, zone_key: st
     if not data:
         raise HTTPException(status_code=422, detail="Empty file")
     slug = _tenant_slug(cur, tenant_id)
-    target_id = device_id if scope == "device" else (shop_id if scope == "shop" else tenant_id)
+    target_id = _scope_target_id(scope, tenant_id, shop_id, device_id, group_id)
     content_type = f"{media_type}/{'jpeg' if ext == 'jpg' else ext}" if media_type == "image" else "video/mp4"
     try:
         uri = _upload_bytes(_content_media_key(slug, scope, target_id, zone_key, ext), data, content_type)
@@ -1314,12 +1369,18 @@ async def _upload_zone_media(conn, cur, tenant_id: int, zone: Dict, zone_key: st
         raise HTTPException(status_code=502, detail="Media upload to storage failed")
 
     # Merge into the existing payload (keeps text/colors/qr_link already set).
-    cur.execute("""
-        SELECT payload FROM public.template_zone_content
-        WHERE tenant_id = %s AND zone_key = %s AND scope = %s
-          AND COALESCE(shop_id, 0) = COALESCE(%s::bigint, 0)
-          AND COALESCE(device_id, 0) = COALESCE(%s::bigint, 0);
-    """, (tenant_id, zone_key, scope, shop_id, device_id))
+    if scope == "group":
+        cur.execute("""
+            SELECT payload FROM public.template_zone_group_content
+            WHERE tenant_id = %s AND zone_key = %s AND group_id = %s;
+        """, (tenant_id, zone_key, group_id))
+    else:
+        cur.execute("""
+            SELECT payload FROM public.template_zone_content
+            WHERE tenant_id = %s AND zone_key = %s AND scope = %s
+              AND COALESCE(shop_id, 0) = COALESCE(%s::bigint, 0)
+              AND COALESCE(device_id, 0) = COALESCE(%s::bigint, 0);
+        """, (tenant_id, zone_key, scope, shop_id, device_id))
     row = cur.fetchone()
     payload = row[0] if row else {}
     if isinstance(payload, str):
@@ -1329,7 +1390,7 @@ async def _upload_zone_media(conn, cur, tenant_id: int, zone: Dict, zone_key: st
     if zone["type"] == "qr" and payload.get("qr_mode") != "link":
         payload["qr_mode"] = "media" if media_type == "video" else payload.get("qr_mode", "image")
     return _upsert_zone_content(conn, cur, tenant_id, zone, zone_key, scope,
-                                shop_id, device_id, payload, user_id)
+                                shop_id, device_id, payload, user_id, group_id=group_id)
 
 
 @router.get("/company/template-content")
@@ -1362,12 +1423,18 @@ def company_content_overrides(ctx: TenantContext = Depends(require_tenant_contex
                 SELECT c.zone_key, 'device', d.id, d.device_name
                 FROM public.template_zone_content c
                 JOIN public.device d ON d.id = c.device_id
-                WHERE c.tenant_id = %s AND c.scope = 'device';
-            """, (ctx.active_tenant_id, ctx.active_tenant_id))
+                WHERE c.tenant_id = %s AND c.scope = 'device'
+                UNION ALL
+                SELECT gc.zone_key, 'group', g.id, g.gname
+                FROM public.template_zone_group_content gc
+                JOIN public."group" g ON g.id = gc.group_id
+                WHERE gc.tenant_id = %s;
+            """, (ctx.active_tenant_id, ctx.active_tenant_id, ctx.active_tenant_id))
             out = {}
+            bucket = {"shop": "shops", "device": "devices", "group": "groups"}
             for zone_key, scope, tid, name in cur.fetchall():
-                e = out.setdefault(zone_key, {"shops": [], "devices": []})
-                (e["shops"] if scope == "shop" else e["devices"]).append({"id": tid, "name": name})
+                e = out.setdefault(zone_key, {"shops": [], "devices": [], "groups": []})
+                e[bucket[scope]].append({"id": tid, "name": name})
     return {"overrides": out}
 
 
@@ -1384,6 +1451,12 @@ def clear_company_zone_overrides(zone_key: str,
                 RETURNING id;
             """, (ctx.active_tenant_id, zone_key))
             cleared = len(cur.fetchall())
+            cur.execute("""
+                DELETE FROM public.template_zone_group_content
+                WHERE tenant_id = %s AND zone_key = %s
+                RETURNING id;
+            """, (ctx.active_tenant_id, zone_key))
+            cleared += len(cur.fetchall())
             if cleared:
                 log_audit(conn, ctx.active_tenant_id, ctx.user_id, "template.content.clear_overrides",
                           "template_zone_content", None, details={"zone_key": zone_key, "cleared": cleared})
@@ -1466,6 +1539,76 @@ async def upload_shop_zone_media(shop_id: int, zone_key: str, file: UploadFile =
     return {"shop_id": shop_id, "zone_key": zone_key, "payload": saved}
 
 
+@router.get("/group/{group_id}/template-content")
+def group_template_content(group_id: int, ctx: TenantContext = Depends(require_tenant_context)):
+    """Group-wide zone content — applies to every device in the group regardless
+    of location. Resolves screen > group > location > company."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            _group_of_tenant(cur, group_id, ctx.active_tenant_id)
+            tpl = _tenant_template(cur, ctx.active_tenant_id)
+            content = _get_scope_content(cur, ctx.active_tenant_id, "group", None, group_id)
+    zones = [z for z in (tpl["zones"] if tpl else [])
+             if (z.get("binding") or {}).get("source") == "content"]
+    return {"group_id": group_id, "template_linked": tpl is not None,
+            "content_zones": zones, "content": content}
+
+
+@router.put("/group/{group_id}/template-content/{zone_key}")
+def put_group_zone_content(group_id: int, zone_key: str, body: ZoneContentIn,
+                           ctx: TenantContext = Depends(require_tenant_context)):
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            _group_of_tenant(cur, group_id, ctx.active_tenant_id)
+            tpl = _tenant_template(cur, ctx.active_tenant_id)
+            if not tpl:
+                raise HTTPException(status_code=422, detail="Company has no linked template")
+            zone = _content_zone_or_422(tpl, zone_key)
+            saved = _upsert_zone_content(conn, cur, ctx.active_tenant_id, zone, zone_key,
+                                         "group", None, None, body.payload, ctx.user_id,
+                                         group_id=group_id)
+        conn.commit()
+    return {"group_id": group_id, "zone_key": zone_key, "payload": saved}
+
+
+@router.delete("/group/{group_id}/template-content/{zone_key}")
+def delete_group_zone_content(group_id: int, zone_key: str,
+                              ctx: TenantContext = Depends(require_tenant_context)):
+    """Remove a group's content for one zone — its devices fall back to location/company."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            _group_of_tenant(cur, group_id, ctx.active_tenant_id)
+            cur.execute("""
+                DELETE FROM public.template_zone_group_content
+                WHERE tenant_id = %s AND zone_key = %s AND group_id = %s
+                RETURNING id;
+            """, (ctx.active_tenant_id, zone_key, group_id))
+            deleted = cur.fetchone() is not None
+            if deleted:
+                log_audit(conn, ctx.active_tenant_id, ctx.user_id, "template.content.delete",
+                          "template_zone_group_content", None,
+                          details={"zone_key": zone_key, "group_id": group_id})
+        conn.commit()
+    return {"group_id": group_id, "zone_key": zone_key, "deleted": deleted}
+
+
+@router.post("/group/{group_id}/template-content/{zone_key}/media")
+async def upload_group_zone_media(group_id: int, zone_key: str, file: UploadFile = File(...),
+                                  ctx: TenantContext = Depends(require_tenant_context)):
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            _group_of_tenant(cur, group_id, ctx.active_tenant_id)
+            tpl = _tenant_template(cur, ctx.active_tenant_id)
+            if not tpl:
+                raise HTTPException(status_code=422, detail="Company has no linked template")
+            zone = _content_zone_or_422(tpl, zone_key)
+            saved = await _upload_zone_media(conn, cur, ctx.active_tenant_id, zone, zone_key,
+                                             "group", None, None, file, ctx.user_id,
+                                             group_id=group_id)
+        conn.commit()
+    return {"group_id": group_id, "zone_key": zone_key, "payload": saved}
+
+
 @router.get("/device-config/{device_id}/template-content")
 def device_template_content(device_id: int, ctx: TenantContext = Depends(require_tenant_context)):
     with pg_conn() as conn:
@@ -1536,8 +1679,23 @@ async def upload_device_zone_media(device_id: int, zone_key: str, file: UploadFi
 # PLAYER-FACING RESOLVER (no auth — mobile_id keyed, like all device routes)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _collapse_content(cur, tenant_id: int, shop_id: Optional[int], device_id: int) -> Dict[str, Dict]:
-    """zone_key -> payload with device > shop > company precedence."""
+def _collapse_content(cur, tenant_id: int, shop_id: Optional[int], device_id: int,
+                      group_id: Optional[int] = None) -> Dict[str, Dict]:
+    """zone_key -> payload with screen > group > location > company precedence.
+
+    Group content lives in its own table (template_zone_group_content) and is
+    resolved for the device's single group (device_assignment.gid), overriding
+    the location default but yielding to a per-screen override.
+    """
+    rank = {"company": 0, "shop": 1, "group": 2, "device": 3}
+    best: Dict[str, tuple] = {}
+
+    def consider(zone_key, scope, payload):
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if zone_key not in best or rank[scope] > best[zone_key][0]:
+            best[zone_key] = (rank[scope], payload)
+
     cur.execute("""
         SELECT zone_key, scope, payload FROM public.template_zone_content
         WHERE tenant_id = %s
@@ -1545,13 +1703,17 @@ def _collapse_content(cur, tenant_id: int, shop_id: Optional[int], device_id: in
                OR (scope = 'shop' AND shop_id = COALESCE(%s::bigint, -1))
                OR (scope = 'device' AND device_id = %s));
     """, (tenant_id, shop_id, device_id))
-    rank = {"company": 0, "shop": 1, "device": 2}
-    best: Dict[str, tuple] = {}
     for zone_key, scope, payload in cur.fetchall():
-        if isinstance(payload, str):
-            payload = json.loads(payload)
-        if zone_key not in best or rank[scope] > best[zone_key][0]:
-            best[zone_key] = (rank[scope], payload)
+        consider(zone_key, scope, payload)
+
+    if group_id is not None:
+        cur.execute("""
+            SELECT zone_key, payload FROM public.template_zone_group_content
+            WHERE tenant_id = %s AND group_id = %s;
+        """, (tenant_id, group_id))
+        for zone_key, payload in cur.fetchall():
+            consider(zone_key, "group", payload)
+
     return {k: v[1] for k, v in best.items()}
 
 
@@ -1599,28 +1761,31 @@ def device_template(mobile_id: str):
                 raise HTTPException(status_code=404, detail="No template linked")
 
             cur.execute("""
-                SELECT da.sid, s.shop_name, c.name
+                SELECT da.sid, s.shop_name, c.name, da.gid
                 FROM public.device d
                 LEFT JOIN public.device_assignment da ON da.did = d.id
                 LEFT JOIN public.shop s ON s.id = da.sid
                 LEFT JOIN public.company c ON c.id = d.tenant_id
                 WHERE d.id = %s;
             """, (did,))
-            arow = cur.fetchone() or (None, None, None)
-            shop_id, shop_name, company_name = arow
-            if shop_id is None:
-                # Fallback: shop via the content-link table (device may predate device_assignment).
+            arow = cur.fetchone() or (None, None, None, None)
+            shop_id, shop_name, company_name, group_id = arow
+            if shop_id is None or group_id is None:
+                # Fallback: shop/group via the content-link table (device may predate device_assignment).
                 cur.execute("""
-                    SELECT l.sid, s.shop_name FROM public.device_video_shop_group l
-                    JOIN public.shop s ON s.id = l.sid
+                    SELECT l.sid, s.shop_name, l.gid FROM public.device_video_shop_group l
+                    LEFT JOIN public.shop s ON s.id = l.sid
                     WHERE l.did = %s ORDER BY l.id DESC LIMIT 1;
                 """, (did,))
                 lrow = cur.fetchone()
                 if lrow:
-                    shop_id, shop_name = lrow
+                    if shop_id is None:
+                        shop_id, shop_name = lrow[0], lrow[1]
+                    if group_id is None:
+                        group_id = lrow[2]
 
             entity = {"company.name": company_name, "shop.name": shop_name, "device.name": device_name}
-            content = _collapse_content(cur, tenant_id, shop_id, did)
+            content = _collapse_content(cur, tenant_id, shop_id, did, group_id)
             _, stamp = _company_template_stamp(cur, tenant_id)
 
     zones = [resolve_zone(z, entity, content, presign_content) for z in tpl["zones"]]
