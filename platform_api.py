@@ -292,7 +292,12 @@ def list_companies(
                     -- User count
                     COALESCE((SELECT COUNT(*) FROM public.users u WHERE u.tenant_id = c.id), 0) as user_count,
                     -- Linked screen template
-                    c.template_id
+                    c.template_id,
+                    -- If the linked template is a company-customized fork, the
+                    -- shared platform template it was copied from (else NULL)
+                    (SELECT st.source_template_id FROM public.screen_template st
+                      WHERE st.id = c.template_id
+                        AND st.owner_tenant_id IS NOT NULL) as template_source_id
                 FROM public.company c
                 {where_sql}
                 ORDER BY c.created_at DESC
@@ -324,6 +329,9 @@ def list_companies(
                     "user_count": r[24] or 0,
                     # Linked screen template (null = default screens)
                     "template_id": r[25],
+                    # Platform original behind a company-customized fork (null =
+                    # linked directly / no template)
+                    "template_source_id": r[26],
                 }
                 
                 # Calculate expiration status and days

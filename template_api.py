@@ -652,11 +652,17 @@ def _get_template(cur, tid: int) -> Dict:
 
 
 def _linked_companies(cur, tid: int) -> List[Dict]:
+    """Companies using this template — linked directly, or through their own
+    customized copy (a fork carries source_template_id back to the original)."""
     cur.execute("""
-        SELECT id, slug, name FROM public.company
-        WHERE template_id = %s ORDER BY name;
-    """, (tid,))
-    return [{"id": r[0], "slug": r[1], "name": r[2]} for r in cur.fetchall()]
+        SELECT c.id, c.slug, c.name, (ct.owner_tenant_id IS NOT NULL) AS customized
+        FROM public.company c
+        JOIN public.screen_template ct ON ct.id = c.template_id
+        WHERE ct.id = %s OR (ct.source_template_id = %s AND ct.owner_tenant_id IS NOT NULL)
+        ORDER BY c.name;
+    """, (tid, tid))
+    return [{"id": r[0], "slug": r[1], "name": r[2], "customized": r[3]}
+            for r in cur.fetchall()]
 
 
 def _company_template_stamp(cur, tenant_id: int):
@@ -730,9 +736,17 @@ def list_templates(status: Optional[str] = None, ctx: TenantContext = Depends(re
         raise HTTPException(status_code=422, detail=f"status must be one of {TEMPLATE_STATUSES}")
     with pg_conn() as conn:
         with conn.cursor() as cur:
+            # "linked" must see THROUGH company forks: a company that published a
+            # customized copy is linked to the fork row (hidden below), not to the
+            # original — counting template_id alone shows "not linked" while the
+            # template is in active (customized) use.
             cur.execute(f"""
                 SELECT {TEMPLATE_COLS},
-                       (SELECT COUNT(*) FROM public.company c WHERE c.template_id = t.id) AS linked
+                       (SELECT COUNT(*) FROM public.company c WHERE c.template_id = t.id) AS linked,
+                       (SELECT COUNT(*) FROM public.company c
+                          JOIN public.screen_template f ON f.id = c.template_id
+                          WHERE f.source_template_id = t.id
+                            AND f.owner_tenant_id IS NOT NULL) AS customized
                 FROM public.screen_template t
                 WHERE (%s::text IS NULL OR status = %s)
                   AND owner_tenant_id IS NULL   -- hide company-forked private copies
@@ -740,8 +754,9 @@ def list_templates(status: Optional[str] = None, ctx: TenantContext = Depends(re
             """, (status, status))
             items = []
             for row in cur.fetchall():
-                d = _template_row_to_dict(row[:-1])
-                d["linked_companies"] = row[-1]
+                d = _template_row_to_dict(row[:-2])
+                d["linked_companies"] = row[-2] + row[-1]
+                d["customized_companies"] = row[-1]
                 items.append(d)
     return {"items": items, "count": len(items)}
 
@@ -793,7 +808,11 @@ def delete_template(tid: int, ctx: TenantContext = Depends(require_platform_user
     with pg_conn() as conn:
         with conn.cursor() as cur:
             _get_template(cur, tid)
-            linked = _linked_companies(cur, tid)
+            # Only DIRECT links block deletion. Companies on a customized copy
+            # keep their own fork row (FK sets the fork's source to NULL), so
+            # deleting the original can't break them — and blocking on them
+            # would create an undeletable template with no way to "unlink".
+            linked = [c for c in _linked_companies(cur, tid) if not c["customized"]]
             if linked:
                 raise HTTPException(
                     status_code=409,
@@ -1138,15 +1157,18 @@ def _fork_company_template(conn, cur, tenant_id: int, user_id: Optional[int]) ->
     # Conflict-safe against a concurrent first-write: the partial-unique index on
     # owner_tenant_id lets the loser's INSERT no-op; it then re-reads the winner's
     # fork. Guarantees exactly one owned template per tenant (no orphan / lost edits).
+    # source_template_id keeps the lineage to the platform original so the
+    # platform UI still reports this company as linked after publish re-points
+    # company.template_id at the fork.
     cur.execute(f"""
         INSERT INTO public.screen_template
             (name, description, orientation, design_width, design_height, zones,
-             status, version, owner_tenant_id, created_by)
-        VALUES (%s, %s, %s, %s, %s, %s::jsonb, 'draft', 0, %s, %s)
+             status, version, owner_tenant_id, source_template_id, created_by)
+        VALUES (%s, %s, %s, %s, %s, %s::jsonb, 'draft', 0, %s, %s, %s)
         ON CONFLICT (owner_tenant_id) WHERE owner_tenant_id IS NOT NULL DO NOTHING
         RETURNING {TEMPLATE_COLS};
     """, (src["name"], src["description"], src["orientation"], src["design_width"],
-          src["design_height"], json.dumps(src["zones"]), tenant_id, user_id))
+          src["design_height"], json.dumps(src["zones"]), tenant_id, src["id"], user_id))
     row = cur.fetchone()
     if row is None:
         existing = _company_owned_template(cur, tenant_id)

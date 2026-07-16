@@ -16,6 +16,7 @@ Tables:
 Columns added:
   company.template_id / company.template_linked_at — the company→template link
   device.app_version — player APK/webapp version reported by the heartbeat
+  screen_template.source_template_id — fork lineage (company copy → platform original)
 """
 
 
@@ -56,6 +57,39 @@ def ensure_template_schema(conn):
             CREATE UNIQUE INDEX IF NOT EXISTS idx_screen_template_owner
             ON public.screen_template (owner_tenant_id)
             WHERE owner_tenant_id IS NOT NULL;
+        """)
+        # source_template_id: set ONLY on company forks — the shared platform
+        # template the fork was copied from. A published fork re-links
+        # company.template_id to the (list-hidden) fork, so without this lineage
+        # the platform UI reports the original as "not linked" while a company
+        # is actively using a customized copy of it. SET NULL: deleting the
+        # original never breaks a company's fork.
+        cur.execute("""
+            ALTER TABLE public.screen_template
+            ADD COLUMN IF NOT EXISTS source_template_id BIGINT
+                REFERENCES public.screen_template(id) ON DELETE SET NULL;
+        """)
+        # Backfill lineage for forks created before the column existed, from the
+        # template.company_fork audit trail. Best-effort (audit writes are
+        # fire-and-forget) and idempotent (fills NULLs only); the EXISTS guard
+        # skips audit rows whose source template was since deleted.
+        cur.execute("""
+            UPDATE public.screen_template st
+            SET source_template_id = b.src_id
+            FROM (
+                SELECT resource_id AS fork_id,
+                       MAX((details->>'source_template_id')::bigint) AS src_id
+                FROM public.audit_log
+                WHERE action = 'template.company_fork'
+                  AND resource_type = 'screen_template'
+                  AND resource_id IS NOT NULL
+                  AND details ? 'source_template_id'
+                GROUP BY resource_id
+            ) b
+            WHERE st.id = b.fork_id
+              AND st.owner_tenant_id IS NOT NULL
+              AND st.source_template_id IS NULL
+              AND EXISTS (SELECT 1 FROM public.screen_template p WHERE p.id = b.src_id);
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS public.screen_template_version (
