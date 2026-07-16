@@ -287,20 +287,27 @@
 
   function fillQr(el, c, st) {
     // qr content is resolved server-side to a media_url (generated PNG or the
-    // uploaded image/video). Padding keeps a quiet zone around the code.
+    // uploaded image/video). The light quiet zone a QR needs in order to scan
+    // hugs the code as a centered SQUARE card; painting the whole zone white
+    // turned every non-square QR box into a white slab (the "white border").
+    // The rest of the zone stays transparent unless the designer set a bg.
     if (!c.media_url) { placeholder(el, "QR"); return; }
-    var pad = typeof st.padding_pct === "number" ? st.padding_pct : 6;
-    el.style.padding = pad + "%";
-    el.style.background = st.bg_color || "#ffffff";
     if (c.media_type === "video") {
       var v = document.createElement("video");
       v.src = c.media_url; v.autoplay = true; v.loop = true; v.muted = true; v.playsInline = true;
       v.style.objectFit = "contain"; el.appendChild(v);
-    } else {
-      var img = document.createElement("img");
-      img.src = c.media_url; img.style.objectFit = "contain";
-      el.appendChild(img);
+      return;
     }
+    var pad = typeof st.padding_pct === "number" ? st.padding_pct : 6;
+    el.style.containerType = "size"; // cq units against the zone, like fillRuns
+    var card = document.createElement("div");
+    card.style.cssText = "width:100cqmin;height:100cqmin;box-sizing:border-box;" +
+      "padding:" + pad + "cqmin;background:" + (c.bg_color || st.bg_color || "#ffffff") + ";";
+    var img = document.createElement("img");
+    img.src = c.media_url;
+    img.style.cssText = "width:100%;height:100%;object-fit:contain;display:block;";
+    card.appendChild(img);
+    el.appendChild(card);
   }
 
   function placeholder(el, label) {
