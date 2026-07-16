@@ -603,10 +603,15 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
     for i, rec in enumerate(rows):
         rownum = i + 1
         row_errors = []
-        for col in REQUIRED:
-            if not rec.get(col):
-                row_errors.append(f"{col} is required")
         dev_id = rec.get("device_id", "").strip()
+        # Required fields gate NEW rows only. For a screen that already exists
+        # (fleet-export round trip) a blank cell means "leave as-is" — a screen
+        # with no location yet must re-upload cleanly, not fail "shop_name is
+        # required".
+        if dev_id not in mobile_ids_this_tenant:
+            for col in REQUIRED:
+                if not rec.get(col):
+                    row_errors.append(f"{col} is required")
         if dev_id:
             if not MOBILE_ID_RE.match(dev_id):
                 row_errors.append("device_id has invalid characters")

@@ -240,3 +240,19 @@ class TestPendingRoundTrip:
         out = validate_rows(rows, existing_device_count=0, max_devices=0,
                             mobile_ids_this_tenant=set(), mobile_ids_other_tenant=set())
         assert any("placeholder" in e["reason"] for e in out["errors"])
+
+    def test_existing_screen_without_location_round_trips(self):
+        # Fleet export writes blank shop_name for screens with no location —
+        # blank means "leave as-is" for EXISTING ids, so it must validate clean.
+        rows = [{"device_name": "Orphan", "shop_name": "", "group_name": "",
+                 "device_id": "abc123", "resolution": "", "notes": ""}]
+        out = validate_rows(rows, existing_device_count=1, max_devices=0,
+                            mobile_ids_this_tenant={"abc123"}, mobile_ids_other_tenant=set())
+        assert out["summary"]["valid"] is True
+
+    def test_new_row_still_requires_shop(self):
+        rows = [{"device_name": "New Screen", "shop_name": "", "group_name": "",
+                 "device_id": "newdev1", "resolution": "", "notes": ""}]
+        out = validate_rows(rows, existing_device_count=0, max_devices=0,
+                            mobile_ids_this_tenant=set(), mobile_ids_other_tenant=set())
+        assert any("shop_name is required" in e["reason"] for e in out["errors"])
