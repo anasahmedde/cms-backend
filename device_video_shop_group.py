@@ -233,7 +233,11 @@ async def startup_event():
             ensure_multi_template_schema(conn)  # NEW: per-group/per-device template overrides
         print("[APP] All schema migrations verified")
     except Exception as e:
-        print(f"[APP] Schema migration warning: {e}")
+        # A schema-broken task must NOT pass health checks and roll out to the
+        # fleet — crash the task so ECS keeps the previous (working) tasks and
+        # the deploy fails loudly instead of "succeeding" with missing columns.
+        print(f"[APP] FATAL: schema migration failed: {e}")
+        raise
     
     print("[APP] Startup complete - pools, WebSocket, offline checker, and client features ready")
     print(f"[APP] Offline threshold: {ONLINE_THRESHOLD_SECONDS}s, check interval: {OFFLINE_CHECK_INTERVAL_SECONDS}s")
