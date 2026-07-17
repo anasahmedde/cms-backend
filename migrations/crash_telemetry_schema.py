@@ -13,4 +13,8 @@ def ensure_crash_telemetry_schema(conn):
         cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS crash_count_total INT NOT NULL DEFAULT 0;")
         cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS last_crash_at TIMESTAMPTZ;")
         cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS last_crash_msg TEXT;")
+        # Whether the box can relaunch itself after a crash (Android 10+ needs
+        # the "Display over other apps" grant) — NULL until a v10.2.0 player
+        # reports; surfaces screens that still need provisioning.
+        cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS overlay_ok BOOLEAN;")
     conn.commit()

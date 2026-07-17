@@ -589,12 +589,19 @@ class DeviceOnlineUpdateIn(BaseModel):
     is_online: bool = True
     resolution: Optional[str] = None  # e.g. "1920x1080" — auto-reported by Android app
     app_version: Optional[str] = None  # player version (APK/webapp) — fleet telemetry
-    # Crash telemetry from the player's process supervisor (v10.2.0+): count of
-    # crashes since the last successful report, epoch-ms of the latest, and a
-    # short first-line message. All optional — older players simply omit them.
+    # Crash telemetry from the player's process supervisor (v10.2.0+).
+    # crash_count is a monotonic GAUGE (device-lifetime total) — stored as-is,
+    # so at-least-once heartbeat delivery is idempotent (an accumulating delta
+    # double-counted whenever the client's 2xx response was lost).
+    # last_crash_at is epoch-ms, bounded to year-2100 so a unit-confused client
+    # can't 500 every heartbeat with 'timestamp out of range'.
+    # All optional — older players simply omit them.
     crash_count: Optional[int] = Field(None, ge=0, le=100000)
-    last_crash_at: Optional[int] = Field(None, ge=0)
+    last_crash_at: Optional[int] = Field(None, ge=0, le=4102444800000)
     last_crash_msg: Optional[str] = Field(None, max_length=300)
+    # Whether the crash-relaunch path works on this box (Android 10+ needs the
+    # "Display over other apps" grant) — surfaces un-provisioned screens.
+    overlay_ok: Optional[bool] = None
 
 
 class DeviceMuteIn(BaseModel):
@@ -3484,6 +3491,8 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                 # reported_resolution/resolution_reported_at track what the hardware
                 # actually reports on EVERY heartbeat (provenance for drift detection)
                 # without ever overwriting the admin-effective `resolution`.
+                # crash_count is a device-lifetime GAUGE — store as-is (idempotent
+                # under heartbeat retransmits), never accumulate server-side.
                 cur.execute("""
                     UPDATE public.device
                     SET is_online = %s, last_online_at = NOW(), updated_at = NOW(),
@@ -3493,19 +3502,21 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                         reported_resolution = COALESCE(%s, reported_resolution),
                         resolution_reported_at = CASE WHEN %s IS NOT NULL THEN NOW()
                                                       ELSE resolution_reported_at END,
-                        crash_count_total = COALESCE(crash_count_total, 0) + COALESCE(%s, 0),
-                        last_crash_at = CASE WHEN %s::bigint IS NOT NULL AND %s::bigint > 0
+                        crash_count_total = COALESCE(%s, crash_count_total),
+                        last_crash_at = CASE WHEN COALESCE(%s::bigint, 0) > 0
                                              THEN to_timestamp(%s::bigint / 1000.0)
                                              ELSE last_crash_at END,
-                        last_crash_msg = CASE WHEN %s::bigint IS NOT NULL AND %s::bigint > 0
-                                              THEN %s ELSE last_crash_msg END
+                        last_crash_msg = CASE WHEN COALESCE(%s::bigint, 0) > 0
+                                              THEN %s ELSE last_crash_msg END,
+                        overlay_ok = COALESCE(%s, overlay_ok)
                     WHERE mobile_id = %s
                     RETURNING is_online;
                 """, (body.is_online, body.resolution, body.app_version,
                       body.resolution, body.resolution,
                       body.crash_count,
-                      body.last_crash_at, body.last_crash_at, body.last_crash_at,
-                      body.last_crash_at, body.last_crash_at, body.last_crash_msg,
+                      body.last_crash_at, body.last_crash_at,
+                      body.last_crash_at, body.last_crash_msg,
+                      body.overlay_ok,
                       mobile_id))
                 row = cur.fetchone()
                 
@@ -6435,7 +6446,7 @@ def standalone_list_devices(
                        -- Last content update time
                        COALESCE(lc.last_content_update, d.updated_at) as last_content_update,
                        d.is_muted, d.app_version, d.reported_resolution,
-                       d.crash_count_total, d.last_crash_at
+                       d.crash_count_total, d.last_crash_at, d.last_crash_msg, d.overlay_ok
                 FROM public.device d
                 LEFT JOIN public.device_assignment da ON da.did = d.id
                 LEFT JOIN public."group" g1 ON g1.id = da.gid
@@ -6535,9 +6546,12 @@ def standalone_list_devices(
             "app_version": r[16] if len(r) > 16 else None,
             "reported_resolution": r[17] if len(r) > 17 else None,
             # Fleet crash telemetry (v10.2.0 supervisor) — a crash-looping
-            # screen shows up here within a heartbeat.
+            # screen shows up here within a heartbeat. overlay_ok=False marks
+            # boxes whose crash-relaunch still needs the overlay grant.
             "crash_count_total": r[18] if len(r) > 18 and r[18] is not None else 0,
             "last_crash_at": r[19] if len(r) > 19 else None,
+            "last_crash_msg": r[20] if len(r) > 20 else None,
+            "overlay_ok": r[21] if len(r) > 21 else None,
             # Lets the dashboard recompute content_status client-side (WS
             # online/offline patches) with the same template awareness.
             "template_linked": template_linked,
