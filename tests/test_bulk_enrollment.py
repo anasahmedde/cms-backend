@@ -28,10 +28,15 @@ class TestContentColumns:
         # the fit column is tagged so the parser routes it to fit_mode
         assert ("content.promo.fit", "promo", "fit", "media") in cols
 
-    def test_text_zone_unaffected(self):
+    def test_text_zone_is_text_only(self):
+        # Styling (bg/colors) is designer-owned — the sheet carries content only.
         zones = [{"key": "hdr", "type": "text", "binding": {"source": "content"}}]
         headers = [c[0] for c in content_columns_for(zones)]
-        assert headers == ["content.hdr.text", "content.hdr.bg"]
+        assert headers == ["content.hdr.text"]
+
+    def test_clock_zone_has_no_columns(self):
+        zones = [{"key": "clk", "type": "clock", "binding": {"source": "content"}}]
+        assert content_columns_for(zones) == []
 
     def test_non_content_zone_skipped(self):
         zones = [{"key": "main", "type": "media", "binding": {"source": "device.playlist"}}]
