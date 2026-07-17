@@ -53,6 +53,7 @@ from tenant_context import (
     hash_password, verify_password, generate_token, create_session,
     invalidate_user_sessions, invalidate_tenant_sessions,
     active_sessions, log_audit, ROLE_PERMISSIONS,
+    destroy_session as tc_destroy_session,
 )
 from platform_api import router as platform_router
 
@@ -70,6 +71,19 @@ from company_expiration_api import router as company_expiration_router, check_co
 
 # NEW: Platform Announcements (visible to all users)
 from announcement_api import router as announcement_router
+# NEW: Web-app (Linux player) + camera gender counting — isolated, additive router
+from webapp_api import router as webapp_router, ensure_webapp_schema
+
+from template_api import router as template_router, heartbeat_template_fields
+from migrations.template_schema import ensure_template_schema
+
+from bulk_enrollment_api import router as bulk_enrollment_router
+from migrations.bulk_import_schema import ensure_bulk_import_schema
+
+from migrations.reported_resolution_schema import ensure_reported_resolution_schema
+from migrations.auth_session_schema import ensure_auth_session_schema
+from migrations.company_features_schema import ensure_company_features_schema
+from migrations.multi_template_schema import ensure_multi_template_schema
 
 load_dotenv()
 
@@ -192,14 +206,31 @@ async def startup_event():
     # NEW: Start client requirements background tasks (expiration, approval)
     await start_background_tasks()
     
-    # Apply schema migrations (idempotent)
+    # Apply schema migrations (idempotent).
+    # Base schemas FIRST: this hook runs before the sync on_startup hook, so on
+    # a fresh database the dependent migrations below would otherwise fail
+    # (their FKs need device/shop/company) and be skipped until a second boot.
     try:
         with pg_conn() as conn:
+            ensure_dvsg_schema(conn)
+            ensure_multitenant_schema(conn)
             ensure_client_requirements_schema(conn)
             ensure_company_expiration_schema(conn)
             with conn.cursor() as cur:
                 cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS ble_device_id VARCHAR(50) DEFAULT NULL;")
+                # These two are read by the heartbeat but previously had no
+                # migration anywhere (live DBs got them via manual DDL) — ensure
+                # them so fresh installs work.
+                cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS is_muted BOOLEAN DEFAULT FALSE;")
+                cur.execute("ALTER TABLE public.device ADD COLUMN IF NOT EXISTS wipe_pending BOOLEAN DEFAULT FALSE;")
             conn.commit()
+            ensure_webapp_schema(conn)  # NEW: gender_counting_enabled column + gender_count_history table
+            ensure_template_schema(conn)  # NEW: screen templates + zone content + device.app_version
+            ensure_bulk_import_schema(conn)  # NEW: bulk device-enrollment jobs
+            ensure_reported_resolution_schema(conn)  # NEW: device-reported resolution provenance
+            ensure_auth_session_schema(conn)  # NEW: durable auth sessions (survive deploys)
+            ensure_company_features_schema(conn)  # NEW: per-company feature flags
+            ensure_multi_template_schema(conn)  # NEW: per-group/per-device template overrides
         print("[APP] All schema migrations verified")
     except Exception as e:
         print(f"[APP] Schema migration warning: {e}")
@@ -232,6 +263,13 @@ app.include_router(platform_router, prefix="/platform", tags=["Platform"])
 app.include_router(client_requirements_router, tags=["Client Requirements"])
 # NEW: Platform Announcements (visible to all users)
 app.include_router(announcement_router, tags=["Platform Announcements"])
+# NEW: Web-app player + gender counting (mounted under /webapp — Android endpoints untouched)
+app.include_router(webapp_router, prefix="/webapp", tags=["WebApp"])
+# NEW: Screen templates (platform designer + zone content + player resolvers).
+# Mounted without prefix — declares its own /platform/templates, /shop, /device paths.
+app.include_router(template_router, tags=["Screen Templates"])
+# NEW: Bulk device enrollment (CSV/XLSX import + pending-device claim).
+app.include_router(bulk_enrollment_router, tags=["Bulk Enrollment"])
 
 
 # ===========================================================
@@ -544,6 +582,7 @@ class DeviceOnlineStatusOut(BaseModel):
 class DeviceOnlineUpdateIn(BaseModel):
     is_online: bool = True
     resolution: Optional[str] = None  # e.g. "1920x1080" — auto-reported by Android app
+    app_version: Optional[str] = None  # player version (APK/webapp) — fleet telemetry
 
 
 class DeviceMuteIn(BaseModel):
@@ -820,6 +859,35 @@ def get_device_id_by_mobile(conn, mobile_id: str) -> Optional[int]:
         return int(row[0]) if row else None
 
 
+def authorize_device(cur, mobile_id: str, user: Dict) -> Tuple[List[int], int]:
+    """Authorize a DASHBOARD caller to act on a device identified by mobile_id.
+
+    Returns (device_ids newest-first, device_tenant_id). Because mobile_id is NOT
+    unique across tenants, a company user is scoped to their own tenant (they can
+    never see or touch another tenant's row); a platform user with no active tenant
+    may act on any. Raises 404 when the caller has no accessible device with that
+    mobile_id. This is the guard that closes the cross-tenant IDOR on the device
+    command endpoints — do NOT use it on device-facing routes (heartbeat, etc.),
+    which are unauthenticated by design.
+    """
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
+    is_platform = user.get("user_type") == "platform"
+    if is_platform and not tenant_id:
+        cur.execute(
+            "SELECT id, tenant_id FROM public.device WHERE mobile_id = %s ORDER BY id DESC;",
+            (mobile_id,),
+        )
+    else:
+        cur.execute(
+            "SELECT id, tenant_id FROM public.device WHERE mobile_id = %s AND tenant_id = %s ORDER BY id DESC;",
+            (mobile_id, tenant_id),
+        )
+    rows = cur.fetchall()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Device not found")
+    return [int(r[0]) for r in rows], rows[0][1]
+
+
 def fetch_link_by_id(conn, link_id: int) -> Optional[Dict[str, Any]]:
     with conn.cursor() as cur:
         cur.execute(READ_JOIN_SQL + " WHERE l.id = %s;", (link_id,))
@@ -941,10 +1009,14 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
                         SELECT 1 FROM public.device_video_shop_group l WHERE l.did = da.did
                     )
                 """
-                # Tenant scoping for device_assignment query
+                # Tenant scoping for device_assignment query.
+                # The placeholder goes BEFORE the filter placeholders in the SQL,
+                # so the param must lead the list too — appending it bound the
+                # first ILIKE pattern into tenant_id (bigint) and 500'd whenever
+                # a mobile_id/shop/group filter was used.
                 if tenant_id:
                     assignment_sql += " AND d.tenant_id = %s"
-                    assignment_params.append(tenant_id)
+                    assignment_params.insert(0, tenant_id)
                 if assignment_where:
                     assignment_sql += " AND " + " AND ".join(assignment_where)
                 assignment_sql += " ORDER BY da.id DESC LIMIT %s OFFSET %s;"
@@ -991,10 +1063,11 @@ def list_links(conn, mobile_id, video_name, shop_name, gname, did, vid, sid, gid
                         SELECT 1 FROM public.device_assignment da WHERE da.did = d.id
                     )
                 """
-                # Tenant scoping for unassigned devices query
+                # Tenant scoping for unassigned devices query — same placeholder
+                # ordering rule as the assignment query above.
                 if tenant_id:
                     unassigned_sql += " AND d.tenant_id = %s"
-                    unassigned_params.append(tenant_id)
+                    unassigned_params.insert(0, tenant_id)
                 if unassigned_where:
                     unassigned_sql += " AND " + " AND ".join(unassigned_where)
                 unassigned_sql += " ORDER BY d.is_online DESC, d.id DESC LIMIT %s OFFSET %s;"
@@ -1240,7 +1313,7 @@ def _set_group_videos(conn, gid: int, vids: List[int]):
                 INSERT INTO public.group_video (gid, vid, display_order)
                 SELECT %s, v, row_number() OVER () - 1
                 FROM UNNEST(%s::bigint[]) AS v
-                ON CONFLICT (gid, vid) DO UPDATE SET updated_at = NOW()
+                ON CONFLICT (gid, vid) DO UPDATE SET display_order = EXCLUDED.display_order, updated_at = NOW()
                 RETURNING id, (xmax = 0) AS was_inserted
             ),
             del AS (
@@ -1611,13 +1684,16 @@ def list_group_videos_by_name(gname: str):
             if gname.strip().lower() in NO_GROUP_SENTINELS:
                 # For "no group", still use device_video_shop_group (legacy behavior)
                 cur.execute("""
-                    SELECT DISTINCT v.id, v.video_name
+                    SELECT DISTINCT v.id, v.video_name, v.content_type
                     FROM public.device_video_shop_group l
                     JOIN public.video v ON v.id = l.vid
                     WHERE l.gid IS NULL ORDER BY v.video_name;
                 """)
                 rows = cur.fetchall() or []
-                return {"gid": None, "gname": None, "vids": [r[0] for r in rows], "video_names": [r[1] for r in rows], "count": len(rows)}
+                return {"gid": None, "gname": None, "vids": [r[0] for r in rows],
+                        "video_names": [r[1] for r in rows],
+                        "video_items": [{"name": r[1], "content_type": r[2] or "video"} for r in rows],
+                        "count": len(rows)}
             
             cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (gname,))
             grow = cur.fetchone()
@@ -1627,19 +1703,19 @@ def list_group_videos_by_name(gname: str):
             
             # Read from group_video table (primary source for group-level associations)
             cur.execute("""
-                SELECT v.id, v.video_name
+                SELECT v.id, v.video_name, v.content_type
                 FROM public.group_video gv
                 JOIN public.video v ON v.id = gv.vid
-                WHERE gv.gid = %s 
+                WHERE gv.gid = %s
                 ORDER BY gv.display_order, v.video_name;
             """, (gid,))
             rows = cur.fetchall() or []
             video_ids = {r[0] for r in rows}
-            videos = [{"id": r[0], "name": r[1]} for r in rows]
-            
+            videos = [{"id": r[0], "name": r[1], "content_type": r[2] or "video"} for r in rows]
+
             # Also check device_video_shop_group for additional video links
             cur.execute("""
-                SELECT DISTINCT v.id, v.video_name
+                SELECT DISTINCT v.id, v.video_name, v.content_type
                 FROM public.device_video_shop_group dvsg
                 JOIN public.video v ON v.id = dvsg.vid
                 WHERE dvsg.gid = %s
@@ -1647,14 +1723,15 @@ def list_group_videos_by_name(gname: str):
             """, (gid,))
             for r in cur.fetchall():
                 if r[0] not in video_ids:
-                    videos.append({"id": r[0], "name": r[1]})
+                    videos.append({"id": r[0], "name": r[1], "content_type": r[2] or "video"})
                     video_ids.add(r[0])
-            
+
             return {
-                "gid": gid, 
-                "gname": gname, 
-                "vids": [v["id"] for v in videos], 
-                "video_names": [v["name"] for v in videos], 
+                "gid": gid,
+                "gname": gname,
+                "vids": [v["id"] for v in videos],
+                "video_names": [v["name"] for v in videos],
+                "video_items": [{"name": v["name"], "content_type": v["content_type"]} for v in videos],
                 "count": len(videos)
             }
 
@@ -3058,15 +3135,13 @@ def get_device_resolution(mobile_id: str):
 
 
 @app.post("/device/{mobile_id}/resolution")
-def set_device_resolution(mobile_id: str, resolution: str = Query(None)):
+def set_device_resolution(mobile_id: str, resolution: str = Query(None), user: Dict = Depends(get_current_user)):
     """Set device screen resolution."""
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("UPDATE public.device SET resolution = %s WHERE mobile_id = %s RETURNING id;", (resolution, mobile_id))
-                row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail="Device not found")
+                ids, _ = authorize_device(cur, mobile_id, user)
+                cur.execute("UPDATE public.device SET resolution = %s WHERE id = ANY(%s::bigint[]);", (resolution, ids))
                 conn.commit()
                 return {"mobile_id": mobile_id, "resolution": resolution}
         except HTTPException:
@@ -3078,17 +3153,16 @@ def set_device_resolution(mobile_id: str, resolution: str = Query(None)):
 
 
 @app.post("/device/{mobile_id}/name")
-def set_device_name(mobile_id: str, body: DeviceNameUpdateIn):
+def set_device_name(mobile_id: str, body: DeviceNameUpdateIn, user: Dict = Depends(get_current_user)):
     """Set/update device friendly name."""
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("UPDATE public.device SET device_name = %s WHERE mobile_id = %s RETURNING id, device_name;", (body.device_name, mobile_id))
+                ids, _ = authorize_device(cur, mobile_id, user)
+                cur.execute("UPDATE public.device SET device_name = %s WHERE id = ANY(%s::bigint[]) RETURNING device_name;", (body.device_name, ids))
                 row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail="Device not found")
                 conn.commit()
-                return {"mobile_id": mobile_id, "device_name": row[1]}
+                return {"mobile_id": mobile_id, "device_name": row[0] if row else body.device_name}
         except HTTPException:
             conn.rollback()
             raise
@@ -3126,23 +3200,16 @@ def get_ble_device_id(mobile_id: str):
 
 
 @app.post("/device/{mobile_id}/ble-id")
-def set_ble_device_id(mobile_id: str, body: BleDeviceIdIn):
+def set_ble_device_id(mobile_id: str, body: BleDeviceIdIn, user: Dict = Depends(get_current_user)):
     """Set or clear the BLE pairing ID for a device. Pass null/empty to disable auth.
     The ID must be unique within the tenant — two devices cannot share the same ESP32 ID."""
     new_id = (body.ble_device_id or "").strip() or None
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                # Resolve the target device's tenant so uniqueness is checked within it
-                cur.execute(
-                    "SELECT tenant_id FROM public.device WHERE mobile_id = %s ORDER BY id DESC LIMIT 1;",
-                    (mobile_id,)
-                )
-                trow = cur.fetchone()
-                if not trow:
-                    conn.rollback()
-                    raise HTTPException(status_code=404, detail="Device not found")
-                tenant_id = trow[0]
+                # Authorize the caller for this device; use the device's own tenant
+                # so uniqueness is still checked within it.
+                ids, tenant_id = authorize_device(cur, mobile_id, user)
 
                 # Reject duplicates (only when assigning a non-empty ID)
                 if new_id is not None:
@@ -3162,13 +3229,9 @@ def set_ble_device_id(mobile_id: str, body: BleDeviceIdIn):
                         )
 
                 cur.execute(
-                    "UPDATE public.device SET ble_device_id = %s WHERE mobile_id = %s RETURNING id;",
-                    (new_id, mobile_id)
+                    "UPDATE public.device SET ble_device_id = %s WHERE id = ANY(%s::bigint[]);",
+                    (new_id, ids)
                 )
-                row = cur.fetchone()
-                if not row:
-                    conn.rollback()
-                    raise HTTPException(status_code=404, detail="Device not found")
                 conn.commit()
                 return {"mobile_id": mobile_id, "ble_device_id": new_id}
         except HTTPException:
@@ -3302,13 +3365,18 @@ def get_device_online_status(mobile_id: str, resolution: Optional[str] = Query(N
             tenant_id = row[5]
             current_resolution = row[6]
 
-            # Auto-save reported resolution if not already set
-            if resolution and not current_resolution:
+            # Auto-save reported resolution if not already set (COALESCE keeps the
+            # only-if-NULL behavior for the admin-effective `resolution`), and always
+            # record what the device actually reports (provenance for drift detection).
+            if resolution:
                 try:
-                    cur.execute(
-                        "UPDATE public.device SET resolution = %s WHERE mobile_id = %s;",
-                        (resolution, mobile_id)
-                    )
+                    cur.execute("""
+                        UPDATE public.device
+                        SET resolution = COALESCE(resolution, %s),
+                            reported_resolution = %s,
+                            resolution_reported_at = NOW()
+                        WHERE mobile_id = %s;
+                    """, (resolution, resolution, mobile_id))
                     conn.commit()
                 except Exception:
                     conn.rollback()
@@ -3401,18 +3469,29 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                 
                 # Update device status; also auto-save resolution if app reported one
                 # and the device doesn't have one set yet (COALESCE keeps existing value).
+                # reported_resolution/resolution_reported_at track what the hardware
+                # actually reports on EVERY heartbeat (provenance for drift detection)
+                # without ever overwriting the admin-effective `resolution`.
                 cur.execute("""
                     UPDATE public.device
                     SET is_online = %s, last_online_at = NOW(), updated_at = NOW(),
                         needs_refresh = FALSE,
-                        resolution = COALESCE(resolution, %s)
+                        resolution = COALESCE(resolution, %s),
+                        app_version = COALESCE(%s, app_version),
+                        reported_resolution = COALESCE(%s, reported_resolution),
+                        resolution_reported_at = CASE WHEN %s IS NOT NULL THEN NOW()
+                                                      ELSE resolution_reported_at END
                     WHERE mobile_id = %s
                     RETURNING is_online;
-                """, (body.is_online, body.resolution, mobile_id))
+                """, (body.is_online, body.resolution, body.app_version,
+                      body.resolution, body.resolution, mobile_id))
                 row = cur.fetchone()
                 
-                # Check if device needs to wipe local files
+                # Check if device needs to wipe local files.
+                # Savepoint: a failure here must not abort the transaction (that
+                # would silently roll back the device-status UPDATE above).
                 wipe_pending = False
+                cur.execute("SAVEPOINT hb_wipe")
                 try:
                     cur.execute("SELECT wipe_pending FROM public.device WHERE id = %s;", (did,))
                     wipe_row = cur.fetchone()
@@ -3421,22 +3500,32 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                     # If wipe was pending, clear the flag after this response
                     if wipe_pending:
                         cur.execute("UPDATE public.device SET wipe_pending = FALSE WHERE id = %s;", (did,))
+                    cur.execute("RELEASE SAVEPOINT hb_wipe")
                 except Exception as e:
                     # Column might not exist yet - that's OK
+                    cur.execute("ROLLBACK TO SAVEPOINT hb_wipe")
                     print(f"wipe_pending check skipped: {e}")
 
                 # Read current mute state and ble_device_id to send back to the device
                 is_muted = False
                 ble_device_id = None
+                cur.execute("SAVEPOINT hb_mute")
                 try:
                     cur.execute("SELECT is_muted, ble_device_id FROM public.device WHERE id = %s;", (did,))
                     mute_row = cur.fetchone()
                     is_muted = bool(mute_row[0]) if mute_row and mute_row[0] else False
                     ble_device_id = mute_row[1] if mute_row and len(mute_row) > 1 else None
+                    cur.execute("RELEASE SAVEPOINT hb_mute")
                 except Exception as e:
-                    conn.rollback()
+                    cur.execute("ROLLBACK TO SAVEPOINT hb_mute")
                     print(f"is_muted/ble_device_id check skipped: {e}")
-                
+
+                # Screen-template change detection (template_version/template_stamp).
+                # Never raises; returns nulls when no template is linked. Passing
+                # the device row makes the stamp track ITS effective template
+                # (screen > group > company), so re-assignment refetches.
+                template_fields = heartbeat_template_fields(cur, tenant_id, device_id=did)
+
                 # Log status change if it actually changed
                 if previous_status != body.is_online:
                     event_type = "online" if body.is_online else "offline"
@@ -3473,6 +3562,7 @@ async def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                 "wipe_videos": wipe_pending,
                 "is_muted": is_muted,
                 "ble_device_id": ble_device_id,
+                **template_fields,
             }
         except HTTPException:
             conn.rollback()
@@ -3536,9 +3626,10 @@ def set_device_mute(mobile_id: str, body: DeviceMuteIn, user: Dict = Depends(get
     """Mute or unmute a device. The Android app picks up the change on the next heartbeat (~30 s)."""
     with pg_conn() as conn:
         with conn.cursor() as cur:
+            ids, _ = authorize_device(cur, mobile_id, user)
             cur.execute(
-                "UPDATE public.device SET is_muted = %s, updated_at = NOW() WHERE mobile_id = %s;",
-                (body.is_muted, mobile_id)
+                "UPDATE public.device SET is_muted = %s, updated_at = NOW() WHERE id = ANY(%s::bigint[]);",
+                (body.is_muted, ids)
             )
         conn.commit()
     return {"mobile_id": mobile_id, "is_muted": body.is_muted}
@@ -3555,14 +3646,17 @@ def get_detected_resolution(mobile_id: str):
     """
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            # 1) Already enrolled — check device table
+            # 1) Already enrolled — check device table (admin-effective value first,
+            #    then the heartbeat-reported value as fallback)
             cur.execute(
-                "SELECT resolution FROM public.device WHERE mobile_id = %s LIMIT 1;",
+                "SELECT resolution, reported_resolution FROM public.device WHERE mobile_id = %s LIMIT 1;",
                 (mobile_id,)
             )
             row = cur.fetchone()
             if row and row[0]:
                 return {"resolution": row[0], "source": "device"}
+            if row and row[1]:
+                return {"resolution": row[1], "source": "reported"}
 
             # 2) Not yet enrolled — check pre-enrollment cache
             try:
@@ -3767,7 +3861,12 @@ def set_group_video_by_name(gname: str, body: GroupVideoUpdateIn):
 def set_group_videos_by_names(gname: str, body: GroupVideosUpdateIn):
     with pg_conn() as conn:
         try:
-            vids = _resolve_video_ids(conn, body.video_names)
+            # An empty list clears the group's video rotation. This is a first-class
+            # state now that the playlist editor splits rotation vs layout-image
+            # panels (a group can legitimately have only layout/grid images).
+            # _resolve_video_ids rejects empty (guards other callers), so short-
+            # circuit it here — _set_group_videos([]) already clears cleanly.
+            vids = _resolve_video_ids(conn, body.video_names) if any(n.strip() for n in body.video_names) else []
             if gname.strip().lower() in NO_GROUP_SENTINELS:
                 ins, dele, upd, vnames, marked = _set_nogroup_videos(conn, vids)
                 conn.commit()
@@ -3785,20 +3884,53 @@ def set_group_videos_by_names(gname: str, body: GroupVideosUpdateIn):
 
 
 # ---------- Video read + presign (for dashboard preview) ----------
+def _media_name_scope(name_col: str, name: str, user: Dict):
+    """WHERE fragment + params scoping a by-name media lookup to the caller's
+    tenant. Company users see only their own tenant's rows; platform users (no
+    active tenant) are unscoped. name_col is a code-literal, never user input.
+
+    These /video/{name} and /advertisement/{name} endpoints are DASHBOARD-ONLY
+    (the fleet fetches content solely via /device/{id}/videos/downloads), so
+    requiring a token here does not affect any device — it closes a cross-tenant
+    IDOR where any caller could read/mutate/delete another company's media by name.
+    """
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
+    if tenant_id is not None:
+        return f"{name_col} = %s AND tenant_id = %s", [name, tenant_id]
+    return f"{name_col} = %s", [name]
+
+
+def _require_media_manage(user: Dict):
+    """Guard the MUTATING by-name media endpoints. A company user is already
+    confined to its own tenant by _media_name_scope, so its existing behaviour is
+    preserved. A platform principal, however, gets the UNSCOPED clause (it can act
+    across tenants), so it must additionally hold a manage permission — otherwise a
+    view-only platform role (e.g. 'support_agent') could rename/delete any company's
+    media. Reads stay open to any authenticated, tenant-scoped caller."""
+    if user.get("user_type") != "platform":
+        return
+    perms = user.get("permissions") or []
+    if "company.full_access" in perms or "manage_videos" in perms or "manage_advertisements" in perms:
+        return
+    raise HTTPException(status_code=403, detail="Permission denied: media management requires manage rights")
+
+
 @app.get("/video/{video_name}", response_model=VideoOut)
-def get_video_by_name(video_name: str = Path(..., description="Exact video_name to fetch")):
+def get_video_by_name(video_name: str = Path(..., description="Exact video_name to fetch"),
+                      user: Dict = Depends(get_current_user)):
     """Return video metadata stored in public.video."""
+    clause, params = _media_name_scope("video_name", video_name, user)
     with pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT id, video_name, s3_link, rotation, content_type, fit_mode, display_duration, created_at, updated_at
                 FROM public.video
-                WHERE video_name = %s
+                WHERE {clause}
                 ORDER BY id DESC
                 LIMIT 1;
                 """,
-                (video_name,),
+                params,
             )
             row = cur.fetchone()
             if not row:
@@ -3821,19 +3953,21 @@ def get_video_by_name(video_name: str = Path(..., description="Exact video_name 
 def presign_video(
     video_name: str = Path(..., description="Exact video_name to presign"),
     expires_in: int = Query(PRESIGN_EXPIRES, ge=60, le=604800, description="Presigned URL expiry in seconds"),
+    user: Dict = Depends(get_current_user),
 ):
     """Generate a presigned URL for the video using its s3_link (s3://bucket/key)."""
+    clause, params = _media_name_scope("video_name", video_name, user)
     with pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT s3_link
                 FROM public.video
-                WHERE video_name = %s
+                WHERE {clause}
                 ORDER BY id DESC
                 LIMIT 1;
                 """,
-                (video_name,),
+                params,
             )
             row = cur.fetchone()
             if not row:
@@ -3875,16 +4009,18 @@ def presign_video(
 
 # ---------- Video rotation and fit mode ----------
 @app.post("/video/{video_name}/rotation")
-def set_video_rotation(video_name: str, body: VideoRotationUpdateIn):
+def set_video_rotation(video_name: str, body: VideoRotationUpdateIn, user: Dict = Depends(get_current_user)):
+    _require_media_manage(user)
     if body.rotation not in [0, 90, 180, 270]:
         raise HTTPException(status_code=400, detail="Rotation must be 0, 90, 180, or 270")
+    clause, params = _media_name_scope("video_name", video_name, user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(f"""
                     UPDATE public.video SET rotation = %s, updated_at = NOW()
-                    WHERE video_name = %s RETURNING id, rotation;
-                """, (body.rotation, video_name))
+                    WHERE {clause} RETURNING id, rotation;
+                """, [body.rotation] + params)
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Video not found")
@@ -3899,17 +4035,19 @@ def set_video_rotation(video_name: str, body: VideoRotationUpdateIn):
 
 
 @app.post("/video/{video_name}/fit_mode")
-def set_video_fit_mode(video_name: str, body: VideoFitModeUpdateIn):
+def set_video_fit_mode(video_name: str, body: VideoFitModeUpdateIn, user: Dict = Depends(get_current_user)):
+    _require_media_manage(user)
     valid_modes = ["contain", "cover", "fill", "none"]
     if body.fit_mode not in valid_modes:
         raise HTTPException(status_code=400, detail=f"fit_mode must be one of: {', '.join(valid_modes)}")
+    clause, params = _media_name_scope("video_name", video_name, user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(f"""
                     UPDATE public.video SET fit_mode = %s, updated_at = NOW()
-                    WHERE video_name = %s RETURNING id, fit_mode;
-                """, (body.fit_mode, video_name))
+                    WHERE {clause} RETURNING id, fit_mode;
+                """, [body.fit_mode] + params)
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Video not found")
@@ -3928,15 +4066,17 @@ class VideoResolutionUpdateIn(BaseModel):
 
 
 @app.post("/video/{video_name}/resolution")
-def set_video_resolution(video_name: str, body: VideoResolutionUpdateIn):
+def set_video_resolution(video_name: str, body: VideoResolutionUpdateIn, user: Dict = Depends(get_current_user)):
     """Set default resolution for a video (e.g. 1920x1080, 1280x720)."""
+    _require_media_manage(user)
+    clause, params = _media_name_scope("video_name", video_name, user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(f"""
                     UPDATE public.video SET resolution = %s, updated_at = NOW()
-                    WHERE video_name = %s RETURNING id, resolution;
-                """, (body.resolution, video_name))
+                    WHERE {clause} RETURNING id, resolution;
+                """, [body.resolution] + params)
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Video not found")
@@ -3951,12 +4091,13 @@ def set_video_resolution(video_name: str, body: VideoResolutionUpdateIn):
 
 
 @app.get("/video/{video_name}/groups")
-def get_video_groups(video_name: str):
+def get_video_groups(video_name: str, user: Dict = Depends(get_current_user)):
     """Get all groups where this video is linked."""
+    clause, params = _media_name_scope("video_name", video_name, user)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            # First get video ID
-            cur.execute("SELECT id FROM public.video WHERE video_name = %s LIMIT 1;", (video_name,))
+            # First get video ID (tenant-scoped)
+            cur.execute(f"SELECT id FROM public.video WHERE {clause} ORDER BY id DESC LIMIT 1;", params)
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Video not found")
@@ -4856,7 +4997,8 @@ def logout(authorization: Optional[str] = Header(None)):
             session_data = active_sessions[token]
             user_id = session_data.get("user_id")
             tenant_id = session_data.get("tenant_id")
-            del active_sessions[token]
+        # Removes from memory AND the durable auth_session row.
+        tc_destroy_session(token)
 
     # Close the most recent active session for this user
     if user_id:
@@ -5323,8 +5465,12 @@ def list_advertisements(q: Optional[str] = Query(None), limit: int = Query(50, g
                 else:
                     cur.execute(base + " WHERE tenant_id = %s ORDER BY id DESC LIMIT %s OFFSET %s", (tenant_id, limit, offset))
                 rows = cur.fetchall()
+                # Advertisements are always images — report content_type so the UI
+                # can classify them without guessing (the /videos stack carries a
+                # real content_type; the ad stack has no such column).
                 items = [{"id": r[0], "ad_name": r[1], "s3_link": r[2], "rotation": r[3],
-                          "fit_mode": r[4], "display_duration": r[5], "created_at": r[6], "updated_at": r[7]} 
+                          "fit_mode": r[4], "display_duration": r[5], "created_at": r[6], "updated_at": r[7],
+                          "content_type": "image"}
                          for r in rows]
             else:
                 # Platform admin: include company name
@@ -5339,25 +5485,27 @@ def list_advertisements(q: Optional[str] = Query(None), limit: int = Query(50, g
                 rows = cur.fetchall()
                 items = [{"id": r[0], "ad_name": r[1], "s3_link": r[2], "rotation": r[3],
                           "fit_mode": r[4], "display_duration": r[5], "created_at": r[6], "updated_at": r[7],
-                          "company_name": r[8], "company_slug": r[9]} 
+                          "company_name": r[8], "company_slug": r[9], "content_type": "image"}
                          for r in rows]
             return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
 
 @app.get("/advertisement/{ad_name}")
-def get_advertisement(ad_name: str, presign: bool = Query(True)):
+def get_advertisement(ad_name: str, presign: bool = Query(True), user: Dict = Depends(get_current_user)):
     """Get a single advertisement by name."""
+    clause, params = _media_name_scope("ad_name", ad_name, user)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 SELECT id, ad_name, s3_link, rotation, fit_mode, display_duration, created_at, updated_at
-                FROM public.advertisement WHERE ad_name = %s LIMIT 1;
-            """, (ad_name,))
+                FROM public.advertisement WHERE {clause} ORDER BY id DESC LIMIT 1;
+            """, params)
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Advertisement not found")
             result = {"id": row[0], "ad_name": row[1], "s3_link": row[2], "rotation": row[3],
-                      "fit_mode": row[4], "display_duration": row[5], "created_at": row[6], "updated_at": row[7]}
-            
+                      "fit_mode": row[4], "display_duration": row[5], "created_at": row[6], "updated_at": row[7],
+                      "content_type": "image"}
+
             if presign and result.get("s3_link"):
                 try:
                     url, filename = ad_presign_get_object(result["s3_link"], AD_PRESIGN_EXPIRES)
@@ -5369,11 +5517,13 @@ def get_advertisement(ad_name: str, presign: bool = Query(True)):
             return result
 
 @app.get("/advertisement/{ad_name}/presign")
-def presign_advertisement(ad_name: str, expires_in: int = Query(AD_PRESIGN_EXPIRES, ge=60, le=7 * 24 * 3600)):
+def presign_advertisement(ad_name: str, expires_in: int = Query(AD_PRESIGN_EXPIRES, ge=60, le=7 * 24 * 3600),
+                          user: Dict = Depends(get_current_user)):
     """Get presigned URL for an advertisement."""
+    clause, params = _media_name_scope("ad_name", ad_name, user)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT s3_link FROM public.advertisement WHERE ad_name = %s LIMIT 1;", (ad_name,))
+            cur.execute(f"SELECT s3_link FROM public.advertisement WHERE {clause} ORDER BY id DESC LIMIT 1;", params)
             row = cur.fetchone()
             if not row or not row[0]:
                 raise HTTPException(status_code=404, detail="Advertisement not found")
@@ -5471,8 +5621,9 @@ async def upload_advertisement(
         raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
 
 @app.put("/advertisement/{ad_name}")
-def update_advertisement(ad_name: str, patch: AdvertisementUpdate):
+def update_advertisement(ad_name: str, patch: AdvertisementUpdate, user: Dict = Depends(get_current_user)):
     """Update an advertisement's metadata."""
+    _require_media_manage(user)
     sets, params = [], []
     if patch.ad_name is not None:
         sets.append("ad_name = %s"); params.append(patch.ad_name)
@@ -5486,13 +5637,14 @@ def update_advertisement(ad_name: str, patch: AdvertisementUpdate):
         sets.append("display_duration = %s"); params.append(patch.display_duration)
     
     if not sets:
-        return get_advertisement(ad_name)
-    
+        return get_advertisement(ad_name, user=user)
+
+    clause, sparams = _media_name_scope("ad_name", ad_name, user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                params.append(ad_name)
-                cur.execute(f"UPDATE public.advertisement SET {', '.join(sets)}, updated_at = NOW() WHERE ad_name = %s RETURNING *;", params)
+                params.extend(sparams)
+                cur.execute(f"UPDATE public.advertisement SET {', '.join(sets)}, updated_at = NOW() WHERE {clause} RETURNING *;", params)
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Advertisement not found")
@@ -5507,16 +5659,17 @@ def update_advertisement(ad_name: str, patch: AdvertisementUpdate):
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/advertisement/{ad_name}/rotation")
-def set_advertisement_rotation(ad_name: str, body: AdvertisementRotationUpdate):
+def set_advertisement_rotation(ad_name: str, body: AdvertisementRotationUpdate, user: Dict = Depends(get_current_user)):
     """Update advertisement rotation."""
+    _require_media_manage(user)
     if body.rotation not in (0, 90, 180, 270):
         raise HTTPException(status_code=400, detail="Rotation must be 0, 90, 180, or 270")
-    
+    clause, params = _media_name_scope("ad_name", ad_name, user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("UPDATE public.advertisement SET rotation = %s, updated_at = NOW() WHERE ad_name = %s RETURNING *;", 
-                           (body.rotation, ad_name))
+                cur.execute(f"UPDATE public.advertisement SET rotation = %s, updated_at = NOW() WHERE {clause} RETURNING *;",
+                           [body.rotation] + params)
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Advertisement not found")
@@ -5530,16 +5683,17 @@ def set_advertisement_rotation(ad_name: str, body: AdvertisementRotationUpdate):
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/advertisement/{ad_name}/fit_mode")
-def set_advertisement_fit_mode(ad_name: str, body: AdvertisementFitModeUpdate):
+def set_advertisement_fit_mode(ad_name: str, body: AdvertisementFitModeUpdate, user: Dict = Depends(get_current_user)):
     """Update advertisement fit mode."""
+    _require_media_manage(user)
     if body.fit_mode not in ("cover", "contain", "fill", "none"):
         raise HTTPException(status_code=400, detail="fit_mode must be cover, contain, fill, or none")
-    
+    clause, params = _media_name_scope("ad_name", ad_name, user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("UPDATE public.advertisement SET fit_mode = %s, updated_at = NOW() WHERE ad_name = %s RETURNING *;", 
-                           (body.fit_mode, ad_name))
+                cur.execute(f"UPDATE public.advertisement SET fit_mode = %s, updated_at = NOW() WHERE {clause} RETURNING *;",
+                           [body.fit_mode] + params)
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Advertisement not found")
@@ -5553,12 +5707,14 @@ def set_advertisement_fit_mode(ad_name: str, body: AdvertisementFitModeUpdate):
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/advertisement/{ad_name}")
-def delete_advertisement(ad_name: str, force: bool = Query(False)):
+def delete_advertisement(ad_name: str, force: bool = Query(False), user: Dict = Depends(get_current_user)):
     """Delete an advertisement. Returns 409 with linked info if linked and force=false."""
+    _require_media_manage(user)
+    clause, sparams = _media_name_scope("ad_name", ad_name, user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM public.advertisement WHERE ad_name = %s LIMIT 1;", (ad_name,))
+                cur.execute(f"SELECT id FROM public.advertisement WHERE {clause} ORDER BY id DESC LIMIT 1;", sparams)
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Advertisement not found")
@@ -5607,12 +5763,13 @@ def delete_advertisement(ad_name: str, force: bool = Query(False)):
 
 
 @app.get("/advertisement/{ad_name}/groups")
-def get_advertisement_groups(ad_name: str):
+def get_advertisement_groups(ad_name: str, user: Dict = Depends(get_current_user)):
     """Get all groups where this advertisement/image is linked."""
+    clause, params = _media_name_scope("ad_name", ad_name, user)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            # First get advertisement ID
-            cur.execute("SELECT id FROM public.advertisement WHERE ad_name = %s LIMIT 1;", (ad_name,))
+            # First get advertisement ID (tenant-scoped)
+            cur.execute(f"SELECT id FROM public.advertisement WHERE {clause} ORDER BY id DESC LIMIT 1;", params)
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Advertisement not found")
@@ -5729,14 +5886,18 @@ def _set_group_advertisements(conn, gid: int, aids: List[int]):
         inserted = 0
         deleted = 0
         
-        # Insert new links
+        # Upsert EVERY link with its submitted position, so display_order is a
+        # contiguous 0..n-1 sequence in the given order. Numbering only new links
+        # (the old behaviour) left existing rows with a stale order, so a mid-list
+        # removal silently reshuffled items the operator never touched.
         for i, aid in enumerate(aids):
+            cur.execute(
+                "INSERT INTO public.group_advertisement (gid, aid, display_order) VALUES (%s, %s, %s) "
+                "ON CONFLICT (gid, aid) DO UPDATE SET display_order = EXCLUDED.display_order;",
+                (gid, aid, i)
+            )
             if aid in to_insert:
-                cur.execute(
-                    "INSERT INTO public.group_advertisement (gid, aid, display_order) VALUES (%s, %s, %s) ON CONFLICT (gid, aid) DO NOTHING;",
-                    (gid, aid, i)
-                )
-                inserted += cur.rowcount
+                inserted += 1
         
         # Delete removed links
         if to_delete:
@@ -5881,7 +6042,7 @@ def get_device_active_status(mobile_id: str):
 
 
 @app.post("/device/{mobile_id}/active-status")
-def set_device_active_status(mobile_id: str, body: DeviceActiveStatusIn):
+def set_device_active_status(mobile_id: str, body: DeviceActiveStatusIn, user: Dict = Depends(get_current_user)):
     """
     Set the active status of a device.
     - When is_active = False: Device will show "Not Enrolled" screen
@@ -5890,18 +6051,10 @@ def set_device_active_status(mobile_id: str, body: DeviceActiveStatusIn):
     try:
         with pg_conn() as conn:
             with conn.cursor() as cur:
-                # Check device exists
-                cur.execute("""
-                    SELECT id FROM public.device 
-                    WHERE mobile_id = %s 
-                    ORDER BY id DESC LIMIT 1;
-                """, (mobile_id,))
-                row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail=f"Device not found: {mobile_id}")
-                
-                did = row[0]
-                
+                # Authorize the caller for this device (tenant-scoped)
+                ids, _ = authorize_device(cur, mobile_id, user)
+                did = ids[0]
+
                 # Update is_active status and set needs_refresh to trigger app restart
                 cur.execute("""
                     UPDATE public.device 
@@ -5924,7 +6077,7 @@ def set_device_active_status(mobile_id: str, body: DeviceActiveStatusIn):
 
 
 @app.post("/device/{mobile_id}/refresh")
-def trigger_device_refresh(mobile_id: str):
+def trigger_device_refresh(mobile_id: str, user: Dict = Depends(get_current_user)):
     """
     Trigger a refresh/restart of the device app.
     The device will restart on next heartbeat.
@@ -5932,18 +6085,10 @@ def trigger_device_refresh(mobile_id: str):
     try:
         with pg_conn() as conn:
             with conn.cursor() as cur:
-                # Check device exists
-                cur.execute("""
-                    SELECT id FROM public.device 
-                    WHERE mobile_id = %s 
-                    ORDER BY id DESC LIMIT 1;
-                """, (mobile_id,))
-                row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail=f"Device not found: {mobile_id}")
-                
-                did = row[0]
-                
+                # Authorize the caller for this device (tenant-scoped)
+                ids, _ = authorize_device(cur, mobile_id, user)
+                did = ids[0]
+
                 # Set needs_refresh flag
                 cur.execute("""
                     UPDATE public.device 
@@ -5964,7 +6109,7 @@ def trigger_device_refresh(mobile_id: str):
 
 
 @app.post("/device/{mobile_id}/unassign-from-group")
-def unassign_device_from_group(mobile_id: str):
+def unassign_device_from_group(mobile_id: str, user: Dict = Depends(get_current_user)):
     """
     Unassign a device from its current group.
     This will:
@@ -5976,18 +6121,10 @@ def unassign_device_from_group(mobile_id: str):
     try:
         with pg_conn() as conn:
             with conn.cursor() as cur:
-                # Get device ID
-                cur.execute("""
-                    SELECT id FROM public.device 
-                    WHERE mobile_id = %s 
-                    ORDER BY id DESC LIMIT 1;
-                """, (mobile_id,))
-                row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail=f"Device not found: {mobile_id}")
-                
-                did = row[0]
-                
+                # Authorize the caller for this device (tenant-scoped)
+                ids, _ = authorize_device(cur, mobile_id, user)
+                did = ids[0]
+
                 # Get current group info before unassigning
                 cur.execute("""
                     SELECT g.gname 
@@ -6150,6 +6287,22 @@ def _detect_video_content_type(filename: str) -> str:
     if ext == '.pdf': return "pdf"
     return "video"
 
+
+def _video_stack_s3_content_type(content_type: str, filename: str) -> str:
+    """The S3 object Content-Type for a video-stack upload. The stack accepts
+    images/HTML/PDF too, so hardcoding video/mp4 broke browser rendering of
+    images (a <img> refuses a video/mp4 object). Map to the real MIME."""
+    from pathlib import Path as _P
+    ext = _P(filename or "").suffix.lower().lstrip(".")
+    if content_type == "image":
+        return {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/jpeg")
+    if content_type == "html":
+        return "text/html"
+    if content_type == "pdf":
+        return "application/pdf"
+    return "video/mp4"
+
 def _video_s3_key_exists(key: str, bucket: str = None) -> bool:
     s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else boto3.client("s3")
     b = bucket or S3_BUCKET
@@ -6259,7 +6412,7 @@ def standalone_list_devices(
                        COALESCE(dc.downloaded_count, 0) as downloaded_count,
                        -- Last content update time
                        COALESCE(lc.last_content_update, d.updated_at) as last_content_update,
-                       d.is_muted
+                       d.is_muted, d.app_version, d.reported_resolution
                 FROM public.device d
                 LEFT JOIN public.device_assignment da ON da.did = d.id
                 LEFT JOIN public."group" g1 ON g1.id = da.gid
@@ -6297,6 +6450,19 @@ def standalone_list_devices(
                 cur.execute(base_sql + " ORDER BY d.id DESC LIMIT %s OFFSET %s;", tenant_params + [limit, offset])
             rows = cur.fetchall()
 
+            # Does this tenant have a published screen template linked? Screens
+            # render it regardless of playlist videos, so "0 videos" must not
+            # read as "No content" on template-driven fleets.
+            template_linked = False
+            if tenant_id:
+                cur.execute("""
+                    SELECT 1 FROM public.company c
+                    JOIN public.screen_template st
+                      ON st.id = c.template_id AND st.status = 'published'
+                    WHERE c.id = %s;
+                """, (tenant_id,))
+                template_linked = cur.fetchone() is not None
+
     items = []
     for r in rows:
         is_online = r[9] if len(r) > 9 else False
@@ -6311,7 +6477,9 @@ def standalone_list_devices(
         # - pending: Content assigned but not yet downloaded
         # - unknown: No content assigned or device hasn't checked in
         if video_count == 0:
-            content_status = "no_content"
+            # A linked template plays even with an empty rotation — the screen
+            # is template-driven, not contentless.
+            content_status = "template" if template_linked else "no_content"
         elif download_status and is_online:
             content_status = "synced"
         elif is_online and not download_status:
@@ -6340,23 +6508,35 @@ def standalone_list_devices(
             "content_status": content_status,
             "last_content_update": r[14] if len(r) > 14 else None,
             "is_muted": bool(r[15]) if len(r) > 15 and r[15] is not None else False,
+            # Fleet telemetry (self-reported by the player heartbeat)
+            "app_version": r[16] if len(r) > 16 else None,
+            "reported_resolution": r[17] if len(r) > 17 else None,
+            # Lets the dashboard recompute content_status client-side (WS
+            # online/offline patches) with the same template awareness.
+            "template_linked": template_linked,
         })
     
     return {"items": items, "total": total, "count": len(items), "limit": limit, "offset": offset, "query": q}
 
 @app.put("/device/{mobile_id}")
-def standalone_update_device(mobile_id: str, patch: StandaloneDeviceUpdate):
+def standalone_update_device(mobile_id: str, patch: StandaloneDeviceUpdate, user: Dict = Depends(get_current_user)):
     sets, params = [], []
     if patch.mobile_id is not None:
         sets.append("mobile_id = %s"); params.append(patch.mobile_id)
     if patch.download_status is not None:
         sets.append("download_status = %s"); params.append(patch.download_status)
-    if not sets:
-        return standalone_get_device(mobile_id)
-    params.append(mobile_id)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"UPDATE public.device SET {', '.join(sets)} WHERE mobile_id = %s RETURNING id, mobile_id, download_status, created_at, updated_at;", params)
+            # Authorize first (tenant-scoped) so even a no-op PUT can't read another
+            # tenant's device metadata by mobile_id collision.
+            ids, _ = authorize_device(cur, mobile_id, user)
+            if not sets:
+                cur.execute("SELECT id, mobile_id, download_status, created_at, updated_at FROM public.device WHERE id = ANY(%s::bigint[]) ORDER BY id DESC LIMIT 1;", (ids,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="Device not found")
+                return {"id": row[0], "mobile_id": row[1], "download_status": row[2], "created_at": row[3], "updated_at": row[4]}
+            cur.execute(f"UPDATE public.device SET {', '.join(sets)} WHERE id = ANY(%s::bigint[]) RETURNING id, mobile_id, download_status, created_at, updated_at;", params + [ids])
             row = cur.fetchone()
         conn.commit()
     if not row:
@@ -6364,14 +6544,13 @@ def standalone_update_device(mobile_id: str, patch: StandaloneDeviceUpdate):
     return {"message": "Device updated", "item": {"id": row[0], "mobile_id": row[1], "download_status": row[2], "created_at": row[3], "updated_at": row[4]}}
 
 @app.delete("/device/{mobile_id}")
-def standalone_delete_device(mobile_id: str, force: bool = Query(False)):
+def standalone_delete_device(mobile_id: str, force: bool = Query(False), user: Dict = Depends(get_current_user)):
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM public.device WHERE mobile_id = %s ORDER BY id DESC;", (mobile_id,))
-                device_ids = [r[0] for r in cur.fetchall()]
-                if not device_ids:
-                    raise HTTPException(status_code=404, detail="Device not found")
+                # Tenant-scoped: only ever delete the caller's own device rows
+                # (mobile_id is not unique across tenants — never cross-tenant delete).
+                device_ids, _ = authorize_device(cur, mobile_id, user)
 
                 # Check all FK references
                 linked = {}
@@ -6415,7 +6594,10 @@ def standalone_delete_device(mobile_id: str, force: bool = Query(False)):
                     except Exception:
                         cur.execute(f"ROLLBACK TO SAVEPOINT sp_{label}")
 
-                cur.execute("DELETE FROM public.device WHERE mobile_id = %s RETURNING id;", (mobile_id,))
+                # Delete ONLY the caller's own tenant-scoped rows (mobile_id is not
+                # unique across tenants — keying on it here would cross-tenant delete
+                # and CASCADE-wipe another tenant's device data).
+                cur.execute("DELETE FROM public.device WHERE id = ANY(%s::bigint[]) RETURNING id;", (device_ids,))
                 deleted = cur.fetchall()
             conn.commit()
             return {"deleted_count": len(deleted), "unlinked": unlinked}
@@ -6740,10 +6922,11 @@ async def standalone_upload_video(
     if not overwrite and _video_s3_key_exists(key):
         raise HTTPException(status_code=409, detail="Video exists. Use overwrite=true.")
     content_type = _detect_video_content_type(file.filename or video_name)
+    s3_content_type = _video_stack_s3_content_type(content_type, file.filename or video_name)
     s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else boto3.client("s3")
     from boto3.s3.transfer import TransferConfig
     cfg = TransferConfig(multipart_threshold=8*1024*1024, multipart_chunksize=16*1024*1024, max_concurrency=8, use_threads=True)
-    s3.upload_fileobj(file.file, S3_BUCKET, key, ExtraArgs={"ACL": "private", "ServerSideEncryption": "AES256", "ContentType": "video/mp4"}, Config=cfg)
+    s3.upload_fileobj(file.file, S3_BUCKET, key, ExtraArgs={"ACL": "private", "ServerSideEncryption": "AES256", "ContentType": s3_content_type}, Config=cfg)
     s3_uri = _to_video_s3_uri(key)
     with pg_conn() as conn:
         with conn.cursor() as cur:
@@ -6821,7 +7004,8 @@ def standalone_list_videos(
     return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
 
 @app.put("/video/{video_name}")
-def standalone_update_video(video_name: str, patch: StandaloneVideoUpdate):
+def standalone_update_video(video_name: str, patch: StandaloneVideoUpdate, user: Dict = Depends(get_current_user)):
+    _require_media_manage(user)
     sets, params = [], []
     if patch.video_name is not None: sets.append("video_name = %s"); params.append(patch.video_name)
     if patch.s3_link is not None: sets.append("s3_link = %s"); params.append(patch.s3_link)
@@ -6831,10 +7015,11 @@ def standalone_update_video(video_name: str, patch: StandaloneVideoUpdate):
     if patch.display_duration is not None: sets.append("display_duration = %s"); params.append(patch.display_duration)
     if not sets:
         raise HTTPException(status_code=400, detail="No fields to update")
-    params.append(video_name)
+    clause, sparams = _media_name_scope("video_name", video_name, user)
+    params.extend(sparams)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"UPDATE public.video SET {', '.join(sets)}, updated_at = NOW() WHERE video_name = %s RETURNING id, video_name, s3_link, rotation, content_type, fit_mode, display_duration, created_at, updated_at;", params)
+            cur.execute(f"UPDATE public.video SET {', '.join(sets)}, updated_at = NOW() WHERE {clause} RETURNING id, video_name, s3_link, rotation, content_type, fit_mode, display_duration, created_at, updated_at;", params)
             row = cur.fetchone()
         conn.commit()
     if not row:
@@ -6843,11 +7028,13 @@ def standalone_update_video(video_name: str, patch: StandaloneVideoUpdate):
             "content_type": row[4], "fit_mode": row[5], "display_duration": row[6], "created_at": row[7], "updated_at": row[8]}}
 
 @app.delete("/video/{video_name}")
-def standalone_delete_video(video_name: str, force: bool = Query(False)):
+def standalone_delete_video(video_name: str, force: bool = Query(False), user: Dict = Depends(get_current_user)):
+    _require_media_manage(user)
+    clause, params = _media_name_scope("video_name", video_name, user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM public.video WHERE video_name = %s LIMIT 1;", (video_name,))
+                cur.execute(f"SELECT id FROM public.video WHERE {clause} ORDER BY id DESC LIMIT 1;", params)
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Video not found")
@@ -6902,7 +7089,7 @@ def standalone_delete_video(video_name: str, force: bool = Query(False)):
 # ============================================================================
 
 @app.post("/device/{mobile_id}/wipe-videos", response_model=DeviceWipeVideosOut)
-def wipe_all_videos_from_device(mobile_id: str):
+def wipe_all_videos_from_device(mobile_id: str, user: Dict = Depends(get_current_user)):
     """
     Send a command to the device to delete all locally stored video files.
     This does NOT delete videos from S3 or remove links from the database.
@@ -6910,10 +7097,10 @@ def wipe_all_videos_from_device(mobile_id: str):
     """
     with pg_conn() as conn:
         try:
-            did = get_device_id_by_mobile(conn, mobile_id)
-            if did is None:
-                raise HTTPException(status_code=404, detail=f"Device not found: {mobile_id}")
-            
+            with conn.cursor() as ac:
+                ids, _ = authorize_device(ac, mobile_id, user)
+            did = ids[0]
+
             with conn.cursor() as cur:
                 # Only set wipe flag - do NOT delete any links from database
                 # The videos remain on S3 and in the database, only device storage is cleared
@@ -6954,156 +7141,72 @@ def wipe_all_videos_from_device(mobile_id: str):
 
 
 @app.delete("/device/{mobile_id}/wipe-videos")
-def wipe_all_videos_from_device_delete(mobile_id: str):
+def wipe_all_videos_from_device_delete(mobile_id: str, user: Dict = Depends(get_current_user)):
     """DELETE method alias for wipe-videos endpoint."""
-    return wipe_all_videos_from_device(mobile_id)
+    return wipe_all_videos_from_device(mobile_id, user)
 
 
 # ============================================================================
 # DEVICE STORAGE REPORTING
 # ============================================================================
-
-class DeviceStorageReportIn(BaseModel):
-    total_bytes: int = 0
-    available_bytes: int = 0
-    used_bytes: int = 0
-    content_bytes: int = 0
-    storage_percent_used: int = 0
-    ram_total_bytes: int = 0
-    ram_available_bytes: int = 0
-    ram_used_bytes: int = 0
-    system_ram_total: int = 0
-    system_ram_available: int = 0
-    low_memory: bool = False
-    is_tv: bool = False
-
-
-@app.post("/device/{mobile_id}/storage/report")
-def report_device_storage(mobile_id: str, body: DeviceStorageReportIn):
-    """
-    Receive storage and RAM report from device.
-    This is called by the Android app on startup and after downloads.
-    """
-    with pg_conn() as conn:
-        try:
-            did = get_device_id_by_mobile(conn, mobile_id)
-            if did is None:
-                raise HTTPException(status_code=404, detail=f"Device not found: {mobile_id}")
-            
-            with conn.cursor() as cur:
-                # Update device with storage info
-                # Try to use storage columns if they exist
-                try:
-                    cur.execute("""
-                        UPDATE public.device 
-                        SET storage_total_bytes = %s,
-                            storage_available_bytes = %s,
-                            storage_used_bytes = %s,
-                            storage_content_bytes = %s,
-                            storage_percent_used = %s,
-                            ram_total_bytes = %s,
-                            ram_available_bytes = %s,
-                            low_memory = %s,
-                            is_tv = %s,
-                            storage_updated_at = NOW(),
-                            updated_at = NOW()
-                        WHERE id = %s;
-                    """, (
-                        body.total_bytes,
-                        body.available_bytes,
-                        body.used_bytes,
-                        body.content_bytes,
-                        body.storage_percent_used,
-                        body.ram_total_bytes,
-                        body.ram_available_bytes,
-                        body.low_memory,
-                        body.is_tv,
-                        did
-                    ))
-                except Exception as e:
-                    # Columns might not exist, just log and continue
-                    Log_msg = f"Storage columns not found, skipping update: {e}"
-                    print(Log_msg)
-            
-            conn.commit()
-            
-            return {
-                "status": "ok",
-                "mobile_id": mobile_id,
-                "storage_mb": body.total_bytes // (1024 * 1024),
-                "available_mb": body.available_bytes // (1024 * 1024),
-                "content_mb": body.content_bytes // (1024 * 1024)
-            }
-            
-        except HTTPException:
-            conn.rollback()
-            raise
-        except Exception as e:
-            conn.rollback()
-            # Don't fail if storage update fails - it's not critical
-            return {"status": "error", "message": str(e)}
+# NOTE: POST /device/{mobile_id}/storage/report is served by client_requirements_api.py
+# (registered first via include_router, so it wins). A dead duplicate used to live
+# here writing non-existent storage_*_bytes columns; it was removed. The real,
+# migration-backed columns are total_storage_bytes / used_storage_bytes /
+# available_storage_bytes / storage_limit_percent / last_storage_report_at
+# (see migrations/client_requirements_schema.py).
 
 
 @app.get("/device/{mobile_id}/storage")
 def get_device_storage(mobile_id: str):
     """
-    Get device storage and RAM info for dashboard display.
+    Get device storage info for dashboard display. Reads the migration-backed
+    columns written by the storage/report handler (client_requirements_api.py):
+    total_storage_bytes, used_storage_bytes, available_storage_bytes (headroom
+    for content within the limit), storage_limit_percent, last_storage_report_at.
     """
     with pg_conn() as conn:
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT 
-                        storage_total_bytes,
-                        storage_available_bytes,
-                        storage_used_bytes,
-                        storage_content_bytes,
-                        storage_percent_used,
-                        ram_total_bytes,
-                        ram_available_bytes,
-                        low_memory,
-                        is_tv,
-                        storage_updated_at
-                    FROM public.device 
-                    WHERE mobile_id = %s;
-                """, (mobile_id,))
-                row = cur.fetchone()
-                
-                if not row:
-                    raise HTTPException(status_code=404, detail="Device not found")
-                
-                return {
-                    "mobile_id": mobile_id,
-                    "storage": {
-                        "total_bytes": row[0] or 0,
-                        "available_bytes": row[1] or 0,
-                        "used_bytes": row[2] or 0,
-                        "content_bytes": row[3] or 0,
-                        "percent_used": row[4] or 0,
-                        "total_mb": (row[0] or 0) // (1024 * 1024),
-                        "available_mb": (row[1] or 0) // (1024 * 1024),
-                        "content_mb": (row[3] or 0) // (1024 * 1024)
-                    },
-                    "ram": {
-                        "total_bytes": row[5] or 0,
-                        "available_bytes": row[6] or 0,
-                        "total_mb": (row[5] or 0) // (1024 * 1024),
-                        "available_mb": (row[6] or 0) // (1024 * 1024)
-                    },
-                    "low_memory": row[7] or False,
-                    "is_tv": row[8] or False,
-                    "last_updated": row[9].isoformat() if row[9] else None
-                }
-        except HTTPException:
-            raise
-        except Exception as e:
-            # Columns might not exist
-            return {
-                "mobile_id": mobile_id,
-                "storage": None,
-                "ram": None,
-                "error": "Storage info not available. Run migration to add storage columns."
-            }
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT total_storage_bytes,
+                       used_storage_bytes,
+                       available_storage_bytes,
+                       storage_limit_percent,
+                       last_storage_report_at
+                FROM public.device
+                WHERE mobile_id = %s;
+            """, (mobile_id,))
+            row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    reported_at = row[4]
+    # Not reported yet → storage: null (a legitimate empty state the dashboard renders).
+    if reported_at is None:
+        return {"mobile_id": mobile_id, "reported": False, "storage": None, "last_updated": None}
+
+    total = row[0] or 0
+    used = row[1] or 0
+    available_for_content = row[2] or 0
+    limit_percent = row[3] if row[3] is not None else 80
+    percent_used = round(used * 100 / total, 1) if total else 0
+
+    return {
+        "mobile_id": mobile_id,
+        "reported": True,
+        "storage": {
+            "total_bytes": total,
+            "used_bytes": used,
+            "available_for_content_bytes": available_for_content,
+            "percent_used": percent_used,
+            "storage_limit_percent": limit_percent,
+            "total_mb": total // (1024 * 1024),
+            "used_mb": used // (1024 * 1024),
+            "available_for_content_mb": available_for_content // (1024 * 1024),
+        },
+        "last_updated": reported_at.isoformat(),
+    }
 
 
 if __name__ == "__main__":

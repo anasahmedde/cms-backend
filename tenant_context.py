@@ -57,11 +57,106 @@ class TenantContext:
 
 
 # ══════════════════════════════════════════════════════════════
-# SESSION STORE (in-memory, same as before but with tenant info)
+# SESSION STORE
 # ══════════════════════════════════════════════════════════════
+# Process memory is the hot path; every write goes through to the
+# auth_session table (token stored as SHA-256, never raw) so sessions survive
+# deploys/restarts and work across replicas. On a memory miss the token is
+# rehydrated from the DB.
+
+import logging
+
+_auth_logger = logging.getLogger("auth.sessions")
 
 # Token -> session dict
 active_sessions: Dict[str, Dict[str, Any]] = {}
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _session_to_json(session: Dict[str, Any]) -> str:
+    doc = dict(session)
+    exp = doc.get("expires_at")
+    if isinstance(exp, datetime):
+        doc["expires_at"] = exp.isoformat()
+    return json.dumps(doc)
+
+
+def _session_from_json(doc: Dict[str, Any]) -> Dict[str, Any]:
+    session = dict(doc)
+    exp = session.get("expires_at")
+    if isinstance(exp, str):
+        try:
+            session["expires_at"] = datetime.fromisoformat(exp)
+        except ValueError:
+            session["expires_at"] = datetime.min
+    return session
+
+
+def persist_session(token: str, session: Dict[str, Any]) -> None:
+    """Write-through a session to the DB. Failures are logged, never fatal —
+    the in-memory session still works until the next restart."""
+    try:
+        from database import pg_conn
+        exp = session.get("expires_at")
+        exp_dt = exp if isinstance(exp, datetime) else datetime.now() + timedelta(hours=24)
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO public.auth_session (token_hash, session, expires_at)
+                    VALUES (%s, %s::jsonb, %s)
+                    ON CONFLICT (token_hash)
+                    DO UPDATE SET session = EXCLUDED.session,
+                                  expires_at = EXCLUDED.expires_at,
+                                  updated_at = NOW();
+                """, (_token_hash(token), _session_to_json(session), exp_dt))
+            conn.commit()
+    except Exception as exc:
+        _auth_logger.warning("session persist failed (memory-only until restart): %s", exc)
+
+
+def _load_session_from_db(token: str) -> Optional[Dict[str, Any]]:
+    try:
+        from database import pg_conn
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT session FROM public.auth_session WHERE token_hash = %s AND expires_at > NOW();",
+                    (_token_hash(token),),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return _session_from_json(row[0] if isinstance(row[0], dict) else json.loads(row[0]))
+    except Exception as exc:
+        _auth_logger.warning("session load failed: %s", exc)
+        return None
+
+
+def destroy_session(token: str) -> None:
+    """Remove a session from memory AND the DB (logout / forced invalidation)."""
+    active_sessions.pop(token, None)
+    try:
+        from database import pg_conn
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM public.auth_session WHERE token_hash = %s;", (_token_hash(token),))
+            conn.commit()
+    except Exception as exc:
+        _auth_logger.warning("session DB delete failed: %s", exc)
+
+
+def _resolve_session(token: str) -> Optional[Dict[str, Any]]:
+    """Memory first, then DB rehydrate (post-deploy / other replica)."""
+    session = active_sessions.get(token)
+    if session is not None:
+        return session
+    session = _load_session_from_db(token)
+    if session is not None:
+        active_sessions[token] = session
+    return session
 
 
 def hash_password(password: str) -> str:
@@ -77,23 +172,45 @@ def generate_token() -> str:
 
 
 def invalidate_user_sessions(user_id: int):
-    """Remove all active sessions for a specific user."""
+    """Remove all active sessions for a specific user (memory + DB)."""
     tokens_to_remove = [
         token for token, session in active_sessions.items()
         if session.get("user_id") == user_id
     ]
     for token in tokens_to_remove:
         del active_sessions[token]
+    try:
+        from database import pg_conn
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM public.auth_session WHERE (session->>'user_id')::bigint = %s;",
+                    (user_id,),
+                )
+            conn.commit()
+    except Exception as exc:
+        _auth_logger.warning("user session DB invalidation failed for user %s: %s", user_id, exc)
 
 
 def invalidate_tenant_sessions(tenant_id: int):
-    """Remove all sessions for users of a specific tenant."""
+    """Remove all sessions for users of a specific tenant (memory + DB)."""
     tokens_to_remove = [
         token for token, session in active_sessions.items()
         if session.get("tenant_id") == tenant_id
     ]
     for token in tokens_to_remove:
         del active_sessions[token]
+    try:
+        from database import pg_conn
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM public.auth_session WHERE (session->>'tenant_id')::bigint = %s;",
+                    (tenant_id,),
+                )
+            conn.commit()
+    except Exception as exc:
+        _auth_logger.warning("tenant session DB invalidation failed for tenant %s: %s", tenant_id, exc)
 
 
 def create_session(
@@ -126,6 +243,16 @@ def create_session(
         "is_impersonating": False,
         "expires_at": datetime.now() + timedelta(hours=hours),
     }
+    persist_session(token, active_sessions[token])
+    # Opportunistic cleanup of expired rows (cheap, indexed).
+    try:
+        from database import pg_conn
+        with pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM public.auth_session WHERE expires_at <= NOW();")
+            conn.commit()
+    except Exception as exc:
+        _auth_logger.warning("expired-session sweep failed: %s", exc)
     return token
 
 
@@ -145,13 +272,12 @@ def get_tenant_context(authorization: Optional[str] = Header(None)) -> TenantCon
 
     token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
 
-    if token not in active_sessions:
+    session = _resolve_session(token)
+    if session is None:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-    session = active_sessions[token]
-
     if datetime.now() > session.get("expires_at", datetime.min):
-        del active_sessions[token]
+        destroy_session(token)
         raise HTTPException(status_code=401, detail="Token expired")
 
     # Check company expiration for company users (not platform users)
@@ -165,7 +291,7 @@ def get_tenant_context(authorization: Optional[str] = Header(None)) -> TenantCon
         company_access = check_company_access(tenant_id)
         if not company_access.get("accessible", True):
             # Company is expired/suspended - invalidate session and force logout
-            del active_sessions[token]
+            destroy_session(token)
             status = company_access.get("status", "expired")
             if status == "suspended":
                 raise HTTPException(
@@ -268,10 +394,10 @@ def require_tenant_context(ctx: TenantContext = Depends(get_tenant_context)) -> 
 
 def start_impersonation(token: str, company_id: int, company_slug: str, company_name: str):
     """Set a platform user's session to impersonate a company."""
-    if token not in active_sessions:
+    session = _resolve_session(token)
+    if session is None:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    session = active_sessions[token]
     if session["user_type"] != "platform":
         raise HTTPException(status_code=403, detail="Only platform users can impersonate")
     if "platform.impersonate" not in session.get("permissions", []) and \
@@ -282,18 +408,20 @@ def start_impersonation(token: str, company_id: int, company_slug: str, company_
     session["company_slug"] = company_slug
     session["company_name"] = company_name
     session["is_impersonating"] = True
+    persist_session(token, session)
 
 
 def stop_impersonation(token: str):
     """Revert a platform user's session to their own context."""
-    if token not in active_sessions:
+    session = _resolve_session(token)
+    if session is None:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    session = active_sessions[token]
     session["active_tenant_id"] = session.get("tenant_id")  # back to None for platform
     session["company_slug"] = None
     session["company_name"] = None
     session["is_impersonating"] = False
+    persist_session(token, session)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -308,15 +436,22 @@ def log_audit(conn, tenant_id, user_id, action, resource_type=None,
     """
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO public.audit_log
-                    (tenant_id, user_id, action, resource_type, resource_id, details, ip_address)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (
-                tenant_id, user_id, action, resource_type, resource_id,
-                json.dumps(details) if details else None,
-                ip_address,
-            ))
+            # Savepoint so a failed audit INSERT cannot abort the caller's
+            # transaction (which would silently turn its commit into a rollback).
+            cur.execute("SAVEPOINT audit_log_sp")
+            try:
+                cur.execute("""
+                    INSERT INTO public.audit_log
+                        (tenant_id, user_id, action, resource_type, resource_id, details, ip_address)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    tenant_id, user_id, action, resource_type, resource_id,
+                    json.dumps(details) if details else None,
+                    ip_address,
+                ))
+                cur.execute("RELEASE SAVEPOINT audit_log_sp")
+            except Exception:
+                cur.execute("ROLLBACK TO SAVEPOINT audit_log_sp")
     except Exception:
         pass  # Never let audit logging break the caller
 

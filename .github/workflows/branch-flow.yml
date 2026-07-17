@@ -1,0 +1,23 @@
+name: Branch Flow
+
+# Enforces the release flow: feature branches merge into `staging`;
+# only `staging` may merge into `main`. This check is required by the
+# `protect-main` repository ruleset — do not remove it.
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  enforce-branch-flow:
+    name: enforce-branch-flow
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only staging may merge into main
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ "$HEAD_REF" != "staging" ]; then
+            echo "::error::Blocked: PRs into main must come from 'staging' (this PR is from '$HEAD_REF'). Merge your branch into staging first, then open a staging -> main PR."
+            exit 1
+          fi
+          echo "OK: staging -> main flow respected."

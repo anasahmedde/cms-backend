@@ -237,6 +237,26 @@ def ensure_dvsg_schema(conn):
     END $$;
     """
 
+    # Backfill: the content_type column was added with DEFAULT 'video', so every
+    # image/html/pdf uploaded to the video stack BEFORE the column existed reads
+    # as 'video' and gets mis-shown as a video. Re-derive the real type from the
+    # file extension. Idempotent + forward-only: only rows still at the 'video'
+    # default with a non-video extension are touched, so it's a no-op once run
+    # (and safe under a rolling deploy — old code treated these as videos, new
+    # code as their true type, both tolerated). Only content_type is corrected.
+    ddl_video_content_type_backfill = r"""
+    UPDATE public.video
+       SET content_type = CASE
+           WHEN lower(s3_link) ~ '\.(jpg|jpeg|png|gif|webp)(\?|#|$)' THEN 'image'
+           WHEN lower(s3_link) ~ '\.(html|htm)(\?|#|$)'              THEN 'html'
+           WHEN lower(s3_link) ~ '\.pdf(\?|#|$)'                     THEN 'pdf'
+           ELSE content_type
+       END
+     WHERE content_type = 'video'
+       AND s3_link IS NOT NULL
+       AND lower(s3_link) ~ '\.(jpg|jpeg|png|gif|webp|html|htm|pdf)(\?|#|$)';
+    """
+
     ddl_shop_cols = """
     DO $$
     DECLARE t text;
@@ -682,6 +702,7 @@ def ensure_dvsg_schema(conn):
         # Then run ALTER TABLE migrations
         cur.execute(ddl_device_cols)
         cur.execute(ddl_video_cols)
+        cur.execute(ddl_video_content_type_backfill)
         cur.execute(ddl_shop_cols)
         cur.execute(ddl_link_table)
         cur.execute(ddl_link_cols)

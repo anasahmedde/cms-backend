@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>DIGIX Screen</title>
+<style>
+  :root { --bg: #000; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg); font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Naskh Arabic", "Noto Sans Arabic", sans-serif; }
+  #stage { position: relative; width: 100vw; height: 100vh; background: var(--bg); }
+  .zone { position: absolute; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+  .zone > img, .zone > video { width: 100%; height: 100%; }
+  .zone .txt { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; padding: 0 2%; text-align: center; line-height: 1.15; word-break: break-word; }
+  .ticker-wrap { width: 100%; overflow: hidden; white-space: nowrap; }
+  .ticker-move { display: inline-block; padding-left: 100%; animation: ticker linear infinite; }
+  @keyframes ticker { from { transform: translateX(0); } to { transform: translateX(-100%); } }
+  #status { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 14px; font-size: 14px; color: #cbd5e1; background: rgba(10,22,40,0.85); display: none; z-index: 9999; }
+  #status.show { display: block; }
+  #splash { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; color: #94a3b8; background: #0a1628; z-index: 9998; text-align: center; padding: 24px; }
+  #splash h1 { font-size: 22px; color: #f1f5f9; font-weight: 600; }
+  #splash code { font-size: 15px; color: #f59e0b; word-break: break-all; }
+  #splash.hidden { display: none; }
+  .spin { width: 34px; height: 34px; border: 3px solid rgba(245,158,11,0.25); border-top-color: #f59e0b; border-radius: 50%; animation: rot 0.9s linear infinite; }
+  @keyframes rot { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="splash">
+    <div class="spin"></div>
+    <h1>DIGIX Screen</h1>
+    <div id="splashMsg">Connecting…</div>
+    <div id="splashId"></div>
+  </div>
+  <div id="status"></div>
+
+<script>
+"use strict";
+/*
+ * DIGIX standalone Screen Template renderer.
+ *
+ * A single self-contained page a Linux mini-PC browser / kiosk opens. It renders
+ * the resolved template for one device (percentage-positioned zones) and, for the
+ * "playlist" zone, plays that device's assigned videos/images via the existing
+ * content pipeline. Falls back gracefully: no template linked -> waiting screen;
+ * offline -> last-good template from localStorage.
+ *
+ * URL params:
+ *   ?device=<mobile_id>   (required; also accepts ?id= or ?mobile_id=)
+ *   ?api=<base url>       (optional; defaults to this page's origin)
+ * The device id also persists in localStorage so a bare reload keeps working.
+ */
+(function () {
+  var qs = new URLSearchParams(location.search);
+  var API = (qs.get("api") || "").replace(/\/+$/, "") || location.origin;
+  var DEVICE = qs.get("device") || qs.get("id") || qs.get("mobile_id") ||
+               localStorage.getItem("dgx_player_device") || "";
+  if (DEVICE) localStorage.setItem("dgx_player_device", DEVICE);
+
+  var TEMPLATE_KEY = "dgx_player_template_" + DEVICE;
+  var PLAYLIST_KEY = "dgx_player_playlist_" + DEVICE;
+  var HEARTBEAT_MS = 30000;
+  var TEMPLATE_POLL_MS = 60000;   // safety re-fetch even if heartbeat misses
+  var PLAYLIST_POLL_MS = 60000;
+
+  var stage = document.getElementById("stage");
+  var splash = document.getElementById("splash");
+  var splashMsg = document.getElementById("splashMsg");
+  var splashId = document.getElementById("splashId");
+  var statusEl = document.getElementById("status");
+
+  var state = {
+    stamp: null,           // template_stamp last rendered
+    template: null,        // last template object
+    playlistTimer: null,   // per-playlist-zone advance timer
+  };
+
+  splashId.innerHTML = DEVICE ? ("Device: <code>" + escapeHtml(DEVICE) + "</code>")
+                              : '<code>No device id — append ?device=YOUR_ID to the URL</code>';
+
+  function escapeHtml(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function showStatus(msg) {
+    if (!msg) { statusEl.className = ""; return; }
+    statusEl.textContent = msg;
+    statusEl.className = "show";
+  }
+  function hideSplash() { splash.className = "hidden"; }
+  function showSplash(msg) { splash.className = ""; if (msg) splashMsg.textContent = msg; }
+
+  function api(path) {
+    return API + path;
+  }
+  function getJSON(path) {
+    return fetch(api(path), { cache: "no-store" }).then(function (r) {
+      if (r.status === 404) return { _status: 404 };
+      if (!r.ok) throw new Error("HTTP " + r.status + " for " + path);
+      return r.json();
+    });
+  }
+
+  // ---- Template fetch + change detection ----------------------------------
+  function refreshTemplate() {
+    if (!DEVICE) return Promise.resolve();
+    return getJSON("/device/" + encodeURIComponent(DEVICE) + "/template").then(function (tpl) {
+      if (tpl._status === 404) {
+        // No template linked (or device unknown/deactivated). Keep any cached
+        // render; otherwise show the waiting screen.
+        if (!state.template) showSplash("Waiting for a screen template…");
+        showStatus("");
+        return;
+      }
+      cacheSet(TEMPLATE_KEY, tpl);
+      if (tpl.template_stamp !== state.stamp) {
+        state.stamp = tpl.template_stamp;
+        render(tpl);
+      }
+      showStatus("");
+    }).catch(function (e) {
+      // Network/API error: fall back to cache if we have one.
+      showStatus("Offline — showing last saved screen (" + e.message + ")");
+      if (!state.template) {
+        var cached = cacheGet(TEMPLATE_KEY);
+        if (cached) { state.stamp = cached.template_stamp; render(cached); }
+        else showSplash("Offline — no saved screen yet");
+      }
+    });
+  }
+
+  function cacheSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+  function cacheGet(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }
+
+  // ---- Rendering ----------------------------------------------------------
+  function render(tpl) {
+    state.template = tpl;
+    if (state.playlistTimer) { clearTimeout(state.playlistTimer); state.playlistTimer = null; }
+    stage.innerHTML = "";
+    // Letterbox the design aspect ratio inside the viewport is unnecessary:
+    // zones are percentages, so they map straight onto the full screen.
+    var zones = (tpl.zones || []).slice().sort(function (a, b) { return (a.z || 1) - (b.z || 1); });
+    zones.forEach(function (z) { stage.appendChild(buildZone(z)); });
+    hideSplash();
+  }
+
+  function pos(z) {
+    return "left:" + z.x + "%;top:" + z.y + "%;width:" + z.w + "%;height:" + z.h + "%;z-index:" + (z.z || 1) + ";";
+  }
+
+  function gradientCss(g) {
+    return "linear-gradient(" + (typeof g.angle === "number" ? g.angle : 135) + "deg, " + (g.stops || []).join(", ") + ")";
+  }
+
+  // Background precedence: content image > content gradient > content/style color.
+  function applyBackground(el, c, st) {
+    if (c.bg_image) {
+      el.style.backgroundImage = "url('" + c.bg_image.replace(/'/g, "%27") + "')";
+      el.style.backgroundSize = "cover";
+      el.style.backgroundPosition = "center";
+      return;
+    }
+    if (c.bg_gradient && c.bg_gradient.stops) { el.style.background = gradientCss(c.bg_gradient); return; }
+    var col = c.bg_color || st.bg_color;
+    if (col) el.style.background = col;
+  }
+
+  function buildZone(z) {
+    var el = document.createElement("div");
+    el.className = "zone";
+    el.setAttribute("style", pos(z));
+    var st = z.style || {};
+    var c = z.content || {};
+    applyBackground(el, c, st);
+
+    // Multiple positioned text items inside one zone (designer-composed).
+    if ((z.type === "text" || z.type === "ticker") && Array.isArray(c.runs) && c.runs.length) {
+      fillRuns(el, c.runs);
+      return el;
+    }
+
+    switch (z.type) {
+      case "text":      fillText(el, c.text || "", st, c); break;
+      case "ticker":    fillTicker(el, c.text || "", st, c); break;
+      case "clock":     fillClock(el, st, c); break;
+      case "media":     fillMedia(el, c, st); break;
+      case "qr":        fillQr(el, c, st); break;
+      case "playlist":  fillPlaylist(el, z, st); break;
+      default:          break;
+    }
+    return el;
+  }
+
+  // Render each run absolutely-positioned within the zone. x/y/w/font_size are
+  // percentages of the zone, so they scale with any screen resolution.
+  function fillRuns(el, runs) {
+    el.style.position = "relative";
+    el.style.containerType = "size";
+    runs.forEach(function (r) {
+      var d = document.createElement("div");
+      d.style.position = "absolute";
+      d.style.left = (r.x || 0) + "%";
+      d.style.top = (r.y || 0) + "%";
+      d.style.width = (typeof r.w === "number" ? r.w : (100 - (r.x || 0))) + "%";
+      d.style.color = r.text_color || "#ffffff";
+      d.style.fontSize = "min(" + (typeof r.font_size_vh === "number" ? r.font_size_vh : 20) + "cqh, 40vw)";
+      d.style.fontWeight = r.bold ? "700" : "400";
+      d.style.textAlign = r.align || "left";
+      d.style.lineHeight = "1.1";
+      d.style.whiteSpace = "pre-wrap";
+      d.style.overflow = "hidden";
+      d.textContent = r.text || "";
+      el.appendChild(d);
+    });
+  }
+
+  function textStyle(el, st, c) {
+    var t = document.createElement("div");
+    t.className = "txt";
+    var textColor = (c && c.text_color) || st.text_color;
+    if (textColor) t.style.color = textColor;
+    // font_size_vh is a % of the ZONE height; convert against the zone element.
+    var vh = typeof st.font_size_vh === "number" ? st.font_size_vh : 45;
+    t.style.fontSize = "min(" + (vh) + "cqh, 40vw)";
+    el.style.containerType = "size";
+    if (st.align) t.style.justifyContent = st.align === "left" ? "flex-start" : st.align === "right" ? "flex-end" : "center";
+    if (st.valign) t.style.alignItems = st.valign === "top" ? "flex-start" : st.valign === "bottom" ? "flex-end" : "center";
+    if (st.direction === "rtl") { t.style.direction = "rtl"; }
+    if (st.bold) t.style.fontWeight = "700";
+    return t;
+  }
+
+  function fillText(el, text, st, c) {
+    var t = textStyle(el, st, c);
+    t.textContent = text;
+    el.appendChild(t);
+  }
+
+  function fillTicker(el, text, st, c) {
+    var wrap = document.createElement("div");
+    wrap.className = "ticker-wrap";
+    var mv = document.createElement("span");
+    mv.className = "ticker-move";
+    mv.textContent = text;
+    var tc = (c && c.text_color) || st.text_color;
+    if (tc) mv.style.color = tc;
+    var speed = typeof st.ticker_speed === "number" ? st.ticker_speed : 18;
+    mv.style.animationDuration = speed + "s";
+    mv.style.fontSize = "min(" + (st.font_size_vh || 60) + "cqh, 12vw)";
+    el.style.containerType = "size";
+    wrap.appendChild(mv);
+    el.appendChild(wrap);
+    el.style.justifyContent = "flex-start";
+  }
+
+  function fillClock(el, st, c) {
+    var t = textStyle(el, st, c);
+    el.appendChild(t);
+    function tick() {
+      var d = new Date();
+      var fmt = st.format || "HH:mm";
+      var hh = String(d.getHours()).padStart(2, "0");
+      var mm = String(d.getMinutes()).padStart(2, "0");
+      var ss = String(d.getSeconds()).padStart(2, "0");
+      t.textContent = fmt === "HH:mm:ss" ? (hh + ":" + mm + ":" + ss) : (hh + ":" + mm);
+    }
+    tick();
+    setInterval(tick, 1000);
+  }
+
+  function fillMedia(el, c, st) {
+    if (!c.media_url) { placeholder(el, ""); return; }
+    var fit = st.fit_mode === "contain" ? "contain" : "cover";
+    if (c.media_type === "video") {
+      var v = document.createElement("video");
+      v.src = c.media_url; v.autoplay = true; v.loop = true; v.muted = true;
+      v.playsInline = true; v.style.objectFit = fit;
+      el.appendChild(v);
+    } else {
+      var img = document.createElement("img");
+      img.src = c.media_url; img.style.objectFit = fit;
+      el.appendChild(img);
+    }
+  }
+
+  function fillQr(el, c, st) {
+    // qr content is resolved server-side to a media_url (generated PNG or the
+    // uploaded image/video). The light quiet zone a QR needs in order to scan
+    // hugs the code as a centered SQUARE card; painting the whole zone white
+    // turned every non-square QR box into a white slab (the "white border").
+    // The rest of the zone stays transparent unless the designer set a bg.
+    if (!c.media_url) { placeholder(el, "QR"); return; }
+    if (c.media_type === "video") {
+      var v = document.createElement("video");
+      v.src = c.media_url; v.autoplay = true; v.loop = true; v.muted = true; v.playsInline = true;
+      v.style.objectFit = "contain"; el.appendChild(v);
+      return;
+    }
+    var pad = typeof st.padding_pct === "number" ? st.padding_pct : 6;
+    el.style.containerType = "size"; // cq units against the zone, like fillRuns
+    var card = document.createElement("div");
+    card.style.cssText = "width:100cqmin;height:100cqmin;box-sizing:border-box;" +
+      "padding:" + pad + "cqmin;background:" + (c.bg_color || st.bg_color || "#ffffff") + ";";
+    var img = document.createElement("img");
+    img.src = c.media_url;
+    img.style.cssText = "width:100%;height:100%;object-fit:contain;display:block;";
+    card.appendChild(img);
+    el.appendChild(card);
+  }
+
+  function placeholder(el, label) {
+    // Deliberately blank on screen (never an error string) when content is unset.
+    if (label) { el.style.opacity = "0.25"; el.textContent = label; }
+  }
+
+  // ---- Playlist zone: reuse the existing device content pipeline -----------
+  function fillPlaylist(el, z, st) {
+    var host = document.createElement("div");
+    host.style.cssText = "position:relative;width:100%;height:100%;background:#000;";
+    el.appendChild(host);
+    var fit = st.fit_mode === "contain" ? "contain" : "cover";
+    var media = { items: [], idx: 0 };
+
+    function loadItems() {
+      return getJSON("/device/" + encodeURIComponent(DEVICE) + "/videos/downloads?limit=200&offset=0")
+        .then(function (res) {
+          if (res && res._status === 404) { media.items = []; cacheSet(PLAYLIST_KEY, { items: [] }); return; }
+          media.items = (res && res.items) ? res.items : [];
+          cacheSet(PLAYLIST_KEY, { items: media.items });
+        })
+        .catch(function () {
+          var cached = cacheGet(PLAYLIST_KEY);
+          media.items = (cached && cached.items) ? cached.items : media.items;
+        });
+    }
+
+    function playNext() {
+      if (!media.items.length) {
+        host.innerHTML = "";
+        state.playlistTimer = setTimeout(function () { loadItems().then(playNext); }, 8000);
+        return;
+      }
+      if (media.idx >= media.items.length) media.idx = 0;
+      var it = media.items[media.idx++];
+      host.innerHTML = "";
+      var isVideo = (it.content_type || "video") === "video";
+      if (isVideo) {
+        var v = document.createElement("video");
+        v.src = it.url; v.autoplay = true; v.muted = true; v.playsInline = true;
+        v.style.cssText = "width:100%;height:100%;object-fit:" + fit + ";";
+        v.onended = playNext;
+        v.onerror = function () { state.playlistTimer = setTimeout(playNext, 1500); };
+        host.appendChild(v);
+        v.play().catch(function () {});
+      } else {
+        var img = document.createElement("img");
+        img.src = it.url;
+        img.style.cssText = "width:100%;height:100%;object-fit:" + fit + ";";
+        host.appendChild(img);
+        var secs = (typeof it.display_duration === "number" && it.display_duration > 0) ? it.display_duration : 10;
+        state.playlistTimer = setTimeout(playNext, secs * 1000);
+      }
+    }
+
+    loadItems().then(playNext);
+    // Periodically re-sync the playlist so content edits show without a reload.
+    setInterval(function () { loadItems(); }, PLAYLIST_POLL_MS);
+  }
+
+  // ---- Heartbeat (keeps the device "online" + drives template refresh) -----
+  function heartbeat() {
+    if (!DEVICE) return;
+    fetch(api("/device/" + encodeURIComponent(DEVICE) + "/online_update"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ is_online: true, app_version: "web-player-1.0", resolution: screen.width + "x" + screen.height }),
+    }).then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (hb) {
+        if (hb && hb.template_stamp && hb.template_stamp !== state.stamp) refreshTemplate();
+      })
+      .catch(function () {});
+  }
+
+  // ---- Boot ---------------------------------------------------------------
+  if (!DEVICE) {
+    showSplash("No device id set");
+    return;
+  }
+  // Render cached template immediately for a fast, offline-friendly start.
+  var boot = cacheGet(TEMPLATE_KEY);
+  if (boot) { state.stamp = boot.template_stamp; render(boot); }
+
+  refreshTemplate();
+  heartbeat();
+  setInterval(heartbeat, HEARTBEAT_MS);
+  setInterval(refreshTemplate, TEMPLATE_POLL_MS);
+})();
+</script>
+</body>
+</html>
