@@ -377,3 +377,20 @@ class TestS3RefNormalization:
         out = resolve_zone(zone, {}, {"media": payload}, lambda u: "https://signed/" + u)
         assert out["content"]["media_url"].startswith("https://signed/")
         assert out["content"]["media_type"] == "image"
+
+
+class TestVersionedMediaKeys:
+    def test_media_key_changes_per_upload(self):
+        # Devices cache by URL path — a replaced file must get a NEW path.
+        from template_api import _content_media_key
+        a = _content_media_key("acme", "device", 7, "promo", "jpg")
+        b = _content_media_key("acme", "device", 7, "promo", "jpg")
+        assert a != b
+        assert a.startswith("tenants/acme/template-content/device/7/promo-")
+        assert a.endswith(".jpg")
+
+    def test_qr_key_changes_per_generation(self):
+        from template_api import _content_qr_key
+        a = _content_qr_key("acme", "company", 1, "menu_qr")
+        b = _content_qr_key("acme", "company", 1, "menu_qr")
+        assert a != b and a.endswith(".png")

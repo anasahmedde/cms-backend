@@ -588,12 +588,27 @@ def _tenant_slug(cur, tenant_id: int) -> str:
     return row[0] if row and row[0] else f"tenant-{tenant_id}"
 
 
+def _media_version() -> str:
+    """Unique version segment for uploaded zone-media keys.
+
+    Devices cache media by URL PATH (so presign renewals don't re-download).
+    A deterministic key meant replacing media with a same-extension file kept
+    the same path — cached devices never saw the new file. Versioning the key
+    makes every upload a NEW path: devices fetch it once and prune the old one
+    on their next template build. Timestamp keeps keys sortable; the random
+    tail guarantees uniqueness even within the same millisecond.
+    """
+    import time
+    import uuid
+    return f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
+
+
 def _content_media_key(slug: str, scope: str, target_id: int, zone_key: str, ext: str) -> str:
-    return f"tenants/{slug}/template-content/{scope}/{target_id}/{zone_key}.{ext}"
+    return f"tenants/{slug}/template-content/{scope}/{target_id}/{zone_key}-{_media_version()}.{ext}"
 
 
 def _content_qr_key(slug: str, scope: str, target_id: int, zone_key: str) -> str:
-    return f"tenants/{slug}/template-content/{scope}/{target_id}/{zone_key}-qr.png"
+    return f"tenants/{slug}/template-content/{scope}/{target_id}/{zone_key}-qr-{_media_version()}.png"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1575,6 +1590,27 @@ def _scope_target_id(scope: str, tenant_id: int, shop_id: Optional[int],
     return tenant_id
 
 
+def _existing_zone_payload(cur, tenant_id: int, zone_key: str, scope: str,
+                           shop_id: Optional[int], device_id: Optional[int],
+                           group_id: Optional[int] = None) -> Dict:
+    """The currently stored payload for this exact content row ({} when none)."""
+    if scope == "group":
+        cur.execute("""
+            SELECT payload FROM public.template_zone_group_content
+            WHERE tenant_id = %s AND zone_key = %s AND group_id = %s;
+        """, (tenant_id, zone_key, group_id))
+    else:
+        cur.execute("""
+            SELECT payload FROM public.template_zone_content
+            WHERE tenant_id = %s AND zone_key = %s AND scope = %s
+              AND COALESCE(shop_id, 0) = COALESCE(%s::bigint, 0)
+              AND COALESCE(device_id, 0) = COALESCE(%s::bigint, 0);
+        """, (tenant_id, zone_key, scope, shop_id, device_id))
+    row = cur.fetchone()
+    payload = row[0] if row else {}
+    return json.loads(payload) if isinstance(payload, str) else (payload or {})
+
+
 def _upsert_zone_content(conn, cur, tenant_id: int, zone: Dict, zone_key: str, scope: str,
                          shop_id: Optional[int], device_id: Optional[int],
                          payload: Dict, user_id: Optional[int],
@@ -1591,19 +1627,27 @@ def _upsert_zone_content(conn, cur, tenant_id: int, zone: Dict, zone_key: str, s
     if errors:
         raise HTTPException(status_code=422, detail={"payload_errors": errors})
 
-    # QR link mode: generate the PNG once, store alongside the payload.
+    # QR link mode: generate the PNG once, store alongside the payload. Keys are
+    # versioned now, so re-generating an UNCHANGED link would force every device
+    # to re-download an identical QR — reuse the previous PNG when the link and
+    # its stored image both survive from the existing row.
     if zone["type"] == "qr" and (payload.get("qr_mode") == "link" or
                                  (payload.get("qr_link") and not payload.get("qr_mode"))):
         payload["qr_mode"] = "link"
-        slug = _tenant_slug(cur, tenant_id)
-        target_id = _scope_target_id(scope, tenant_id, shop_id, device_id, group_id)
-        try:
-            png = make_qr_png(payload["qr_link"])
-            payload["qr_generated_s3"] = _upload_bytes(
-                _content_qr_key(slug, scope, target_id, zone_key), png, "image/png")
-        except Exception as e:
-            logger.error("QR generation failed (tenant %s zone %s): %s", tenant_id, zone_key, e)
-            raise HTTPException(status_code=502, detail="QR code generation/upload failed")
+        prev = _existing_zone_payload(cur, tenant_id, zone_key, scope, shop_id, device_id, group_id)
+        if (prev.get("qr_link") == payload.get("qr_link")
+                and prev.get("qr_generated_s3")):
+            payload["qr_generated_s3"] = prev["qr_generated_s3"]
+        else:
+            slug = _tenant_slug(cur, tenant_id)
+            target_id = _scope_target_id(scope, tenant_id, shop_id, device_id, group_id)
+            try:
+                png = make_qr_png(payload["qr_link"])
+                payload["qr_generated_s3"] = _upload_bytes(
+                    _content_qr_key(slug, scope, target_id, zone_key), png, "image/png")
+            except Exception as e:
+                logger.error("QR generation failed (tenant %s zone %s): %s", tenant_id, zone_key, e)
+                raise HTTPException(status_code=502, detail="QR code generation/upload failed")
 
     if scope == "group":
         # Group content: separate table keyed by group_id (see migration note).
