@@ -461,16 +461,21 @@ def resolve_zone(zone: Dict, entity: Dict[str, Optional[str]],
                 resolved["media_url"] = url
                 resolved["media_type"] = payload.get("media_type", "image")
 
-        # Shared text/style fields (text + ticker + any zone with a background).
-        for k in ("text", "text_color", "bg_color", "format"):
+        # Shared text/style fields. Text/ticker zones take the WORDS only —
+        # every visual property (colors, background, size, weight, position)
+        # is designer-owned, always (user decision 2026-07-18) — so stored
+        # style keys on their payloads are deliberately ignored.
+        shared = ("text",) if ztype in ("text", "ticker") else ("text", "text_color", "bg_color", "format")
+        for k in shared:
             if payload.get(k) is not None:
                 resolved[k] = payload[k]
-        # Background can also be a gradient or an image (precedence image > gradient > color).
-        if payload.get("bg_gradient") is not None:
-            resolved["bg_gradient"] = payload["bg_gradient"]
-        bg_img = media_url_of(payload.get("bg_image_s3"), payload.get("bg_image_url"))
-        if bg_img:
-            resolved["bg_image"] = bg_img
+        if ztype not in ("text", "ticker"):
+            # Background can also be a gradient or an image (precedence image > gradient > color).
+            if payload.get("bg_gradient") is not None:
+                resolved["bg_gradient"] = payload["bg_gradient"]
+            bg_img = media_url_of(payload.get("bg_image_s3"), payload.get("bg_image_url"))
+            if bg_img:
+                resolved["bg_image"] = bg_img
         # Per-content fit (cover = fill+crop, contain = show whole). Folded into
         # style, which every player already reads (style.fit_mode), so a per-image
         # fit works with no player change and overrides the zone's designer default.
@@ -478,26 +483,23 @@ def resolve_zone(zone: Dict, entity: Dict[str, Optional[str]],
             out["style"]["fit_mode"] = payload["fit_mode"]
         out["content"] = resolved
 
-    # Text boxes take tenant content on EVERY binding (sheet / dashboard text
-    # overrides the designed or name-bound default) — the binding only supplies
-    # the default. The 'content' source already resolved its payload above.
-    tenant = content.get(zone.get("key")) or {}
-    if ztype in ("text", "ticker") and source != "content" and tenant:
-        for k in ("text", "text_color", "bg_color", "bg_gradient"):
-            if tenant.get(k) is not None:
-                out["content"][k] = tenant[k]
-        t_bg = media_url_of(tenant.get("bg_image_s3"), tenant.get("bg_image_url"))
-        if t_bg:
-            out["content"]["bg_image"] = t_bg
-
-    # Designer-composed positioned text items ride along on every text/ticker
-    # zone regardless of binding (the designer promises "this zone shows the
-    # positioned items"; percentages are zone-relative so players render them
-    # at any resolution) — EXCEPT when an explicit tenant text overrides the
-    # whole composition.
-    if (ztype in ("text", "ticker") and isinstance(zc.get("runs"), list) and zc["runs"]
-            and not tenant.get("text")):
-        out["content"]["runs"] = zc["runs"]
+    # Text/ticker zones: tenant content (sheet or dashboard, on EVERY binding)
+    # supplies the WORDS ONLY — colors, background, size, weight and position
+    # are designer-owned, always (user decision 2026-07-18). With a designer-
+    # composed run layout the override text replaces the FIRST run's words and
+    # keeps the whole composition (so the text still renders in the designed
+    # look); without runs it rides as plain text styled by the zone's designer
+    # style. Percentages in runs are zone-relative, so players render them at
+    # any resolution.
+    if ztype in ("text", "ticker"):
+        t_text = (content.get(zone.get("key")) or {}).get("text")
+        runs = zc.get("runs") if isinstance(zc.get("runs"), list) and zc.get("runs") else None
+        if runs:
+            if t_text:
+                runs = [dict(runs[0], text=t_text)] + [dict(r) for r in runs[1:]]
+            out["content"]["runs"] = runs
+        elif t_text:
+            out["content"]["text"] = t_text
 
     # Designer-set zone backgrounds (style.bg_gradient / style.bg_image_url)
     # fold into resolved content — the players already render content-level
@@ -1452,14 +1454,50 @@ def company_template_preview(scope: str = "company",
                 device_id if scope == "device" else -1,
                 eff_group)
             entity = {"company.name": ctx.company_name, "shop.name": shop_name, "device.name": device_name}
-    zones = [resolve_zone(z, entity, content, presign_content) for z in tpl["zones"]]
+            # Company scope: a box whose content lives ONLY on specific screens/
+            # groups/locations rendered empty here, which read as broken ("how it
+            # looks on screen is empty"). Show ONE representative payload per such
+            # box (screen > group > location, oldest row for determinism) and tag
+            # where it came from so the UI can label it honestly.
+            sampled: Dict[str, Dict[str, Any]] = {}
+            if scope == "company":
+                missing = [z.get("key") for z in tpl["zones"]
+                           if takes_tenant_content(z) and not content.get(z.get("key"))]
+                if missing:
+                    cur.execute("""
+                        SELECT c.zone_key, c.payload, 'screen', d.device_name
+                        FROM public.template_zone_content c
+                        JOIN public.device d ON d.id = c.device_id
+                        WHERE c.tenant_id = %s AND c.scope = 'device' AND c.zone_key = ANY(%s)
+                        UNION ALL
+                        SELECT gc.zone_key, gc.payload, 'group', g.gname
+                        FROM public.template_zone_group_content gc
+                        JOIN public."group" g ON g.id = gc.group_id
+                        WHERE gc.tenant_id = %s AND gc.zone_key = ANY(%s)
+                        UNION ALL
+                        SELECT c.zone_key, c.payload, 'location', s.shop_name
+                        FROM public.template_zone_content c
+                        JOIN public.shop s ON s.id = c.shop_id
+                        WHERE c.tenant_id = %s AND c.scope = 'shop' AND c.zone_key = ANY(%s);
+                    """, (tenant_id, missing, tenant_id, missing, tenant_id, missing))
+                    rank = {"screen": 0, "group": 1, "location": 2}
+                    rows = sorted(cur.fetchall(), key=lambda r: (r[0], rank.get(r[2], 9), str(r[3])))
+                    for zk, pl, level, name in rows:
+                        if zk not in sampled:
+                            sampled[zk] = {"payload": json.loads(pl) if isinstance(pl, str) else pl,
+                                           "from": {"scope": level, "name": name or ""}}
+    resolve_content = {**{zk: s["payload"] for zk, s in sampled.items()}, **content}
+    zones = [resolve_zone(z, entity, resolve_content, presign_content) for z in tpl["zones"]]
+    for rz in zones:
+        if rz.get("key") in sampled:
+            rz["sampled_from"] = sampled[rz["key"]]["from"]
     # Repair browser rendering: an image uploaded to the video stack carries a
     # video/mp4 content-type, which a preview <img> refuses. Re-presign S3-backed
     # image media with an explicit image content-type so the preview shows it.
     for rz in zones:
         rc = rz.get("content") or {}
         if rz.get("type") == "media" and rc.get("media_type") == "image" and rc.get("media_url"):
-            s3ref = (content.get(rz.get("key")) or {}).get("media_s3")
+            s3ref = (resolve_content.get(rz.get("key")) or {}).get("media_s3")
             if s3ref:
                 fixed = presign_content(s3ref, response_content_type="image/jpeg")
                 if fixed:
