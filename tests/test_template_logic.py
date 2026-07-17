@@ -5,6 +5,7 @@ import pytest
 from template_api import (
     make_qr_png,
     resolve_zone,
+    takes_tenant_content,
     validate_content_payload,
     validate_zones,
     _canonical_s3_ref,
@@ -270,6 +271,70 @@ class TestResolveZone:
                 "binding": {"source": "static"}, "content": {"text": "Fixed"}}
         out = resolve_zone(zone, ENTITY, {}, FAKE_PRESIGN)
         assert out["content"] == {"text": "Fixed"}
+
+
+class TestTextZoneTenantOverride:
+    """Text boxes take tenant content on EVERY binding (user decision
+    2026-07-18): the designed or name-bound text is only the default."""
+
+    NAME_ZONE = {"key": "hdr", "type": "text", "x": 0, "y": 0, "w": 100, "h": 12,
+                 "binding": {"source": "company.name"},
+                 "content": {"runs": [{"text": "Easypaisa", "x": 10, "y": 10}]}}
+
+    def test_name_binding_keeps_designer_runs(self):
+        # The designer promises "this zone shows the positioned items" — they
+        # must survive a name binding (the white-on-white invisible-header bug).
+        out = resolve_zone(self.NAME_ZONE, ENTITY, {}, FAKE_PRESIGN)
+        assert out["content"]["text"] == "MoltyFoam"
+        assert out["content"]["runs"] == [{"text": "Easypaisa", "x": 10, "y": 10}]
+
+    def test_tenant_text_overrides_name_binding_and_runs(self):
+        out = resolve_zone(self.NAME_ZONE, ENTITY, {"hdr": {"text": "EID SALE"}}, FAKE_PRESIGN)
+        assert out["content"]["text"] == "EID SALE"
+        assert "runs" not in out["content"]
+
+    def test_tenant_text_overrides_static_zone(self):
+        zone = {"key": "s", "type": "text", "x": 0, "y": 0, "w": 10, "h": 10,
+                "binding": {"source": "static"}, "content": {"text": "Fixed"}}
+        out = resolve_zone(zone, ENTITY, {"s": {"text": "Per-screen"}}, FAKE_PRESIGN)
+        assert out["content"]["text"] == "Per-screen"
+
+    def test_tenant_style_overlays_without_dropping_runs(self):
+        out = resolve_zone(self.NAME_ZONE, ENTITY, {"hdr": {"text_color": "#00ff00"}}, FAKE_PRESIGN)
+        assert out["content"]["text"] == "MoltyFoam"       # no text override
+        assert out["content"]["text_color"] == "#00ff00"
+        assert out["content"]["runs"]                      # runs stay
+
+    def test_tenant_bg_image_is_presigned(self):
+        out = resolve_zone(self.NAME_ZONE, ENTITY,
+                           {"hdr": {"bg_image_s3": "s3://bucket/banner.png"}}, FAKE_PRESIGN)
+        assert out["content"]["bg_image"] == "https://signed.example/banner.png"
+
+    def test_content_bound_zone_falls_back_to_designer_runs(self):
+        zone = {"key": "promo", "type": "text", "x": 0, "y": 0, "w": 100, "h": 10,
+                "binding": {"source": "content", "scope": "shop"},
+                "content": {"runs": [{"text": "Designed", "x": 0, "y": 0}]}}
+        assert resolve_zone(zone, ENTITY, {}, FAKE_PRESIGN)["content"]["runs"]
+        out = resolve_zone(zone, ENTITY, {"promo": {"text": "override"}}, FAKE_PRESIGN)
+        assert out["content"]["text"] == "override"
+        assert "runs" not in out["content"]
+
+
+class TestTakesTenantContent:
+    def test_content_bound_zone(self):
+        assert takes_tenant_content({"type": "media", "binding": {"source": "content"}})
+
+    def test_text_zone_on_every_binding(self):
+        for src in ("static", "company.name", "shop.name", "device.name", "content"):
+            assert takes_tenant_content({"type": "text", "binding": {"source": src}})
+
+    def test_ticker_zone(self):
+        assert takes_tenant_content({"type": "ticker", "binding": {"source": "static"}})
+
+    def test_non_text_non_content_zones_do_not(self):
+        assert not takes_tenant_content({"type": "clock", "binding": {"source": "static"}})
+        assert not takes_tenant_content({"type": "playlist", "binding": {"source": "device.playlist"}})
+        assert not takes_tenant_content({"type": "media", "binding": {"source": "device.playlist"}})
 
 
 class TestParseBgValue:
