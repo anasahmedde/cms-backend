@@ -588,12 +588,27 @@ def _tenant_slug(cur, tenant_id: int) -> str:
     return row[0] if row and row[0] else f"tenant-{tenant_id}"
 
 
+def _media_version() -> str:
+    """Unique version segment for uploaded zone-media keys.
+
+    Devices cache media by URL PATH (so presign renewals don't re-download).
+    A deterministic key meant replacing media with a same-extension file kept
+    the same path — cached devices never saw the new file. Versioning the key
+    makes every upload a NEW path: devices fetch it once and prune the old one
+    on their next template build. Timestamp keeps keys sortable; the random
+    tail guarantees uniqueness even within the same millisecond.
+    """
+    import time
+    import uuid
+    return f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
+
+
 def _content_media_key(slug: str, scope: str, target_id: int, zone_key: str, ext: str) -> str:
-    return f"tenants/{slug}/template-content/{scope}/{target_id}/{zone_key}.{ext}"
+    return f"tenants/{slug}/template-content/{scope}/{target_id}/{zone_key}-{_media_version()}.{ext}"
 
 
 def _content_qr_key(slug: str, scope: str, target_id: int, zone_key: str) -> str:
-    return f"tenants/{slug}/template-content/{scope}/{target_id}/{zone_key}-qr.png"
+    return f"tenants/{slug}/template-content/{scope}/{target_id}/{zone_key}-qr-{_media_version()}.png"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -698,15 +713,39 @@ def _company_template_stamp(cur, tenant_id: int, device_id: Optional[int] = None
         row = cur.fetchone()
     if not row:
         return None, None
-    # Max updated_at across BOTH content tables — a group-scope edit must bump
-    # the stamp too, or devices in that group never re-fetch the new content.
-    cur.execute("""
-        SELECT COALESCE((MAX(EXTRACT(EPOCH FROM updated_at)) * 1000)::bigint, 0) FROM (
-            SELECT updated_at FROM public.template_zone_content WHERE tenant_id = %s
-            UNION ALL
-            SELECT updated_at FROM public.template_zone_group_content WHERE tenant_id = %s
-        ) AS all_content;
-    """, (tenant_id, tenant_id))
+    if device_id is not None:
+        # Scope the content epoch to the rows THIS device can actually resolve
+        # (company defaults + its location + its group + its own overrides). A
+        # tenant-wide epoch meant one single-screen edit re-stamped EVERY screen
+        # in the company — a full-tenant refetch herd inside one heartbeat
+        # period, and pointless template re-renders on unaffected screens.
+        cur.execute("SELECT sid, gid FROM public.device_assignment WHERE did = %s LIMIT 1;",
+                    (device_id,))
+        asg = cur.fetchone() or (None, None)
+        sid, gid = asg[0], asg[1]
+        cur.execute("""
+            SELECT COALESCE((MAX(EXTRACT(EPOCH FROM updated_at)) * 1000)::bigint, 0) FROM (
+                SELECT updated_at FROM public.template_zone_content
+                WHERE tenant_id = %s
+                  AND (scope = 'company'
+                       OR (scope = 'shop' AND shop_id = COALESCE(%s::bigint, -1))
+                       OR (scope = 'device' AND device_id = %s))
+                UNION ALL
+                SELECT updated_at FROM public.template_zone_group_content
+                WHERE tenant_id = %s AND group_id = COALESCE(%s::bigint, -1)
+            ) AS my_content;
+        """, (tenant_id, sid, device_id, tenant_id, gid))
+    else:
+        # Company-level stamp (no device context): tenant-wide, as before. A
+        # group-scope edit must bump it too, or devices in that group would
+        # never re-fetch through the company-level path.
+        cur.execute("""
+            SELECT COALESCE((MAX(EXTRACT(EPOCH FROM updated_at)) * 1000)::bigint, 0) FROM (
+                SELECT updated_at FROM public.template_zone_content WHERE tenant_id = %s
+                UNION ALL
+                SELECT updated_at FROM public.template_zone_group_content WHERE tenant_id = %s
+            ) AS all_content;
+        """, (tenant_id, tenant_id))
     content_epoch = cur.fetchone()[0] or 0
     return row[1], f"{row[0]}.{row[1]}.{content_epoch}"
 
@@ -1575,6 +1614,27 @@ def _scope_target_id(scope: str, tenant_id: int, shop_id: Optional[int],
     return tenant_id
 
 
+def _existing_zone_payload(cur, tenant_id: int, zone_key: str, scope: str,
+                           shop_id: Optional[int], device_id: Optional[int],
+                           group_id: Optional[int] = None) -> Dict:
+    """The currently stored payload for this exact content row ({} when none)."""
+    if scope == "group":
+        cur.execute("""
+            SELECT payload FROM public.template_zone_group_content
+            WHERE tenant_id = %s AND zone_key = %s AND group_id = %s;
+        """, (tenant_id, zone_key, group_id))
+    else:
+        cur.execute("""
+            SELECT payload FROM public.template_zone_content
+            WHERE tenant_id = %s AND zone_key = %s AND scope = %s
+              AND COALESCE(shop_id, 0) = COALESCE(%s::bigint, 0)
+              AND COALESCE(device_id, 0) = COALESCE(%s::bigint, 0);
+        """, (tenant_id, zone_key, scope, shop_id, device_id))
+    row = cur.fetchone()
+    payload = row[0] if row else {}
+    return json.loads(payload) if isinstance(payload, str) else (payload or {})
+
+
 def _upsert_zone_content(conn, cur, tenant_id: int, zone: Dict, zone_key: str, scope: str,
                          shop_id: Optional[int], device_id: Optional[int],
                          payload: Dict, user_id: Optional[int],
@@ -1591,19 +1651,27 @@ def _upsert_zone_content(conn, cur, tenant_id: int, zone: Dict, zone_key: str, s
     if errors:
         raise HTTPException(status_code=422, detail={"payload_errors": errors})
 
-    # QR link mode: generate the PNG once, store alongside the payload.
+    # QR link mode: generate the PNG once, store alongside the payload. Keys are
+    # versioned now, so re-generating an UNCHANGED link would force every device
+    # to re-download an identical QR — reuse the previous PNG when the link and
+    # its stored image both survive from the existing row.
     if zone["type"] == "qr" and (payload.get("qr_mode") == "link" or
                                  (payload.get("qr_link") and not payload.get("qr_mode"))):
         payload["qr_mode"] = "link"
-        slug = _tenant_slug(cur, tenant_id)
-        target_id = _scope_target_id(scope, tenant_id, shop_id, device_id, group_id)
-        try:
-            png = make_qr_png(payload["qr_link"])
-            payload["qr_generated_s3"] = _upload_bytes(
-                _content_qr_key(slug, scope, target_id, zone_key), png, "image/png")
-        except Exception as e:
-            logger.error("QR generation failed (tenant %s zone %s): %s", tenant_id, zone_key, e)
-            raise HTTPException(status_code=502, detail="QR code generation/upload failed")
+        prev = _existing_zone_payload(cur, tenant_id, zone_key, scope, shop_id, device_id, group_id)
+        if (prev.get("qr_link") == payload.get("qr_link")
+                and prev.get("qr_generated_s3")):
+            payload["qr_generated_s3"] = prev["qr_generated_s3"]
+        else:
+            slug = _tenant_slug(cur, tenant_id)
+            target_id = _scope_target_id(scope, tenant_id, shop_id, device_id, group_id)
+            try:
+                png = make_qr_png(payload["qr_link"])
+                payload["qr_generated_s3"] = _upload_bytes(
+                    _content_qr_key(slug, scope, target_id, zone_key), png, "image/png")
+            except Exception as e:
+                logger.error("QR generation failed (tenant %s zone %s): %s", tenant_id, zone_key, e)
+                raise HTTPException(status_code=502, detail="QR code generation/upload failed")
 
     if scope == "group":
         # Group content: separate table keyed by group_id (see migration note).
