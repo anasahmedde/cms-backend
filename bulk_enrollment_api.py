@@ -319,7 +319,7 @@ def _template_bundle(tenant_id: int):
     else:
         instructions.append("")
         instructions.append("(No screen template is linked to this company yet, so there are no content columns.)")
-    return headers, rows, instructions, ccols, playback
+    return headers, rows, instructions, ccols, playback, bool(fleet)
 
 
 def _csv_bytes(headers, rows, instructions) -> bytes:
@@ -350,7 +350,7 @@ class ClaimIn(BaseModel):
 @router.get("/bulk-devices/template.csv")
 def template_csv(ctx: TenantContext = Depends(require_tenant_context)):
     _require_manage_devices(ctx)
-    headers, rows, instructions, _ccols, _playback = _template_bundle(ctx.active_tenant_id)
+    headers, rows, instructions, _ccols, _playback, _is_fleet = _template_bundle(ctx.active_tenant_id)
     return StreamingResponse(
         io.BytesIO(_csv_bytes(headers, rows, instructions)), media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="digix-devices-template.csv"'},
@@ -365,7 +365,7 @@ def template_xlsx(ctx: TenantContext = Depends(require_tenant_context)):
         from openpyxl.styles import Font, PatternFill
     except ImportError:
         raise HTTPException(status_code=501, detail="XLSX export unavailable; use the CSV template")
-    headers, rows, instructions, _ccols, playback = _template_bundle(ctx.active_tenant_id)
+    headers, rows, instructions, _ccols, playback, is_fleet = _template_bundle(ctx.active_tenant_id)
     wb = Workbook()
     ws = wb.active
     ws.title = "Devices"
@@ -380,6 +380,35 @@ def template_xlsx(ctx: TenantContext = Depends(require_tenant_context)):
         ws.append(row)
     for i in range(len(headers)):
         ws.column_dimensions[_col_letter(i + 1)].width = 30 if i >= len(BASE_COLUMNS) else BASE_WIDTHS[i]
+
+    # A blank writable cell means "inherited" — which reads as missing data.
+    # Annotate every blank content/template cell with WHAT it inherits and from
+    # where (from the playback rows). Comments are ignored on upload, so the
+    # round-trip stays a no-op.
+    if is_fleet and playback:
+        from openpyxl.comments import Comment
+        inherited = {}   # (screen, zone_key) -> (level, showing)
+        eff_tpl = {}     # screen -> effective template name
+        for scr, _loc, _grp, tpl_name, zone, set_at, showing in playback:
+            eff_tpl[scr] = tpl_name
+            if set_at and set_at != "this screen":
+                inherited[(scr, zone)] = (set_at, showing)
+        tpl_col = BASE_COLUMNS.index("template") + 1
+        for ri, r in enumerate(rows, start=2):  # row 1 = headers
+            screen = r[0] or r[BASE_COLUMNS.index("device_id")]
+            if not r[tpl_col - 1] and eff_tpl.get(screen):
+                ws.cell(row=ri, column=tpl_col).comment = Comment(
+                    f"Inherited — this screen renders '{eff_tpl[screen]}'.\n"
+                    "Type a linked template's name to override just this screen.", "DIGIX")
+            for ci, h in enumerate(headers):
+                if not h.startswith("content.") or (ci < len(r) and r[ci]):
+                    continue
+                zone_key = h.split(".")[1]
+                info = inherited.get((screen, zone_key))
+                if info:
+                    ws.cell(row=ri, column=ci + 1).comment = Comment(
+                        f"Inherited from {info[0]}: {info[1]}\n"
+                        "Type a value to override THIS screen only; blank keeps inheriting.", "DIGIX")
     if playback:
         # Visibility, not input: what every screen renders in each editable box
         # and which level set it. Only the first sheet is read on upload.
