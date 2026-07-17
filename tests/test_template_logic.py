@@ -260,11 +260,13 @@ class TestResolveZone:
         out = resolve_zone(WHITEBOARD_ZONES[3], ENTITY, {}, FAKE_PRESIGN)
         assert out["content"] == {}
 
-    def test_text_zone_content_with_colors(self):
+    def test_text_zone_words_only_tenant_styling_ignored(self):
+        # Theme is designer-owned ALWAYS (user decision 2026-07-18): a stored
+        # payload color must not restyle the box — only the words apply.
         content = {"promo_text": {"text": "50% OFF", "bg_color": "#ff0000"}}
         out = resolve_zone(WHITEBOARD_ZONES[4], ENTITY, content, FAKE_PRESIGN)
         assert out["content"]["text"] == "50% OFF"
-        assert out["content"]["bg_color"] == "#ff0000"
+        assert out["content"].get("bg_color") != "#ff0000"
 
     def test_static_zone(self):
         zone = {"key": "s", "type": "text", "x": 0, "y": 0, "w": 10, "h": 10,
@@ -274,50 +276,67 @@ class TestResolveZone:
 
 
 class TestTextZoneTenantOverride:
-    """Text boxes take tenant content on EVERY binding (user decision
-    2026-07-18): the designed or name-bound text is only the default."""
+    """Text boxes take tenant WORDS on EVERY binding (user decisions
+    2026-07-18): the designed or name-bound text is only the default, and the
+    theme — colors, background, size, weight, position — is ALWAYS the
+    designer's. An override replaces the first run's words, never the look."""
 
     NAME_ZONE = {"key": "hdr", "type": "text", "x": 0, "y": 0, "w": 100, "h": 12,
                  "binding": {"source": "company.name"},
-                 "content": {"runs": [{"text": "Easypaisa", "x": 10, "y": 10}]}}
+                 "content": {"runs": [
+                     {"text": "Easypaisa", "x": 10, "y": 10, "text_color": "#22a06b",
+                      "bold": True, "font_size_vh": 60},
+                     {"text": "tagline", "x": 10, "y": 70, "font_size_vh": 15},
+                 ]}}
 
     def test_name_binding_keeps_designer_runs(self):
         # The designer promises "this zone shows the positioned items" — they
         # must survive a name binding (the white-on-white invisible-header bug).
         out = resolve_zone(self.NAME_ZONE, ENTITY, {}, FAKE_PRESIGN)
         assert out["content"]["text"] == "MoltyFoam"
-        assert out["content"]["runs"] == [{"text": "Easypaisa", "x": 10, "y": 10}]
+        assert out["content"]["runs"] == self.NAME_ZONE["content"]["runs"]
 
-    def test_tenant_text_overrides_name_binding_and_runs(self):
+    def test_tenant_text_replaces_words_keeps_designed_look(self):
         out = resolve_zone(self.NAME_ZONE, ENTITY, {"hdr": {"text": "EID SALE"}}, FAKE_PRESIGN)
-        assert out["content"]["text"] == "EID SALE"
-        assert "runs" not in out["content"]
+        runs = out["content"]["runs"]
+        assert runs[0]["text"] == "EID SALE"               # new words…
+        assert runs[0]["text_color"] == "#22a06b"          # …designed color
+        assert runs[0]["bold"] is True                     # …designed weight
+        assert runs[0]["font_size_vh"] == 60               # …designed size
+        assert runs[1] == self.NAME_ZONE["content"]["runs"][1]  # other items intact
 
-    def test_tenant_text_overrides_static_zone(self):
+    def test_tenant_text_overrides_static_zone_without_runs(self):
         zone = {"key": "s", "type": "text", "x": 0, "y": 0, "w": 10, "h": 10,
                 "binding": {"source": "static"}, "content": {"text": "Fixed"}}
         out = resolve_zone(zone, ENTITY, {"s": {"text": "Per-screen"}}, FAKE_PRESIGN)
         assert out["content"]["text"] == "Per-screen"
 
-    def test_tenant_style_overlays_without_dropping_runs(self):
-        out = resolve_zone(self.NAME_ZONE, ENTITY, {"hdr": {"text_color": "#00ff00"}}, FAKE_PRESIGN)
-        assert out["content"]["text"] == "MoltyFoam"       # no text override
-        assert out["content"]["text_color"] == "#00ff00"
-        assert out["content"]["runs"]                      # runs stay
-
-    def test_tenant_bg_image_is_presigned(self):
+    def test_tenant_styling_is_ignored(self):
         out = resolve_zone(self.NAME_ZONE, ENTITY,
-                           {"hdr": {"bg_image_s3": "s3://bucket/banner.png"}}, FAKE_PRESIGN)
-        assert out["content"]["bg_image"] == "https://signed.example/banner.png"
+                           {"hdr": {"text_color": "#00ff00", "bg_color": "#000000",
+                                    "bg_image_s3": "s3://bucket/banner.png"}}, FAKE_PRESIGN)
+        assert out["content"].get("text_color") != "#00ff00"
+        assert out["content"].get("bg_color") != "#000000"
+        assert "bg_image" not in out["content"]
+        assert out["content"]["runs"] == self.NAME_ZONE["content"]["runs"]
 
-    def test_content_bound_zone_falls_back_to_designer_runs(self):
+    def test_designer_zone_style_still_folds_in(self):
+        zone = {"key": "s", "type": "text", "x": 0, "y": 0, "w": 10, "h": 10,
+                "style": {"bg_color": "#0a1628", "text_color": "#f59e0b"},
+                "binding": {"source": "static"}, "content": {"text": "Fixed"}}
+        out = resolve_zone(zone, ENTITY, {"s": {"text": "New words"}}, FAKE_PRESIGN)
+        assert out["content"]["text"] == "New words"
+        assert out["content"]["bg_color"] == "#0a1628"     # designer bg kept
+        assert out["style"]["text_color"] == "#f59e0b"     # designer color kept
+
+    def test_content_bound_zone_runs_get_the_words_too(self):
         zone = {"key": "promo", "type": "text", "x": 0, "y": 0, "w": 100, "h": 10,
                 "binding": {"source": "content", "scope": "shop"},
-                "content": {"runs": [{"text": "Designed", "x": 0, "y": 0}]}}
-        assert resolve_zone(zone, ENTITY, {}, FAKE_PRESIGN)["content"]["runs"]
+                "content": {"runs": [{"text": "Designed", "x": 0, "y": 0, "text_color": "#123456"}]}}
+        assert resolve_zone(zone, ENTITY, {}, FAKE_PRESIGN)["content"]["runs"][0]["text"] == "Designed"
         out = resolve_zone(zone, ENTITY, {"promo": {"text": "override"}}, FAKE_PRESIGN)
-        assert out["content"]["text"] == "override"
-        assert "runs" not in out["content"]
+        assert out["content"]["runs"][0]["text"] == "override"
+        assert out["content"]["runs"][0]["text_color"] == "#123456"
 
 
 class TestTakesTenantContent:
