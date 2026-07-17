@@ -12,9 +12,44 @@ permissions:
   id-token: write
   contents: read
 
+# One deploy per environment at a time. Stacked merges used to run parallel
+# ECS deployments that superseded each other — every earlier run's stability
+# waiter timed out and CI went red with the real fleet state ambiguous. A
+# newer push now cancels the superseded run and deploys the newest commit once.
+concurrency:
+  group: deploy-backend-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    # The gate: nothing deploys to the environment the LIVE FLEET uses without
+    # the unit suite and an import smoke test passing.
+    if: |
+      !(github.ref == 'refs/heads/staging' &&
+        startsWith(github.event.head_commit.message, 'Merge branch ''main'''))
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install deps
+        run: |
+          pip install -r requirement.txt
+          pip install pytest
+      - name: Import smoke test
+        env:
+          S3_BUCKET: ci-smoke-test
+        run: python -c "import device_video_shop_group"
+      - name: Unit tests
+        env:
+          S3_BUCKET: ci-smoke-test
+        run: python -m pytest tests/ -q
+
   deploy:
     runs-on: ubuntu-latest
+    needs: test
     # Skip auto-merge commits that GitHub creates when syncing staging with main
     # (e.g. "Merge branch 'main' into staging" during a PR). These are not real
     # deployable changes — only deploy on actual feature/fix pushes.
