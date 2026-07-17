@@ -107,6 +107,16 @@ MEDIA_EXTENSIONS = {
 # ZONE VALIDATION (pure functions — covered by tests/)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def takes_tenant_content(zone: Dict) -> bool:
+    """True when tenant-set content (dashboard zone editor / Excel sheet) applies
+    to this zone: 'content'-bound zones by definition, and text/ticker zones on
+    EVERY binding — their designed/bound text is only the DEFAULT, an explicit
+    per-scope text overrides it (see resolve_zone). Keep in sync with the
+    frontend's TemplateMap isEditable()."""
+    src = (zone.get("binding") or {}).get("source", "static")
+    return src == "content" or zone.get("type") in ("text", "ticker")
+
+
 def validate_zones(zones: Any) -> List[str]:
     """Validate a template's zones definition. Returns a list of error strings."""
     errors: List[str] = []
@@ -410,13 +420,21 @@ def resolve_zone(zone: Dict, entity: Dict[str, Optional[str]],
         "style": dict(zone.get("style") or {}),
     }
     source = (zone.get("binding") or {}).get("source", "static")
+    ztype = zone.get("type")
     zc = zone.get("content") if isinstance(zone.get("content"), dict) else {}
+
+    # A media value may be an uploaded S3 object (presign it) OR an external
+    # URL (pass through as-is). This lets content reference any public image/
+    # video URL, or a video/advertisement already in the library (stored as s3://).
+    def media_url_of(s3_key, ext_url):
+        if ext_url:
+            return ext_url
+        if s3_key:
+            return presign(s3_key)
+        return None
+
     if source == "static":
         out["content"] = {"text": zc.get("text")}
-        # Designer-composed multiple text items ride through as-is; percentages
-        # are relative to the zone, so players render them at any resolution.
-        if isinstance(zc.get("runs"), list) and zc["runs"]:
-            out["content"]["runs"] = zc["runs"]
     elif source == "device.playlist":
         out["content"] = {"playlist": True}
     elif source in ("company.name", "shop.name", "device.name"):
@@ -424,16 +442,6 @@ def resolve_zone(zone: Dict, entity: Dict[str, Optional[str]],
     elif source == "content":
         payload = dict(content.get(zone.get("key"), {}))
         resolved: Dict[str, Any] = {}
-
-        # A media value may be an uploaded S3 object (presign it) OR an external
-        # URL (pass through as-is). This lets content reference any public image/
-        # video URL, or a video/advertisement already in the library (stored as s3://).
-        def media_url_of(s3_key, ext_url):
-            if ext_url:
-                return ext_url
-            if s3_key:
-                return presign(s3_key)
-            return None
 
         if zone.get("type") == "qr":
             mode = payload.get("qr_mode") or ("link" if payload.get("qr_link") else "image")
@@ -469,6 +477,27 @@ def resolve_zone(zone: Dict, entity: Dict[str, Optional[str]],
         if payload.get("fit_mode") in ("cover", "contain", "fill", "none"):
             out["style"]["fit_mode"] = payload["fit_mode"]
         out["content"] = resolved
+
+    # Text boxes take tenant content on EVERY binding (sheet / dashboard text
+    # overrides the designed or name-bound default) — the binding only supplies
+    # the default. The 'content' source already resolved its payload above.
+    tenant = content.get(zone.get("key")) or {}
+    if ztype in ("text", "ticker") and source != "content" and tenant:
+        for k in ("text", "text_color", "bg_color", "bg_gradient"):
+            if tenant.get(k) is not None:
+                out["content"][k] = tenant[k]
+        t_bg = media_url_of(tenant.get("bg_image_s3"), tenant.get("bg_image_url"))
+        if t_bg:
+            out["content"]["bg_image"] = t_bg
+
+    # Designer-composed positioned text items ride along on every text/ticker
+    # zone regardless of binding (the designer promises "this zone shows the
+    # positioned items"; percentages are zone-relative so players render them
+    # at any resolution) — EXCEPT when an explicit tenant text overrides the
+    # whole composition.
+    if (ztype in ("text", "ticker") and isinstance(zc.get("runs"), list) and zc["runs"]
+            and not tenant.get("text")):
+        out["content"]["runs"] = zc["runs"]
 
     # Designer-set zone backgrounds (style.bg_gradient / style.bg_image_url)
     # fold into resolved content — the players already render content-level
@@ -1163,7 +1192,7 @@ def _content_zone_or_422(template: Dict, zone_key: str) -> Dict:
     zone = next((z for z in template["zones"] if z.get("key") == zone_key), None)
     if zone is None:
         raise HTTPException(status_code=422, detail=f"Zone {zone_key!r} does not exist in the linked template")
-    if (zone.get("binding") or {}).get("source") != "content":
+    if not takes_tenant_content(zone):
         raise HTTPException(status_code=422, detail=f"Zone {zone_key!r} does not take editable content")
     return zone
 
@@ -1215,7 +1244,7 @@ def company_template(ctx: TenantContext = Depends(require_tenant_context)):
             tpl = _tenant_template(cur, ctx.active_tenant_id)
     if not tpl:
         return {"template": None}
-    content_zones = [z for z in tpl["zones"] if (z.get("binding") or {}).get("source") == "content"]
+    content_zones = [z for z in tpl["zones"] if takes_tenant_content(z)]
     return {"template": tpl, "content_zones": content_zones}
 
 
@@ -1790,7 +1819,7 @@ def company_template_content(ctx: TenantContext = Depends(require_tenant_context
             tpl = _tenant_template(cur, ctx.active_tenant_id)
             content = _get_scope_content(cur, ctx.active_tenant_id, "company", None, None)
     zones = [z for z in (tpl["zones"] if tpl else [])
-             if (z.get("binding") or {}).get("source") == "content"]
+             if takes_tenant_content(z)]
     return {"template_linked": tpl is not None, "template": tpl, **_design_size_of(tpl),
             "content_zones": zones, "content": content}
 
@@ -1891,7 +1920,7 @@ def shop_template_content(shop_id: int, ctx: TenantContext = Depends(require_ten
             tpl = _tenant_template(cur, ctx.active_tenant_id)
             content = _get_scope_content(cur, ctx.active_tenant_id, "shop", "shop_id", shop_id)
     zones = [z for z in (tpl["zones"] if tpl else [])
-             if (z.get("binding") or {}).get("source") == "content"]
+             if takes_tenant_content(z)]
     return {"shop_id": shop_id, "template_linked": tpl is not None, "template": tpl,
             **_design_size_of(tpl), "content_zones": zones, "content": content}
 
@@ -1938,7 +1967,7 @@ def group_template_content(group_id: int, ctx: TenantContext = Depends(require_t
             tpl = _effective_template(cur, ctx.active_tenant_id, group_id=group_id)
             content = _get_scope_content(cur, ctx.active_tenant_id, "group", None, group_id)
     zones = [z for z in (tpl["zones"] if tpl else [])
-             if (z.get("binding") or {}).get("source") == "content"]
+             if takes_tenant_content(z)]
     return {"group_id": group_id, "template_linked": tpl is not None, "template": tpl,
             **_design_size_of(tpl), "content_zones": zones, "content": content}
 
@@ -2006,7 +2035,7 @@ def device_template_content(device_id: int, ctx: TenantContext = Depends(require
             tpl = _effective_template(cur, ctx.active_tenant_id, device_id=device_id)
             content = _get_scope_content(cur, ctx.active_tenant_id, "device", "device_id", device_id)
     zones = [z for z in (tpl["zones"] if tpl else [])
-             if (z.get("binding") or {}).get("source") == "content"]
+             if takes_tenant_content(z)]
     # reported_resolution ("1920x1080", from the device heartbeat) lets the
     # dashboard show zone pixel sizes for THIS screen, not just the design canvas.
     return {"device_id": device_id, "template_linked": tpl is not None, "template": tpl,
