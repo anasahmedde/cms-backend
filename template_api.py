@@ -713,15 +713,39 @@ def _company_template_stamp(cur, tenant_id: int, device_id: Optional[int] = None
         row = cur.fetchone()
     if not row:
         return None, None
-    # Max updated_at across BOTH content tables — a group-scope edit must bump
-    # the stamp too, or devices in that group never re-fetch the new content.
-    cur.execute("""
-        SELECT COALESCE((MAX(EXTRACT(EPOCH FROM updated_at)) * 1000)::bigint, 0) FROM (
-            SELECT updated_at FROM public.template_zone_content WHERE tenant_id = %s
-            UNION ALL
-            SELECT updated_at FROM public.template_zone_group_content WHERE tenant_id = %s
-        ) AS all_content;
-    """, (tenant_id, tenant_id))
+    if device_id is not None:
+        # Scope the content epoch to the rows THIS device can actually resolve
+        # (company defaults + its location + its group + its own overrides). A
+        # tenant-wide epoch meant one single-screen edit re-stamped EVERY screen
+        # in the company — a full-tenant refetch herd inside one heartbeat
+        # period, and pointless template re-renders on unaffected screens.
+        cur.execute("SELECT sid, gid FROM public.device_assignment WHERE did = %s LIMIT 1;",
+                    (device_id,))
+        asg = cur.fetchone() or (None, None)
+        sid, gid = asg[0], asg[1]
+        cur.execute("""
+            SELECT COALESCE((MAX(EXTRACT(EPOCH FROM updated_at)) * 1000)::bigint, 0) FROM (
+                SELECT updated_at FROM public.template_zone_content
+                WHERE tenant_id = %s
+                  AND (scope = 'company'
+                       OR (scope = 'shop' AND shop_id = COALESCE(%s::bigint, -1))
+                       OR (scope = 'device' AND device_id = %s))
+                UNION ALL
+                SELECT updated_at FROM public.template_zone_group_content
+                WHERE tenant_id = %s AND group_id = COALESCE(%s::bigint, -1)
+            ) AS my_content;
+        """, (tenant_id, sid, device_id, tenant_id, gid))
+    else:
+        # Company-level stamp (no device context): tenant-wide, as before. A
+        # group-scope edit must bump it too, or devices in that group would
+        # never re-fetch through the company-level path.
+        cur.execute("""
+            SELECT COALESCE((MAX(EXTRACT(EPOCH FROM updated_at)) * 1000)::bigint, 0) FROM (
+                SELECT updated_at FROM public.template_zone_content WHERE tenant_id = %s
+                UNION ALL
+                SELECT updated_at FROM public.template_zone_group_content WHERE tenant_id = %s
+            ) AS all_content;
+        """, (tenant_id, tenant_id))
     content_epoch = cur.fetchone()[0] or 0
     return row[1], f"{row[0]}.{row[1]}.{content_epoch}"
 
