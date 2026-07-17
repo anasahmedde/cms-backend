@@ -34,6 +34,16 @@ class TestContentColumns:
         headers = [c[0] for c in content_columns_for(zones)]
         assert headers == ["content.hdr.text"]
 
+    def test_name_bound_text_zone_gets_a_column(self):
+        # EVERY text box is sheet-fillable (2026-07-18): a name binding is only
+        # the default, a sheet value overrides it on that screen.
+        zones = [{"key": "hdr", "type": "text", "binding": {"source": "company.name"}}]
+        assert [c[0] for c in content_columns_for(zones)] == ["content.hdr.text"]
+
+    def test_static_text_zone_gets_a_column(self):
+        zones = [{"key": "note", "type": "text", "binding": {"source": "static"}}]
+        assert [c[0] for c in content_columns_for(zones)] == ["content.note.text"]
+
     def test_clock_zone_has_no_columns(self):
         zones = [{"key": "clk", "type": "clock", "binding": {"source": "content"}}]
         assert content_columns_for(zones) == []

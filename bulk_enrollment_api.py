@@ -94,16 +94,20 @@ _ZONE_HELP = {
 
 
 def content_columns_for(zones) -> list:
-    """[(header, zone_key, field, zone_type)] for each content-bound zone.
+    """[(header, zone_key, field, zone_type)] for each tenant-fillable zone.
 
     Deliberately CONTENT-only (user decision 2026-07-17): the sheet carries
     text / media / QR values; backgrounds, colors and every other style live
     in the designer. Old sheets that still contain content.*.bg columns parse
     harmlessly — unknown headers are ignored.
+
+    EVERY text/ticker box gets a column, whatever its binding (user decision
+    2026-07-18): a designed or name-bound text is only the default, and a
+    sheet value overrides it on that screen (see template_api.resolve_zone).
     """
     cols = []
     for z in zones or []:
-        if (z.get("binding") or {}).get("source") != "content":
+        if not tpl_api.takes_tenant_content(z):
             continue
         key, zt = z.get("key"), z.get("type")
         if zt in ("text", "ticker"):
@@ -130,7 +134,7 @@ def _tenant_content_zones(cur, tenant_id: int):
     seen: Dict[str, Dict] = {}
     for t in templates:
         for z in t["zones"]:
-            if (z.get("binding") or {}).get("source") != "content":
+            if not tpl_api.takes_tenant_content(z):
                 continue
             seen.setdefault(z.get("key"), z)
     return list(seen.values()), default, templates
@@ -234,7 +238,17 @@ def _fleet_rows(cur, tenant_id: int, ccols) -> Tuple[list, list]:
     return rows, devs
 
 
-def _effective_playback(cur, tenant_id: int, devs, ccols, templates=None) -> list:
+_UNSET_FALLBACK = {
+    # What a box with NO tenant content anywhere actually renders, by binding.
+    "company.name": "(shows the company name)",
+    "shop.name": "(shows the location name)",
+    "device.name": "(shows the screen name)",
+    "static": "(shows the template's designed text)",
+}
+
+
+def _effective_playback(cur, tenant_id: int, devs, ccols, templates=None,
+                        zone_sources=None) -> list:
     """Read-only rows: what each screen actually renders per editable box right
     now, and which level set it (screen > group > location > company)."""
     zone_keys = list(dict.fromkeys(k for (_h, k, _f, _zt) in ccols))
@@ -278,7 +292,11 @@ def _effective_playback(cur, tenant_id: int, devs, ccols, templates=None) -> lis
                     out.append([name or mid, shop, grp, eff_tpl, zk, level, _content_summary(pl)])
                     break
             else:
-                out.append([name or mid, shop, grp, eff_tpl, zk, "", "(nothing set — box is blank)"])
+                fallback = _UNSET_FALLBACK.get((zone_sources or {}).get(zk))
+                if fallback:
+                    out.append([name or mid, shop, grp, eff_tpl, zk, "the template", fallback])
+                else:
+                    out.append([name or mid, shop, grp, eff_tpl, zk, "", "(nothing set — box is blank)"])
     return out
 
 
@@ -289,8 +307,11 @@ def _template_bundle(tenant_id: int):
         with conn.cursor() as cur:
             content_cols, tpl, templates = _tenant_content_zones(cur, tenant_id)
             ccols = content_columns_for(content_cols)
+            zone_sources = {z.get("key"): (z.get("binding") or {}).get("source", "static")
+                            for z in content_cols}
             fleet, devs = _fleet_rows(cur, tenant_id, ccols)
-            playback = _effective_playback(cur, tenant_id, devs, ccols, templates)
+            playback = _effective_playback(cur, tenant_id, devs, ccols, templates,
+                                           zone_sources=zone_sources)
     headers = BASE_COLUMNS + [h for (h, _, _, _) in ccols]
     if fleet:
         rows = fleet
