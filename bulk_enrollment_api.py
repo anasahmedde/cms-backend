@@ -89,7 +89,8 @@ _ZONE_HELP = {
     "bg": ("#111827  (or  #0a1628 -> #f59e0b @135  for a gradient, or an image URL)",
            "a #hex color, a gradient like '#0a1628 -> #f59e0b @135', or an image URL/name"),
     "fit": ("contain",
-            "how the image/video fits its box: cover (fill & crop), contain (show the whole thing), fill (stretch), or none. Blank = leave as-is."),
+            "how the image/video fits its box: cover (fill & crop), contain (show the whole thing), fill (stretch), or none. Blank = leave as-is. "
+            "If contain makes a video look tiny, the FILE itself has black bars baked in — use cover, or re-export the file at the box's size."),
 }
 
 
