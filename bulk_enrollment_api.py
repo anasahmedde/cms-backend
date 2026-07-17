@@ -94,7 +94,13 @@ _ZONE_HELP = {
 
 
 def content_columns_for(zones) -> list:
-    """[(header, zone_key, field, zone_type)] for each content-bound zone."""
+    """[(header, zone_key, field, zone_type)] for each content-bound zone.
+
+    Deliberately CONTENT-only (user decision 2026-07-17): the sheet carries
+    text / media / QR values; backgrounds, colors and every other style live
+    in the designer. Old sheets that still contain content.*.bg columns parse
+    harmlessly — unknown headers are ignored.
+    """
     cols = []
     for z in zones or []:
         if (z.get("binding") or {}).get("source") != "content":
@@ -102,9 +108,6 @@ def content_columns_for(zones) -> list:
         key, zt = z.get("key"), z.get("type")
         if zt in ("text", "ticker"):
             cols.append((f"content.{key}.text", key, "text", zt))
-            cols.append((f"content.{key}.bg", key, "bg", zt))
-        elif zt == "clock":
-            cols.append((f"content.{key}.bg", key, "bg", zt))
         elif zt == "media":
             cols.append((f"content.{key}.media", key, "media", zt))
             cols.append((f"content.{key}.fit", key, "fit", zt))
