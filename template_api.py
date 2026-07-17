@@ -675,17 +675,30 @@ def _get_template(cur, tid: int) -> Dict:
 
 
 def _linked_companies(cur, tid: int) -> List[Dict]:
-    """Companies using this template — linked directly, or through their own
-    customized copy (a fork carries source_template_id back to the original)."""
+    """Companies using this template — as their DEFAULT (directly, or through
+    their own customized copy carrying source_template_id) or linked as an
+    ADDITIONAL template for per-group/per-screen assignment (company_template).
+    One row per company; a default link outranks an additional one."""
     cur.execute("""
-        SELECT c.id, c.slug, c.name, (ct.owner_tenant_id IS NOT NULL) AS customized
-        FROM public.company c
-        JOIN public.screen_template ct ON ct.id = c.template_id
-        WHERE ct.id = %s OR (ct.source_template_id = %s AND ct.owner_tenant_id IS NOT NULL)
-        ORDER BY c.name;
-    """, (tid, tid))
-    return [{"id": r[0], "slug": r[1], "name": r[2], "customized": r[3]}
-            for r in cur.fetchall()]
+        SELECT DISTINCT ON (u.id) u.id, u.slug, u.name, u.customized, u.additional
+        FROM (
+            SELECT c.id, c.slug, c.name,
+                   (ct.owner_tenant_id IS NOT NULL) AS customized,
+                   FALSE AS additional
+            FROM public.company c
+            JOIN public.screen_template ct ON ct.id = c.template_id
+            WHERE ct.id = %s OR (ct.source_template_id = %s AND ct.owner_tenant_id IS NOT NULL)
+            UNION ALL
+            SELECT c.id, c.slug, c.name, FALSE, TRUE
+            FROM public.company_template x
+            JOIN public.company c ON c.id = x.company_id
+            WHERE x.template_id = %s
+        ) u
+        ORDER BY u.id, u.additional ASC;
+    """, (tid, tid, tid))
+    rows = sorted(cur.fetchall(), key=lambda r: (r[2] or "").lower())
+    return [{"id": r[0], "slug": r[1], "name": r[2], "customized": r[3], "additional": r[4]}
+            for r in rows]
 
 
 def _company_template_stamp(cur, tenant_id: int, device_id: Optional[int] = None):
@@ -801,11 +814,22 @@ def list_templates(status: Optional[str] = None, ctx: TenantContext = Depends(re
             # template is in active (customized) use.
             cur.execute(f"""
                 SELECT {TEMPLATE_COLS},
-                       (SELECT COUNT(*) FROM public.company c WHERE c.template_id = t.id) AS linked,
+                       (SELECT COUNT(DISTINCT u.cid) FROM (
+                           SELECT c.id AS cid FROM public.company c WHERE c.template_id = t.id
+                           UNION
+                           SELECT c.id FROM public.company c
+                             JOIN public.screen_template f ON f.id = c.template_id
+                            WHERE f.source_template_id = t.id AND f.owner_tenant_id IS NOT NULL
+                           UNION
+                           SELECT x.company_id FROM public.company_template x
+                            WHERE x.template_id = t.id
+                       ) u) AS linked,
                        (SELECT COUNT(*) FROM public.company c
                           JOIN public.screen_template f ON f.id = c.template_id
                           WHERE f.source_template_id = t.id
-                            AND f.owner_tenant_id IS NOT NULL) AS customized
+                            AND f.owner_tenant_id IS NOT NULL) AS customized,
+                       (SELECT COUNT(*) FROM public.company_template x
+                         WHERE x.template_id = t.id) AS additional
                 FROM public.screen_template t
                 WHERE (%s::text IS NULL OR status = %s)
                   AND owner_tenant_id IS NULL   -- hide company-forked private copies
@@ -813,9 +837,13 @@ def list_templates(status: Optional[str] = None, ctx: TenantContext = Depends(re
             """, (status, status))
             items = []
             for row in cur.fetchall():
-                d = _template_row_to_dict(row[:-2])
-                d["linked_companies"] = row[-2] + row[-1]
-                d["customized_companies"] = row[-1]
+                d = _template_row_to_dict(row[:-3])
+                # linked = DISTINCT companies across default + customized-fork +
+                # ADDITIONAL links, so a template linked "as extra" from the
+                # company page no longer reads "Not linked yet" here.
+                d["linked_companies"] = row[-3]
+                d["customized_companies"] = row[-2]
+                d["additional_companies"] = row[-1]
                 items.append(d)
     return {"items": items, "count": len(items)}
 
@@ -878,6 +906,11 @@ def delete_template(tid: int, ctx: TenantContext = Depends(require_platform_user
                     detail={"message": "Template is linked to companies — unlink first",
                             "companies": linked},
                 )
+            # Defensive cleanup so nothing dangles at a deleted template (the
+            # resolver would fall through anyway; this keeps pickers honest).
+            cur.execute("DELETE FROM public.company_template WHERE template_id = %s;", (tid,))
+            cur.execute('UPDATE public."group" SET template_id = NULL WHERE template_id = %s;', (tid,))
+            cur.execute("UPDATE public.device SET template_id = NULL WHERE template_id = %s;", (tid,))
             cur.execute("DELETE FROM public.screen_template WHERE id = %s;", (tid,))
             log_audit(conn, None, ctx.user_id, "template.delete", "screen_template", tid)
         conn.commit()
