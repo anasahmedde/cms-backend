@@ -34,6 +34,9 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
+          # This repo's file is requirement.txt (no 's') — the cache's default
+          # glob only matches requirements.txt and fails the job without this.
+          cache-dependency-path: requirement.txt
       - name: Install deps
         run: |
           pip install -r requirement.txt
