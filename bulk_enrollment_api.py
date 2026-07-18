@@ -35,7 +35,7 @@ import re
 import secrets
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -54,6 +54,19 @@ def _require_manage_devices(ctx: TenantContext):
     real gate."""
     if not ctx.has_permission("manage_devices"):
         raise HTTPException(status_code=403, detail="Permission denied: manage_devices required")
+
+
+def _bulk_mode(ctx: TenantContext) -> str:
+    """'full' (manage_devices) = create/claim screens, assignments AND content.
+    'content' (any template-content edit permission, i.e. the editor role) =
+    content.* columns on EXISTING screens only — rows that would add screens or
+    change name/location/group/template are validation errors, and the writes
+    ride the template-content approval gate like the zone editor does."""
+    if ctx.has_permission("manage_devices"):
+        return "full"
+    if any(ctx.has_permission(p) for p in tpl_api._CONTENT_EDIT_PERMS):
+        return "content"
+    raise HTTPException(status_code=403, detail="Permission denied: manage_devices required")
 
 BASE_COLUMNS = ["device_name", "shop_name", "group_name", "template", "device_id", "resolution", "notes"]
 BASE_WIDTHS = [26, 22, 18, 22, 22, 12, 30]
@@ -374,7 +387,7 @@ class ClaimIn(BaseModel):
 
 @router.get("/bulk-devices/template.csv")
 def template_csv(ctx: TenantContext = Depends(require_tenant_context)):
-    _require_manage_devices(ctx)
+    _bulk_mode(ctx)  # content editors may download the sheet too
     headers, rows, instructions, _ccols, _playback, _is_fleet = _template_bundle(ctx.active_tenant_id)
     return StreamingResponse(
         io.BytesIO(_csv_bytes(headers, rows, instructions)), media_type="text/csv",
@@ -384,7 +397,7 @@ def template_csv(ctx: TenantContext = Depends(require_tenant_context)):
 
 @router.get("/bulk-devices/template.xlsx")
 def template_xlsx(ctx: TenantContext = Depends(require_tenant_context)):
-    _require_manage_devices(ctx)
+    _bulk_mode(ctx)  # content editors may download the sheet too
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill
@@ -839,9 +852,40 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
 
 # ─────────────────────────── endpoints ───────────────────────────
 
+def _restrict_preview_to_content(preview: Dict) -> Dict:
+    """Content-only bulk (the editor role): rows that would ADD screens or change
+    anything besides content.* columns become row errors, so the preview tells
+    the editor exactly which cells their role can't apply. Nothing is created,
+    so the new-shops/new-groups lists empty out."""
+    for row in preview["rows"]:
+        reasons = []
+        if row["action"] in ("create", "pending"):
+            reasons.append("Your role can only update content on existing screens — this row would add a screen")
+        elif row["action"] == "update":
+            noncontent = sorted({str(c.get("field", "")) for c in (row.get("changes") or [])
+                                 if not str(c.get("field", "")).startswith("content.")})
+            if noncontent:
+                reasons.append("Your role can only change content columns — this row also changes: "
+                               + ", ".join(noncontent))
+        if reasons:
+            row["action"] = "error"
+            for msg in reasons:
+                preview["errors"].append({"row": row["row"], "reason": msg})
+    s = preview["summary"]
+    s["will_create"] = 0
+    s["will_pending"] = 0
+    s["will_update"] = sum(1 for r in preview["rows"] if r["action"] == "update")
+    s["new_shops"] = []
+    s["new_groups"] = []
+    s["error_rows"] = len({e["row"] for e in preview["errors"] if e["row"] > 0})
+    s["valid"] = len(preview["errors"]) == 0
+    s["content_only"] = True
+    return preview
+
+
 @router.post("/bulk-devices/validate")
 async def bulk_validate(file: UploadFile = File(...), ctx: TenantContext = Depends(require_tenant_context)):
-    _require_manage_devices(ctx)
+    mode = _bulk_mode(ctx)
     tenant_id = ctx.active_tenant_id
     data = await file.read()
     if not data:
@@ -885,6 +929,8 @@ async def bulk_validate(file: UploadFile = File(...), ctx: TenantContext = Depen
                                     content_cols=content_cols, cur=cur, tenant_id=tenant_id,
                                     existing_shops=existing_shops, existing_groups=existing_groups,
                                     template_names=template_names)
+            if mode == "content":
+                preview = _restrict_preview_to_content(preview)
 
             cur.execute("""
                 INSERT INTO public.bulk_import_job
@@ -899,9 +945,147 @@ async def bulk_validate(file: UploadFile = File(...), ctx: TenantContext = Depen
     return {"job_id": job_id, **preview}
 
 
+def _commit_content_only(body: "CommitIn", ctx: TenantContext,
+                         background_tasks: BackgroundTasks) -> Dict:
+    """The editor role's bulk commit: apply ONLY content.* changes on existing
+    screens (never creates screens/locations/groups, never renames/re-assigns/
+    re-templates — validation already errored such rows). When the company's
+    approval requirement applies to this user, the whole batch is parked as ONE
+    content_change_request (request_type 'template_content_bulk') and nothing
+    touches the live tables until a manager/admin approves."""
+    tenant_id = ctx.active_tenant_id
+    with pg_conn() as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT status, payload, report FROM public.bulk_import_job
+                    WHERE id = %s AND tenant_id = %s;
+                """, (body.job_id, tenant_id))
+                job = cur.fetchone()
+                if not job:
+                    raise HTTPException(status_code=404, detail="Import job not found")
+                if job[0] in ("committed", "pending_approval"):
+                    raise HTTPException(status_code=409, detail="This import was already submitted")
+                rows = job[1]
+                summary = job[2] if isinstance(job[2], dict) else {}
+                if not summary.get("valid", False):
+                    raise HTTPException(status_code=422, detail="This import has validation errors — fix and re-upload")
+
+                content_zones, _tpl, _templates = _tenant_content_zones(cur, tenant_id)
+                zone_map = {z["key"]: z for z in content_zones}
+
+                # Collect the merged per-screen zone payloads (same effective-content
+                # seeding as the full bulk path, so a fit-only cell can't blank
+                # inherited media). Merging at SUBMIT time makes the approval preview
+                # show exactly what will land.
+                items: List[Dict] = []
+                devices_touched = set()
+                for r in rows:
+                    if r.get("action") not in ("update", "unchanged", "skip"):
+                        continue
+                    mid = (r.get("device_id") or "").strip()
+                    changed_zones = {c["field"].split(".", 1)[1] for c in (r.get("changes") or [])
+                                     if str(c.get("field", "")).startswith("content.")}
+                    if not mid or not changed_zones:
+                        continue
+                    cur.execute("SELECT id FROM public.device WHERE tenant_id = %s AND mobile_id = %s"
+                                " ORDER BY id DESC LIMIT 1;", (tenant_id, mid))
+                    hit = cur.fetchone()
+                    if not hit:
+                        continue
+                    did = hit[0]
+                    cur.execute("SELECT sid, gid FROM public.device_assignment WHERE did = %s LIMIT 1;", (did,))
+                    asg = cur.fetchone()
+                    sid, gid = (asg[0], asg[1]) if asg else (None, None)
+                    effective = tpl_api._collapse_content(cur, tenant_id, sid, did, gid)
+                    for zone_key in sorted(changed_zones):
+                        payload = (r.get("content") or {}).get(zone_key)
+                        zone = zone_map.get(zone_key)
+                        if not zone or not payload:
+                            continue
+                        merged = dict(effective.get(zone_key) or {})
+                        merged.pop("qr_generated_s3", None)
+                        merged.update(dict(payload))
+                        items.append({"device_id": did, "device_name": r.get("device_name") or mid,
+                                      "zone_key": zone_key,
+                                      "zone_label": zone.get("name") or zone_key,
+                                      "payload": merged})
+                        devices_touched.add(did)
+
+                if items and tpl_api._approval_required(cur, ctx):
+                    # Supersede this user's earlier pending bulk batch — a re-upload
+                    # replaces it, same iterate-before-review semantics as the editor.
+                    cur.execute("""
+                        UPDATE public.content_change_request
+                        SET status = 'cancelled', updated_at = NOW()
+                        WHERE tenant_id = %s AND request_type = 'template_content_bulk'
+                          AND status = 'pending' AND requested_by = %s
+                        RETURNING id;
+                    """, (tenant_id, ctx.user_id))
+                    superseded = [x[0] for x in cur.fetchall()]
+                    change_data = {"items": items, "job_id": body.job_id,
+                                   "requested_by": ctx.user_id}
+                    cur.execute("""
+                        INSERT INTO public.content_change_request
+                            (tenant_id, request_type, target_type, target_id, target_name,
+                             change_data, requested_by, status, expires_at)
+                        VALUES (%s, 'template_content_bulk', 'company', %s, %s, %s::jsonb, %s,
+                                'pending', NOW() + INTERVAL '72 hours')
+                        RETURNING id;
+                    """, (tenant_id, tenant_id,
+                          f"Bulk sheet — {len(devices_touched)} screen{'s' if len(devices_touched) != 1 else ''}",
+                          _json(change_data), ctx.user_id))
+                    request_id = cur.fetchone()[0]
+                    report = {"status": "pending_approval", "request_id": request_id,
+                              "screens": len(devices_touched), "content_changes": len(items),
+                              "superseded_request_ids": superseded}
+                    cur.execute("""
+                        UPDATE public.bulk_import_job
+                        SET status = 'pending_approval', report = %s::jsonb, finished_at = NOW()
+                        WHERE id = %s;
+                    """, (_json(report), body.job_id))
+                    log_audit(conn, tenant_id, ctx.user_id, "template.content.bulk_approval_requested",
+                              "content_change_request", request_id,
+                              details={"job_id": body.job_id, "screens": len(devices_touched),
+                                       "content_changes": len(items)})
+                    tpl_api._notify_pending_approvals_count(background_tasks, cur, tenant_id)
+                    conn.commit()
+                    return {"job_id": body.job_id, "committed": False, **report}
+
+                # Approver (or the gate is off): apply directly, content only.
+                for it in items:
+                    zone = zone_map[it["zone_key"]]
+                    tpl_api._upsert_zone_content(conn, cur, tenant_id, zone, it["zone_key"],
+                                                 "device", None, it["device_id"], it["payload"],
+                                                 ctx.user_id)
+                report = {"created": 0, "pending": 0, "skipped": 0,
+                          "content_updated_existing": len(devices_touched),
+                          "content_written": len(items), "shops": 0, "groups": 0}
+                cur.execute("""
+                    UPDATE public.bulk_import_job
+                    SET status = 'committed', created_rows = 0, skipped_rows = 0,
+                        report = %s::jsonb, finished_at = NOW()
+                    WHERE id = %s;
+                """, (_json(report), body.job_id))
+                log_audit(conn, tenant_id, ctx.user_id, "devices.bulk_import", "device", None,
+                          details=report)
+            conn.commit()
+        except HTTPException:
+            conn.rollback()
+            raise
+        except Exception as e:
+            conn.rollback()
+            logger.error("content-only bulk commit failed (tenant %s job %s): %s",
+                         tenant_id, body.job_id, e)
+            raise HTTPException(status_code=500, detail="Bulk content update failed; nothing was written")
+    return {"job_id": body.job_id, "committed": True, **report}
+
+
 @router.post("/bulk-devices/commit")
-def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_context)):
-    _require_manage_devices(ctx)
+def bulk_commit(body: CommitIn, background_tasks: BackgroundTasks,
+                ctx: TenantContext = Depends(require_tenant_context)):
+    if _bulk_mode(ctx) == "content":
+        return _commit_content_only(body, ctx, background_tasks)
     tenant_id = ctx.active_tenant_id
     with pg_conn() as conn:
         try:
@@ -1097,7 +1281,7 @@ def bulk_commit(body: CommitIn, ctx: TenantContext = Depends(require_tenant_cont
 
 @router.get("/bulk-devices/jobs/{job_id}")
 def bulk_job(job_id: int, ctx: TenantContext = Depends(require_tenant_context)):
-    _require_manage_devices(ctx)
+    _bulk_mode(ctx)  # content editors poll their own jobs too
     with pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
