@@ -60,7 +60,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import boto3
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -71,6 +71,7 @@ from tenant_context import (
     require_platform_user,
     require_tenant_context,
 )
+from websocket_routes import notify_pending_approvals
 
 logger = logging.getLogger("template_api")
 
@@ -1735,10 +1736,7 @@ def _existing_zone_payload(cur, tenant_id: int, zone_key: str, scope: str,
     return json.loads(payload) if isinstance(payload, str) else (payload or {})
 
 
-def _upsert_zone_content(conn, cur, tenant_id: int, zone: Dict, zone_key: str, scope: str,
-                         shop_id: Optional[int], device_id: Optional[int],
-                         payload: Dict, user_id: Optional[int],
-                         group_id: Optional[int] = None) -> Dict:
+def _canonicalize_payload_s3(payload: Dict) -> Dict:
     # A media-library item's s3_link may be stored as s3://, an S3 https URL, or a
     # bare key. Canonicalize the S3 refs the user picked so a library image/video
     # both passes validation (strict s3://) and resolves to a presigned URL on the
@@ -1747,6 +1745,14 @@ def _upsert_zone_content(conn, cur, tenant_id: int, zone: Dict, zone_key: str, s
         v = payload.get(_f)
         if isinstance(v, str) and v and not v.startswith("s3://"):
             payload[_f] = _canonical_s3_ref(v)
+    return payload
+
+
+def _upsert_zone_content(conn, cur, tenant_id: int, zone: Dict, zone_key: str, scope: str,
+                         shop_id: Optional[int], device_id: Optional[int],
+                         payload: Dict, user_id: Optional[int],
+                         group_id: Optional[int] = None) -> Dict:
+    payload = _canonicalize_payload_s3(payload)
     errors = validate_content_payload(zone["type"], payload)
     if errors:
         raise HTTPException(status_code=422, detail={"payload_errors": errors})
@@ -1801,10 +1807,13 @@ def _upsert_zone_content(conn, cur, tenant_id: int, zone: Dict, zone_key: str, s
     return saved
 
 
-async def _upload_zone_media(conn, cur, tenant_id: int, zone: Dict, zone_key: str, scope: str,
-                             shop_id: Optional[int], device_id: Optional[int],
-                             file: UploadFile, user_id: Optional[int],
-                             group_id: Optional[int] = None) -> Dict:
+async def _prepare_zone_media_payload(cur, tenant_id: int, zone: Dict, zone_key: str, scope: str,
+                                      shop_id: Optional[int], device_id: Optional[int],
+                                      file: UploadFile,
+                                      group_id: Optional[int] = None) -> Dict:
+    """Upload the file to S3 and return the zone payload it produces (merged into
+    the scope's existing payload). Does NOT write content rows — the caller either
+    upserts directly or parks the payload in a pending approval request."""
     ext = (file.filename or "").rsplit(".", 1)[-1].lower()
     media_type = MEDIA_EXTENSIONS.get(ext)
     if not media_type:
@@ -1845,8 +1854,128 @@ async def _upload_zone_media(conn, cur, tenant_id: int, zone: Dict, zone_key: st
     payload["media_type"] = media_type
     if zone["type"] == "qr" and payload.get("qr_mode") != "link":
         payload["qr_mode"] = "media" if media_type == "video" else payload.get("qr_mode", "image")
+    return payload
+
+
+async def _upload_zone_media(conn, cur, tenant_id: int, zone: Dict, zone_key: str, scope: str,
+                             shop_id: Optional[int], device_id: Optional[int],
+                             file: UploadFile, user_id: Optional[int],
+                             group_id: Optional[int] = None) -> Dict:
+    payload = await _prepare_zone_media_payload(cur, tenant_id, zone, zone_key, scope,
+                                                shop_id, device_id, file, group_id=group_id)
     return _upsert_zone_content(conn, cur, tenant_id, zone, zone_key, scope,
                                 shop_id, device_id, payload, user_id, group_id=group_id)
+
+
+# ── Roles + approval integration ──────────────────────────────────────────
+# Reads stay open to every tenant user (viewers see content read-only), but
+# every content WRITE needs at least one content permission — that line is what
+# separates viewer (read-only) from editor/manager/admin. On top of that,
+# when the company has require_content_approval enabled, writes from users who
+# are not approvers (role not in auto_approve_roles, no can_approve_content
+# flag, not platform) are DIVERTED into the content_change_request queue
+# instead of touching the live tables. The content stamp only moves when a
+# reviewer approves, so screens keep playing the old content until then.
+
+_CONTENT_EDIT_PERMS = ("manage_company_settings", "manage_devices", "manage_shops",
+                       "upload_videos", "manage_videos", "manage_links")
+
+_SCOPE_TARGET_TYPE = {"company": "company", "shop": "shop", "group": "group", "device": "device"}
+
+
+def _require_content_editor(ctx: TenantContext) -> None:
+    if not any(ctx.has_permission(p) for p in _CONTENT_EDIT_PERMS):
+        raise HTTPException(status_code=403,
+                            detail="You don't have permission to change template content")
+
+
+def _approval_required(cur, ctx: TenantContext) -> bool:
+    """Server-side mirror of the playlist approval gate (create_content_change_request):
+    divert when the company requires approval and the caller is neither an
+    auto-approve role, a flagged approver, nor a platform user."""
+    if ctx.user_type == "platform":
+        return False
+    cur.execute("""
+        SELECT require_content_approval, auto_approve_roles
+        FROM public.company WHERE id = %s;
+    """, (ctx.active_tenant_id,))
+    row = cur.fetchone()
+    if not row or not row[0]:
+        return False
+    auto_roles = row[1] or ["admin", "manager"]
+    if isinstance(auto_roles, str):
+        auto_roles = json.loads(auto_roles)
+    if (ctx.role_name or "") in auto_roles:
+        return False
+    cur.execute("SELECT can_approve_content FROM public.users WHERE id = %s;", (ctx.user_id,))
+    urow = cur.fetchone()
+    return not (urow and urow[0])
+
+
+def _submit_content_approval(conn, cur, ctx: TenantContext, *, action: str, scope: str,
+                             zone_key: str, zone_label: str, payload: Optional[Dict],
+                             shop_id: Optional[int] = None, device_id: Optional[int] = None,
+                             group_id: Optional[int] = None,
+                             target_name: Optional[str] = None) -> Dict:
+    """Park a content write as a pending content_change_request. A newer
+    submission from the same user for the same zone+target supersedes the older
+    pending one (status 'cancelled') so editors can iterate before review."""
+    tenant_id = ctx.active_tenant_id
+    target_type = _SCOPE_TARGET_TYPE[scope]
+    target_id = _scope_target_id(scope, tenant_id, shop_id, device_id, group_id)
+    change_data = {"action": action, "scope": scope, "zone_key": zone_key,
+                   "zone_label": zone_label, "payload": payload,
+                   "shop_id": shop_id, "device_id": device_id, "group_id": group_id,
+                   "requested_by": ctx.user_id}
+    cur.execute("""
+        UPDATE public.content_change_request
+        SET status = 'cancelled', updated_at = NOW()
+        WHERE tenant_id = %s AND request_type = 'template_content' AND status = 'pending'
+          AND requested_by = %s AND target_type = %s AND target_id = %s
+          AND change_data->>'zone_key' = %s
+        RETURNING id;
+    """, (tenant_id, ctx.user_id, target_type, target_id, zone_key))
+    superseded = [r[0] for r in cur.fetchall()]
+    cur.execute("""
+        INSERT INTO public.content_change_request
+            (tenant_id, request_type, target_type, target_id, target_name,
+             change_data, requested_by, status, expires_at)
+        VALUES (%s, 'template_content', %s, %s, %s, %s::jsonb, %s, 'pending',
+                NOW() + INTERVAL '72 hours')
+        RETURNING id;
+    """, (tenant_id, target_type, target_id, target_name or ctx.company_name,
+          json.dumps(change_data), ctx.user_id))
+    request_id = cur.fetchone()[0]
+    log_audit(conn, tenant_id, ctx.user_id, "template.content.approval_requested",
+              "content_change_request", request_id,
+              details={"zone_key": zone_key, "scope": scope, "action": action,
+                       "superseded": superseded})
+    return {"status": "pending_approval", "request_id": request_id, "zone_key": zone_key,
+            "superseded_request_ids": superseded}
+
+
+def _notify_pending_approvals_count(background_tasks: BackgroundTasks, cur, tenant_id: int) -> None:
+    """Queue the tenant's pending count for the dashboard WS badge. Counts on the
+    CALLER's cursor (pre-commit, so the just-inserted request is included) —
+    never opens a second pooled connection while the endpoint still holds one,
+    which could deadlock an exhausted pool. The WS send itself runs after the
+    response via BackgroundTasks."""
+    cur.execute("""
+        SELECT COUNT(*) FROM public.content_change_request
+        WHERE tenant_id = %s AND status = 'pending';
+    """, (tenant_id,))
+    count = cur.fetchone()[0]
+    background_tasks.add_task(notify_pending_approvals, tenant_id, count)
+
+
+def _validate_or_422(zone: Dict, payload: Dict) -> Dict:
+    """Fail a diverted write at SUBMIT time, not at review time — the editor gets
+    the same instant 422 an approver would get from a direct write."""
+    payload = _canonicalize_payload_s3(payload)
+    errors = validate_content_payload(zone["type"], payload)
+    if errors:
+        raise HTTPException(status_code=422, detail={"payload_errors": errors})
+    return payload
 
 
 @router.get("/company/template-content")
@@ -1895,12 +2024,20 @@ def company_content_overrides(ctx: TenantContext = Depends(require_tenant_contex
 
 
 @router.delete("/company/template-content/{zone_key}/overrides")
-def clear_company_zone_overrides(zone_key: str,
+def clear_company_zone_overrides(zone_key: str, background_tasks: BackgroundTasks,
                                  ctx: TenantContext = Depends(require_tenant_context)):
     """Remove ALL location + screen overrides for one zone so the company-wide
     default takes effect everywhere. Bumps the content stamp → screens refetch."""
+    _require_content_editor(ctx)
     with pg_conn() as conn:
         with conn.cursor() as cur:
+            if _approval_required(cur, ctx):
+                pending = _submit_content_approval(conn, cur, ctx, action="clear_overrides",
+                                                   scope="company", zone_key=zone_key,
+                                                   zone_label=zone_key, payload=None)
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
+                conn.commit()
+                return pending
             cur.execute("""
                 DELETE FROM public.template_zone_content
                 WHERE tenant_id = %s AND zone_key = %s AND scope IN ('shop', 'device')
@@ -1921,14 +2058,24 @@ def clear_company_zone_overrides(zone_key: str,
 
 
 @router.put("/company/template-content/{zone_key}")
-def put_company_zone_content(zone_key: str, body: ZoneContentIn,
+def put_company_zone_content(zone_key: str, body: ZoneContentIn, background_tasks: BackgroundTasks,
                              ctx: TenantContext = Depends(require_tenant_context)):
+    _require_content_editor(ctx)
     with pg_conn() as conn:
         with conn.cursor() as cur:
             tpl = _tenant_template(cur, ctx.active_tenant_id)
             if not tpl:
                 raise HTTPException(status_code=422, detail="Company has no linked template")
             zone = _content_zone_or_422(tpl, zone_key)
+            if _approval_required(cur, ctx):
+                payload = _validate_or_422(zone, body.payload)
+                pending = _submit_content_approval(conn, cur, ctx, action="put", scope="company",
+                                                   zone_key=zone_key,
+                                                   zone_label=zone.get("name") or zone_key,
+                                                   payload=payload)
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
+                conn.commit()
+                return pending
             saved = _upsert_zone_content(conn, cur, ctx.active_tenant_id, zone, zone_key,
                                          "company", None, None, body.payload, ctx.user_id)
         conn.commit()
@@ -1936,14 +2083,27 @@ def put_company_zone_content(zone_key: str, body: ZoneContentIn,
 
 
 @router.post("/company/template-content/{zone_key}/media")
-async def upload_company_zone_media(zone_key: str, file: UploadFile = File(...),
+async def upload_company_zone_media(zone_key: str, background_tasks: BackgroundTasks,
+                                    file: UploadFile = File(...),
                                     ctx: TenantContext = Depends(require_tenant_context)):
+    _require_content_editor(ctx)
     with pg_conn() as conn:
         with conn.cursor() as cur:
             tpl = _tenant_template(cur, ctx.active_tenant_id)
             if not tpl:
                 raise HTTPException(status_code=422, detail="Company has no linked template")
             zone = _content_zone_or_422(tpl, zone_key)
+            if _approval_required(cur, ctx):
+                payload = await _prepare_zone_media_payload(cur, ctx.active_tenant_id, zone, zone_key,
+                                                            "company", None, None, file)
+                payload = _validate_or_422(zone, payload)
+                pending = _submit_content_approval(conn, cur, ctx, action="put", scope="company",
+                                                   zone_key=zone_key,
+                                                   zone_label=zone.get("name") or zone_key,
+                                                   payload=payload)
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
+                conn.commit()
+                return pending
             saved = await _upload_zone_media(conn, cur, ctx.active_tenant_id, zone, zone_key,
                                              "company", None, None, file, ctx.user_id)
         conn.commit()
@@ -1965,14 +2125,26 @@ def shop_template_content(shop_id: int, ctx: TenantContext = Depends(require_ten
 
 @router.put("/shop/{shop_id}/template-content/{zone_key}")
 def put_shop_zone_content(shop_id: int, zone_key: str, body: ZoneContentIn,
+                          background_tasks: BackgroundTasks,
                           ctx: TenantContext = Depends(require_tenant_context)):
+    _require_content_editor(ctx)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            _shop_of_tenant(cur, shop_id, ctx.active_tenant_id)
+            shop = _shop_of_tenant(cur, shop_id, ctx.active_tenant_id)
             tpl = _tenant_template(cur, ctx.active_tenant_id)
             if not tpl:
                 raise HTTPException(status_code=422, detail="Company has no linked template")
             zone = _content_zone_or_422(tpl, zone_key)
+            if _approval_required(cur, ctx):
+                payload = _validate_or_422(zone, body.payload)
+                pending = _submit_content_approval(conn, cur, ctx, action="put", scope="shop",
+                                                   zone_key=zone_key,
+                                                   zone_label=zone.get("name") or zone_key,
+                                                   payload=payload, shop_id=shop_id,
+                                                   target_name=shop[1])
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
+                conn.commit()
+                return pending
             saved = _upsert_zone_content(conn, cur, ctx.active_tenant_id, zone, zone_key,
                                          "shop", shop_id, None, body.payload, ctx.user_id)
         conn.commit()
@@ -1980,15 +2152,29 @@ def put_shop_zone_content(shop_id: int, zone_key: str, body: ZoneContentIn,
 
 
 @router.post("/shop/{shop_id}/template-content/{zone_key}/media")
-async def upload_shop_zone_media(shop_id: int, zone_key: str, file: UploadFile = File(...),
+async def upload_shop_zone_media(shop_id: int, zone_key: str, background_tasks: BackgroundTasks,
+                                 file: UploadFile = File(...),
                                  ctx: TenantContext = Depends(require_tenant_context)):
+    _require_content_editor(ctx)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            _shop_of_tenant(cur, shop_id, ctx.active_tenant_id)
+            shop = _shop_of_tenant(cur, shop_id, ctx.active_tenant_id)
             tpl = _tenant_template(cur, ctx.active_tenant_id)
             if not tpl:
                 raise HTTPException(status_code=422, detail="Company has no linked template")
             zone = _content_zone_or_422(tpl, zone_key)
+            if _approval_required(cur, ctx):
+                payload = await _prepare_zone_media_payload(cur, ctx.active_tenant_id, zone, zone_key,
+                                                            "shop", shop_id, None, file)
+                payload = _validate_or_422(zone, payload)
+                pending = _submit_content_approval(conn, cur, ctx, action="put", scope="shop",
+                                                   zone_key=zone_key,
+                                                   zone_label=zone.get("name") or zone_key,
+                                                   payload=payload, shop_id=shop_id,
+                                                   target_name=shop[1])
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
+                conn.commit()
+                return pending
             saved = await _upload_zone_media(conn, cur, ctx.active_tenant_id, zone, zone_key,
                                              "shop", shop_id, None, file, ctx.user_id)
         conn.commit()
@@ -2012,14 +2198,26 @@ def group_template_content(group_id: int, ctx: TenantContext = Depends(require_t
 
 @router.put("/group/{group_id}/template-content/{zone_key}")
 def put_group_zone_content(group_id: int, zone_key: str, body: ZoneContentIn,
+                           background_tasks: BackgroundTasks,
                            ctx: TenantContext = Depends(require_tenant_context)):
+    _require_content_editor(ctx)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            _group_of_tenant(cur, group_id, ctx.active_tenant_id)
+            grp = _group_of_tenant(cur, group_id, ctx.active_tenant_id)
             tpl = _effective_template(cur, ctx.active_tenant_id, group_id=group_id)
             if not tpl:
                 raise HTTPException(status_code=422, detail="Company has no linked template")
             zone = _content_zone_or_422(tpl, zone_key)
+            if _approval_required(cur, ctx):
+                payload = _validate_or_422(zone, body.payload)
+                pending = _submit_content_approval(conn, cur, ctx, action="put", scope="group",
+                                                   zone_key=zone_key,
+                                                   zone_label=zone.get("name") or zone_key,
+                                                   payload=payload, group_id=group_id,
+                                                   target_name=grp[1])
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
+                conn.commit()
+                return pending
             saved = _upsert_zone_content(conn, cur, ctx.active_tenant_id, zone, zone_key,
                                          "group", None, None, body.payload, ctx.user_id,
                                          group_id=group_id)
@@ -2028,12 +2226,21 @@ def put_group_zone_content(group_id: int, zone_key: str, body: ZoneContentIn,
 
 
 @router.delete("/group/{group_id}/template-content/{zone_key}")
-def delete_group_zone_content(group_id: int, zone_key: str,
+def delete_group_zone_content(group_id: int, zone_key: str, background_tasks: BackgroundTasks,
                               ctx: TenantContext = Depends(require_tenant_context)):
     """Remove a group's content for one zone — its devices fall back to location/company."""
+    _require_content_editor(ctx)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            _group_of_tenant(cur, group_id, ctx.active_tenant_id)
+            grp = _group_of_tenant(cur, group_id, ctx.active_tenant_id)
+            if _approval_required(cur, ctx):
+                pending = _submit_content_approval(conn, cur, ctx, action="delete", scope="group",
+                                                   zone_key=zone_key, zone_label=zone_key,
+                                                   payload=None, group_id=group_id,
+                                                   target_name=grp[1])
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
+                conn.commit()
+                return pending
             cur.execute("""
                 DELETE FROM public.template_zone_group_content
                 WHERE tenant_id = %s AND zone_key = %s AND group_id = %s
@@ -2049,15 +2256,30 @@ def delete_group_zone_content(group_id: int, zone_key: str,
 
 
 @router.post("/group/{group_id}/template-content/{zone_key}/media")
-async def upload_group_zone_media(group_id: int, zone_key: str, file: UploadFile = File(...),
+async def upload_group_zone_media(group_id: int, zone_key: str, background_tasks: BackgroundTasks,
+                                  file: UploadFile = File(...),
                                   ctx: TenantContext = Depends(require_tenant_context)):
+    _require_content_editor(ctx)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            _group_of_tenant(cur, group_id, ctx.active_tenant_id)
+            grp = _group_of_tenant(cur, group_id, ctx.active_tenant_id)
             tpl = _effective_template(cur, ctx.active_tenant_id, group_id=group_id)
             if not tpl:
                 raise HTTPException(status_code=422, detail="Company has no linked template")
             zone = _content_zone_or_422(tpl, zone_key)
+            if _approval_required(cur, ctx):
+                payload = await _prepare_zone_media_payload(cur, ctx.active_tenant_id, zone, zone_key,
+                                                            "group", None, None, file,
+                                                            group_id=group_id)
+                payload = _validate_or_422(zone, payload)
+                pending = _submit_content_approval(conn, cur, ctx, action="put", scope="group",
+                                                   zone_key=zone_key,
+                                                   zone_label=zone.get("name") or zone_key,
+                                                   payload=payload, group_id=group_id,
+                                                   target_name=grp[1])
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
+                conn.commit()
+                return pending
             saved = await _upload_zone_media(conn, cur, ctx.active_tenant_id, zone, zone_key,
                                              "group", None, None, file, ctx.user_id,
                                              group_id=group_id)
@@ -2083,14 +2305,26 @@ def device_template_content(device_id: int, ctx: TenantContext = Depends(require
 
 @router.put("/device-config/{device_id}/template-content/{zone_key}")
 def put_device_zone_content(device_id: int, zone_key: str, body: ZoneContentIn,
+                            background_tasks: BackgroundTasks,
                             ctx: TenantContext = Depends(require_tenant_context)):
+    _require_content_editor(ctx)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            _device_of_tenant(cur, device_id, ctx.active_tenant_id)
+            dev = _device_of_tenant(cur, device_id, ctx.active_tenant_id)
             tpl = _effective_template(cur, ctx.active_tenant_id, device_id=device_id)
             if not tpl:
                 raise HTTPException(status_code=422, detail="Company has no linked template")
             zone = _content_zone_or_422(tpl, zone_key)
+            if _approval_required(cur, ctx):
+                payload = _validate_or_422(zone, body.payload)
+                pending = _submit_content_approval(conn, cur, ctx, action="put", scope="device",
+                                                   zone_key=zone_key,
+                                                   zone_label=zone.get("name") or zone_key,
+                                                   payload=payload, device_id=device_id,
+                                                   target_name=dev[1])
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
+                conn.commit()
+                return pending
             saved = _upsert_zone_content(conn, cur, ctx.active_tenant_id, zone, zone_key,
                                          "device", None, device_id, body.payload, ctx.user_id)
         conn.commit()
@@ -2098,12 +2332,21 @@ def put_device_zone_content(device_id: int, zone_key: str, body: ZoneContentIn,
 
 
 @router.delete("/device-config/{device_id}/template-content/{zone_key}")
-def delete_device_zone_content(device_id: int, zone_key: str,
+def delete_device_zone_content(device_id: int, zone_key: str, background_tasks: BackgroundTasks,
                                ctx: TenantContext = Depends(require_tenant_context)):
     """Remove a device override — the device falls back to shop/company content."""
+    _require_content_editor(ctx)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            _device_of_tenant(cur, device_id, ctx.active_tenant_id)
+            dev = _device_of_tenant(cur, device_id, ctx.active_tenant_id)
+            if _approval_required(cur, ctx):
+                pending = _submit_content_approval(conn, cur, ctx, action="delete", scope="device",
+                                                   zone_key=zone_key, zone_label=zone_key,
+                                                   payload=None, device_id=device_id,
+                                                   target_name=dev[1])
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
+                conn.commit()
+                return pending
             cur.execute("""
                 DELETE FROM public.template_zone_content
                 WHERE tenant_id = %s AND zone_key = %s AND scope = 'device' AND device_id = %s
@@ -2119,15 +2362,29 @@ def delete_device_zone_content(device_id: int, zone_key: str,
 
 
 @router.post("/device-config/{device_id}/template-content/{zone_key}/media")
-async def upload_device_zone_media(device_id: int, zone_key: str, file: UploadFile = File(...),
+async def upload_device_zone_media(device_id: int, zone_key: str, background_tasks: BackgroundTasks,
+                                   file: UploadFile = File(...),
                                    ctx: TenantContext = Depends(require_tenant_context)):
+    _require_content_editor(ctx)
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            _device_of_tenant(cur, device_id, ctx.active_tenant_id)
+            dev = _device_of_tenant(cur, device_id, ctx.active_tenant_id)
             tpl = _effective_template(cur, ctx.active_tenant_id, device_id=device_id)
             if not tpl:
                 raise HTTPException(status_code=422, detail="Company has no linked template")
             zone = _content_zone_or_422(tpl, zone_key)
+            if _approval_required(cur, ctx):
+                payload = await _prepare_zone_media_payload(cur, ctx.active_tenant_id, zone, zone_key,
+                                                            "device", None, device_id, file)
+                payload = _validate_or_422(zone, payload)
+                pending = _submit_content_approval(conn, cur, ctx, action="put", scope="device",
+                                                   zone_key=zone_key,
+                                                   zone_label=zone.get("name") or zone_key,
+                                                   payload=payload, device_id=device_id,
+                                                   target_name=dev[1])
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
+                conn.commit()
+                return pending
             saved = await _upload_zone_media(conn, cur, ctx.active_tenant_id, zone, zone_key,
                                              "device", None, device_id, file, ctx.user_id)
         conn.commit()
@@ -2252,6 +2509,7 @@ def device_template(mobile_id: str):
     return {
         "mobile_id": mobile_id,
         "template_id": tpl["id"],
+        "name": tpl["name"],
         "version": tpl["version"],
         "template_stamp": stamp,
         "orientation": tpl["orientation"],
