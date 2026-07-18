@@ -57,3 +57,20 @@ class TestRequireUserTenant:
         with pytest.raises(HTTPException) as e:
             require_user_tenant(PLATFORM)
         assert e.value.status_code == 400
+
+
+class TestReportRange:
+    def test_defaults_and_bounds(self):
+        from fastapi import HTTPException
+        import pytest as _pytest
+        from reports_api import _range_or_422
+        start, end = _range_or_422(None, None)
+        assert (end - start).days == 6  # default = last 7 days inclusive
+        s, e = _range_or_422("2026-01-01", "2026-01-31")
+        assert str(s) == "2026-01-01" and str(e) == "2026-01-31"
+        with _pytest.raises(HTTPException):
+            _range_or_422("2026-02-01", "2026-01-01")  # inverted
+        with _pytest.raises(HTTPException):
+            _range_or_422("2020-01-01", "2026-01-01")  # too large
+        with _pytest.raises(HTTPException):
+            _range_or_422("nope", None)
