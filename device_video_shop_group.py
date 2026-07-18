@@ -278,6 +278,9 @@ app.include_router(webapp_router, prefix="/webapp", tags=["WebApp"])
 app.include_router(template_router, tags=["Screen Templates"])
 # NEW: Bulk device enrollment (CSV/XLSX import + pending-device claim).
 app.include_router(bulk_enrollment_router, tags=["Bulk Enrollment"])
+# Fleet-wide report aggregates (one request per report, not one per screen).
+from reports_api import router as reports_router  # noqa: E402
+app.include_router(reports_router, tags=["Reports"])
 
 
 # ===========================================================
