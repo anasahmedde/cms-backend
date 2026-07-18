@@ -48,6 +48,8 @@ from websocket_routes import (
 
 # Multi-tenant auth (replaces old inline auth)
 from tenant_context import (
+    require_perm,
+    require_user_tenant,
     TenantContext, get_tenant_context, get_current_user,
     require_permission, require_platform_user, require_tenant_context,
     hash_password, verify_password, generate_token, create_session,
@@ -2126,10 +2128,32 @@ def record_door_open(mobile_id: str):
 
 
 # ---------- Link CRUD ----------
+def _link_device_tenant_or_404(conn, link_id: int, user: Dict) -> Dict:
+    """Fetch a link row and verify its DEVICE belongs to the caller's tenant.
+    Links are the join table; the device is the tenant anchor (device rows
+    always carry tenant_id, older link rows may not)."""
+    row = fetch_link_by_id(conn, link_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Link not found")
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
+    if tenant_id:
+        with conn.cursor() as cur:
+            cur.execute("SELECT tenant_id FROM public.device WHERE id = %s;", (int(row["did"]),))
+            drow = cur.fetchone()
+        if not drow or (drow[0] is not None and int(drow[0]) != int(tenant_id)):
+            raise HTTPException(status_code=404, detail="Link not found")
+    return row
+
+
 @app.post("/link", response_model=LinkOut)
-def create_link(req: LinkCreate):
+def create_link(req: LinkCreate, user: Dict = Depends(get_current_user)):
+    require_perm(user, "manage_links")
     with pg_conn() as conn:
         try:
+            # The link's device must be the caller's — names resolve inside the
+            # helper, so anchor tenant ownership on the device up front.
+            with conn.cursor() as cur:
+                authorize_device(cur, req.mobile_id, user)
             row = create_link_by_names(conn, req)
             conn.commit()
             return row
@@ -2171,12 +2195,11 @@ def list_links_route(
 
 
 @app.delete("/link/{link_id}")
-def delete_link_route(link_id: int = Path(..., ge=1)):
+def delete_link_route(link_id: int = Path(..., ge=1), user: Dict = Depends(get_current_user)):
+    require_perm(user, "manage_links")
     with pg_conn() as conn:
         try:
-            row = fetch_link_by_id(conn, link_id)
-            if not row:
-                raise HTTPException(status_code=404, detail="Link not found")
+            row = _link_device_tenant_or_404(conn, link_id, user)
             did = int(row["did"])
             deleted = delete_link_row(conn, link_id)
             if deleted == 0:
@@ -2194,32 +2217,32 @@ def delete_link_route(link_id: int = Path(..., ge=1)):
 
 
 @app.post("/link/{link_id}/delete")
-def delete_link_route_fallback(link_id: int = Path(..., ge=1)):
-    return delete_link_route(link_id)
+def delete_link_route_fallback(link_id: int = Path(..., ge=1), user: Dict = Depends(get_current_user)):
+    return delete_link_route(link_id, user)
 
 
 @app.delete("/device/{mobile_id}/links")
-def delete_all_device_links(mobile_id: str):
+def delete_all_device_links(mobile_id: str, user: Dict = Depends(get_current_user)):
     """Delete all links for a device. Used before deleting the device itself."""
+    require_perm(user, "manage_links", "manage_devices")
     with pg_conn() as conn:
         try:
-            did = get_device_id_by_mobile(conn, mobile_id)
-            if did is None:
-                raise HTTPException(status_code=404, detail=f"Device not found: {mobile_id}")
-            
+            with conn.cursor() as cur:
+                device_ids, _dev_tenant = authorize_device(cur, mobile_id, user)
+
             with conn.cursor() as cur:
                 cur.execute(
-                    "DELETE FROM public.device_video_shop_group WHERE did = %s RETURNING id;",
-                    (did,)
+                    "DELETE FROM public.device_video_shop_group WHERE did = ANY(%s::bigint[]) RETURNING id;",
+                    (device_ids,)
                 )
                 deleted_count = cur.rowcount or 0
-                
+
                 # Reset device download status
                 cur.execute(
-                    "UPDATE public.device SET download_status = false WHERE id = %s;",
-                    (did,)
+                    "UPDATE public.device SET download_status = false WHERE id = ANY(%s::bigint[]);",
+                    (device_ids,)
                 )
-            
+
             conn.commit()
             return {
                 "mobile_id": mobile_id,
@@ -2235,9 +2258,9 @@ def delete_all_device_links(mobile_id: str):
 
 
 @app.post("/device/{mobile_id}/links/delete")
-def delete_all_device_links_fallback(mobile_id: str):
+def delete_all_device_links_fallback(mobile_id: str, user: Dict = Depends(get_current_user)):
     """Fallback POST endpoint for delete all links."""
-    return delete_all_device_links(mobile_id)
+    return delete_all_device_links(mobile_id, user)
 
 
 # Link a device to a group - inherits all videos from the group
@@ -2247,30 +2270,38 @@ class DeviceToGroupIn(BaseModel):
     shop_name: str
 
 @app.post("/link/device-to-group")
-def link_device_to_group(body: DeviceToGroupIn):
+def link_device_to_group(body: DeviceToGroupIn, user: Dict = Depends(get_current_user)):
     """
     Link a device to a group. This will:
     1. Create/update a device_assignment record (always, regardless of videos)
     2. Create links for all videos currently in the group (if any)
     A device can only belong to ONE group - changing groups will automatically remove old assignment.
     """
+    # Membership is fleet structure, not content — editors/viewers may not move screens.
+    require_perm(user, "manage_devices", "manage_groups", "manage_shops")
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
     try:
         with pg_conn() as conn:
-            # Get device ID
-            did = get_device_id_by_mobile(conn, body.mobile_id)
-            if did is None:
-                raise HTTPException(status_code=404, detail=f"Device not found: {body.mobile_id}")
-            
             with conn.cursor() as cur:
-                # Get shop ID
-                cur.execute("SELECT id FROM public.shop WHERE shop_name = %s ORDER BY id DESC LIMIT 1;", (body.shop_name,))
+                device_ids, _dev_tenant = authorize_device(cur, body.mobile_id, user)
+                did = device_ids[0]
+
+            with conn.cursor() as cur:
+                # Get shop ID (the caller's tenant only)
+                cur.execute("SELECT id FROM public.shop WHERE shop_name = %s"
+                            " AND (%s::bigint IS NULL OR tenant_id = %s)"
+                            " ORDER BY id DESC LIMIT 1;",
+                            (body.shop_name, tenant_id, tenant_id))
                 srow = cur.fetchone()
                 if not srow:
                     raise HTTPException(status_code=404, detail=f"Shop not found: {body.shop_name}")
                 sid = int(srow[0])
-                
-                # Get group ID
-                cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (body.gname,))
+
+                # Get group ID (the caller's tenant only)
+                cur.execute('SELECT id FROM public."group" WHERE gname = %s'
+                            ' AND (%s::bigint IS NULL OR tenant_id = %s)'
+                            ' ORDER BY id DESC LIMIT 1;',
+                            (body.gname, tenant_id, tenant_id))
                 grow = cur.fetchone()
                 if not grow:
                     raise HTTPException(status_code=404, detail=f"Group not found: {body.gname}")
@@ -2386,16 +2417,21 @@ class GroupSyncIn(BaseModel):
 
 
 @app.post("/group/{gname}/sync-to-devices")
-def sync_group_devices(gname: str, body: GroupSyncIn):
+def sync_group_devices(gname: str, body: GroupSyncIn, user: Dict = Depends(get_current_user)):
     """
     Sync videos and layout settings from a source device to ALL devices in the group.
     This ensures all devices in the group have the same videos and layout.
     """
+    # Fleet-wide push onto every screen in the group — device management.
+    require_perm(user, "manage_devices")
+    _tenant = user.get("active_tenant_id") or user.get("tenant_id")
     try:
         with pg_conn() as conn:
             with conn.cursor() as cur:
-                # Get group ID
-                cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (gname,))
+                # Get group ID (the caller's tenant only)
+                cur.execute('SELECT id FROM public."group" WHERE gname = %s'
+                            ' AND (%s::bigint IS NULL OR tenant_id = %s)'
+                            ' ORDER BY id DESC LIMIT 1;', (gname, _tenant, _tenant))
                 grow = cur.fetchone()
                 if not grow:
                     raise HTTPException(status_code=404, detail=f"Group not found: {gname}")
@@ -2905,16 +2941,14 @@ def get_device_layout(mobile_id: str):
 
 
 @app.post("/device/{mobile_id}/layout", response_model=DeviceLayoutOut)
-def set_device_layout(mobile_id: str, body: DeviceLayoutIn):
+def set_device_layout(mobile_id: str, body: DeviceLayoutIn, user: Dict = Depends(get_current_user)):
     """Set device layout configuration."""
+    require_perm(user, "manage_devices")
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM public.device WHERE mobile_id = %s LIMIT 1;", (mobile_id,))
-                drow = cur.fetchone()
-                if not drow:
-                    raise HTTPException(status_code=404, detail="Device not found")
-                did = int(drow[0])
+                device_ids, _dev_tenant = authorize_device(cur, mobile_id, user)
+                did = device_ids[0]
                 
                 cur.execute("""
                     INSERT INTO public.device_layout (did, layout_mode, layout_config)
@@ -2942,13 +2976,21 @@ def set_device_layout(mobile_id: str, body: DeviceLayoutIn):
 
 # ---------- Link-level settings (per-device rotation, resolution, grid) ----------
 @app.put("/link/{link_id}/settings")
-def update_link_settings(link_id: int, body: LinkUpdateIn):
+def update_link_settings(link_id: int, body: LinkUpdateIn, user: Dict = Depends(get_current_user)):
     """Update per-device settings for a specific link (rotation, resolution, grid position)."""
+    # Written by the layout editor — device configuration, not content.
+    require_perm(user, "manage_devices")
+    _link_tenant = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                # Get device ID for this link
-                cur.execute("SELECT id, did FROM public.device_video_shop_group WHERE id = %s LIMIT 1;", (link_id,))
+                # Get device ID for this link — the device anchors tenant ownership.
+                cur.execute("""
+                    SELECT l.id, l.did FROM public.device_video_shop_group l
+                    JOIN public.device d ON d.id = l.did
+                    WHERE l.id = %s AND (%s::bigint IS NULL OR d.tenant_id = %s)
+                    LIMIT 1;
+                """, (link_id, _link_tenant, _link_tenant))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Link not found")
@@ -3156,6 +3198,7 @@ def get_device_resolution(mobile_id: str):
 @app.post("/device/{mobile_id}/resolution")
 def set_device_resolution(mobile_id: str, resolution: str = Query(None), user: Dict = Depends(get_current_user)):
     """Set device screen resolution."""
+    require_perm(user, "manage_devices")
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
@@ -3174,6 +3217,7 @@ def set_device_resolution(mobile_id: str, resolution: str = Query(None), user: D
 @app.post("/device/{mobile_id}/name")
 def set_device_name(mobile_id: str, body: DeviceNameUpdateIn, user: Dict = Depends(get_current_user)):
     """Set/update device friendly name."""
+    require_perm(user, "manage_devices")
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
@@ -3222,6 +3266,7 @@ def get_ble_device_id(mobile_id: str):
 def set_ble_device_id(mobile_id: str, body: BleDeviceIdIn, user: Dict = Depends(get_current_user)):
     """Set or clear the BLE pairing ID for a device. Pass null/empty to disable auth.
     The ID must be unique within the tenant — two devices cannot share the same ESP32 ID."""
+    require_perm(user, "manage_devices")
     new_id = (body.ble_device_id or "").strip() or None
     with pg_conn() as conn:
         try:
@@ -3262,7 +3307,7 @@ def set_ble_device_id(mobile_id: str, body: BleDeviceIdIn, user: Dict = Depends(
 
 
 @app.post("/device/{mobile_id}/grid_layout")
-def set_device_grid_layout(mobile_id: str, body: Dict[str, Any]):
+def set_device_grid_layout(mobile_id: str, body: Dict[str, Any], user: Dict = Depends(get_current_user)):
     """
     Set grid layout for all videos on a device.
     body: {
@@ -3271,11 +3316,12 @@ def set_device_grid_layout(mobile_id: str, body: Dict[str, Any]):
     }
     Also supports legacy format: [{"link_id": 1, ...}, ...] (array directly)
     """
+    require_perm(user, "manage_devices")
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM public.device WHERE mobile_id = %s LIMIT 1;", (mobile_id,))
-                drow = cur.fetchone()
+                device_ids, _dev_tenant = authorize_device(cur, mobile_id, user)
+                drow = (device_ids[0],)
                 if not drow:
                     raise HTTPException(status_code=404, detail="Device not found")
                 did = int(drow[0])
@@ -3657,6 +3703,7 @@ def get_shop_devices(shop_name: str):
 @app.post("/device/{mobile_id}/mute")
 def set_device_mute(mobile_id: str, body: DeviceMuteIn, user: Dict = Depends(get_current_user)):
     """Mute or unmute a device. The Android app picks up the change on the next heartbeat (~30 s)."""
+    require_perm(user, "manage_devices")
     with pg_conn() as conn:
         with conn.cursor() as cur:
             ids, _ = authorize_device(cur, mobile_id, user)
@@ -3710,7 +3757,8 @@ def get_detected_resolution(mobile_id: str):
 @app.post("/device/create")
 def create_device_with_linking(body: DeviceCreateIn, user: Dict = Depends(get_current_user)):
     """Create a new device and optionally link to group and shop."""
-    tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
+    require_perm(user, "manage_devices")
+    tenant_id = require_user_tenant(user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
@@ -3867,11 +3915,30 @@ def create_device_with_linking(body: DeviceCreateIn, user: Dict = Depends(get_cu
             )
 
 
+def _assert_group_in_tenant(conn, gname: str, user: Dict) -> None:
+    """Rotation/ad saves resolve groups by NAME via shared unscoped helpers —
+    pre-assert the named group exists in the caller's tenant so one company can
+    never rewrite another's rotation through a name collision. Sentinel names
+    ("no group") skip the check."""
+    if gname.strip().lower() in NO_GROUP_SENTINELS:
+        return
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
+    if not tenant_id:
+        return  # platform user without impersonation: legacy pass-through
+    with conn.cursor() as cur:
+        cur.execute('SELECT 1 FROM public."group" WHERE gname = %s AND tenant_id = %s LIMIT 1;',
+                    (gname, tenant_id))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail=f"Group not found: {gname}")
+
+
 # ---------- Group video endpoints ----------
 @app.post("/group/{gname}/video", response_model=GroupVideoUpdateOut)
-def set_group_video_by_name(gname: str, body: GroupVideoUpdateIn):
+def set_group_video_by_name(gname: str, body: GroupVideoUpdateIn, user: Dict = Depends(get_current_user)):
+    require_perm(user, "manage_links")
     with pg_conn() as conn:
         try:
+            _assert_group_in_tenant(conn, gname, user)
             if gname.strip().lower() in NO_GROUP_SENTINELS:
                 vid = _resolve_video_id(conn, body.video_name)
                 ins, dele, rem, vname, marked = _set_nogroup_video(conn, vid)
@@ -3891,9 +3958,11 @@ def set_group_video_by_name(gname: str, body: GroupVideoUpdateIn):
 
 
 @app.post("/group/{gname}/videos", response_model=GroupVideosUpdateOut)
-def set_group_videos_by_names(gname: str, body: GroupVideosUpdateIn):
+def set_group_videos_by_names(gname: str, body: GroupVideosUpdateIn, user: Dict = Depends(get_current_user)):
+    require_perm(user, "manage_links")
     with pg_conn() as conn:
         try:
+            _assert_group_in_tenant(conn, gname, user)
             # An empty list clears the group's video rotation. This is a first-class
             # state now that the playlist editor splits rotation vs layout-image
             # panels (a group can legitimately have only layout/grid images).
@@ -5951,10 +6020,13 @@ def _set_group_advertisements(conn, gid: int, aids: List[int]):
 
 
 @app.post("/group/{gname}/advertisements", response_model=GroupAdvertisementsUpdateOut)
-def set_group_advertisements_by_names(gname: str, body: GroupAdvertisementsUpdateIn):
+def set_group_advertisements_by_names(gname: str, body: GroupAdvertisementsUpdateIn,
+                                      user: Dict = Depends(get_current_user)):
     """Link advertisements to a group by names."""
+    require_perm(user, "manage_links")
     with pg_conn() as conn:
         try:
+            _assert_group_in_tenant(conn, gname, user)
             aids = _resolve_advertisement_ids(conn, body.ad_names)
             gid = _resolve_group_id(conn, gname)
             ins, dele, upd, gname_res, ad_names = _set_group_advertisements(conn, gid, aids)
@@ -6081,6 +6153,7 @@ def set_device_active_status(mobile_id: str, body: DeviceActiveStatusIn, user: D
     - When is_active = False: Device will show "Not Enrolled" screen
     - When is_active = True: Device works normally
     """
+    require_perm(user, "manage_devices")
     try:
         with pg_conn() as conn:
             with conn.cursor() as cur:
@@ -6115,6 +6188,7 @@ def trigger_device_refresh(mobile_id: str, user: Dict = Depends(get_current_user
     Trigger a refresh/restart of the device app.
     The device will restart on next heartbeat.
     """
+    require_perm(user, "manage_devices")
     try:
         with pg_conn() as conn:
             with conn.cursor() as cur:
@@ -6151,6 +6225,7 @@ def unassign_device_from_group(mobile_id: str, user: Dict = Depends(get_current_
     3. Clear the device_layout config
     4. Mark device for re-download (download_status = FALSE)
     """
+    require_perm(user, "manage_devices")
     try:
         with pg_conn() as conn:
             with conn.cursor() as cur:
@@ -6364,10 +6439,11 @@ def _parse_video_s3_link(s3_link: str):
 
 @app.post("/insert_device")
 def standalone_insert_device(req: StandaloneDeviceRequest, user: Dict = Depends(get_current_user)):
+    require_perm(user, "manage_devices")
     mobile = (req.mobile_id or "").strip()
     if not mobile:
         raise HTTPException(status_code=400, detail="mobile_id is required")
-    tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
+    tenant_id = require_user_tenant(user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
@@ -6561,6 +6637,7 @@ def standalone_list_devices(
 
 @app.put("/device/{mobile_id}")
 def standalone_update_device(mobile_id: str, patch: StandaloneDeviceUpdate, user: Dict = Depends(get_current_user)):
+    require_perm(user, "manage_devices")
     sets, params = [], []
     if patch.mobile_id is not None:
         sets.append("mobile_id = %s"); params.append(patch.mobile_id)
@@ -6586,6 +6663,7 @@ def standalone_update_device(mobile_id: str, patch: StandaloneDeviceUpdate, user
 
 @app.delete("/device/{mobile_id}")
 def standalone_delete_device(mobile_id: str, force: bool = Query(False), user: Dict = Depends(get_current_user)):
+    require_perm(user, "manage_devices")
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
@@ -6653,7 +6731,8 @@ def standalone_delete_device(mobile_id: str, force: bool = Query(False), user: D
 
 @app.post("/insert_group")
 def standalone_insert_group(req: StandaloneGroupCreate, user: Dict = Depends(get_current_user)):
-    tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
+    require_perm(user, "manage_groups")
+    tenant_id = require_user_tenant(user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
@@ -6715,12 +6794,19 @@ def standalone_list_groups(
     return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
 
 @app.put("/group/{gname}")
-def standalone_update_group(gname: str, patch: StandaloneGroupUpdate):
+def standalone_update_group(gname: str, patch: StandaloneGroupUpdate, user: Dict = Depends(get_current_user)):
+    require_perm(user, "manage_groups")
     if not patch.gname:
         return standalone_get_group(gname)
+    _tenant = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute('UPDATE public."group" SET gname = %s WHERE gname = %s RETURNING id, gname, created_at, updated_at;', (patch.gname, gname))
+            # Tenant-scoped: gname is not unique across tenants — never rename
+            # (or even observe) another company's group.
+            cur.execute('UPDATE public."group" SET gname = %s WHERE gname = %s'
+                        ' AND (%s::bigint IS NULL OR tenant_id = %s)'
+                        ' RETURNING id, gname, created_at, updated_at;',
+                        (patch.gname, gname, _tenant, _tenant))
             row = cur.fetchone()
         conn.commit()
     if not row:
@@ -6728,11 +6814,15 @@ def standalone_update_group(gname: str, patch: StandaloneGroupUpdate):
     return {"message": "Group updated", "item": {"id": row[0], "gname": row[1], "created_at": row[2], "updated_at": row[3]}}
 
 @app.delete("/group/{gname}")
-def standalone_delete_group(gname: str, force: bool = Query(False)):
+def standalone_delete_group(gname: str, force: bool = Query(False), user: Dict = Depends(get_current_user)):
+    require_perm(user, "manage_groups")
+    _tenant = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (gname,))
+                cur.execute('SELECT id FROM public."group" WHERE gname = %s'
+                            ' AND (%s::bigint IS NULL OR tenant_id = %s)'
+                            ' ORDER BY id DESC LIMIT 1;', (gname, _tenant, _tenant))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Group not found")
@@ -6789,10 +6879,14 @@ def standalone_delete_group(gname: str, force: bool = Query(False)):
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/group/{gname}/unassign-devices")
-def standalone_unassign_group_devices(gname: str):
+def standalone_unassign_group_devices(gname: str, user: Dict = Depends(get_current_user)):
+    require_perm(user, "manage_groups")
+    _tenant = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (gname,))
+            cur.execute('SELECT id FROM public."group" WHERE gname = %s'
+                        ' AND (%s::bigint IS NULL OR tenant_id = %s)'
+                        ' ORDER BY id DESC LIMIT 1;', (gname, _tenant, _tenant))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Group not found")
@@ -6809,7 +6903,8 @@ def standalone_unassign_group_devices(gname: str):
 
 @app.post("/insert_shop")
 def standalone_insert_shop(req: StandaloneShopCreate, user: Dict = Depends(get_current_user)):
-    tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
+    require_perm(user, "manage_shops")
+    tenant_id = require_user_tenant(user)
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
@@ -6874,13 +6969,19 @@ def standalone_list_shops(
     return {"count": len(items), "items": items, "limit": limit, "offset": offset, "query": q}
 
 @app.put("/shop/{shop_name}")
-def standalone_update_shop(shop_name: str, patch: StandaloneShopUpdate):
+def standalone_update_shop(shop_name: str, patch: StandaloneShopUpdate, user: Dict = Depends(get_current_user)):
+    require_perm(user, "manage_shops")
     if not patch.shop_name:
         return standalone_get_shop(shop_name)
+    _tenant = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE public.shop SET shop_name = %s WHERE shop_name = %s RETURNING id, shop_name, created_at, updated_at;",
-                        (patch.shop_name, shop_name))
+            # Tenant-scoped: shop_name is not unique across tenants — never rename
+            # another company's location.
+            cur.execute("UPDATE public.shop SET shop_name = %s WHERE shop_name = %s"
+                        " AND (%s::bigint IS NULL OR tenant_id = %s)"
+                        " RETURNING id, shop_name, created_at, updated_at;",
+                        (patch.shop_name, shop_name, _tenant, _tenant))
             row = cur.fetchone()
         conn.commit()
     if not row:
@@ -6888,11 +6989,15 @@ def standalone_update_shop(shop_name: str, patch: StandaloneShopUpdate):
     return {"message": "Shop updated", "item": {"id": row[0], "shop_name": row[1], "created_at": row[2], "updated_at": row[3]}}
 
 @app.delete("/shop/{shop_name}")
-def standalone_delete_shop(shop_name: str, force: bool = Query(False)):
+def standalone_delete_shop(shop_name: str, force: bool = Query(False), user: Dict = Depends(get_current_user)):
+    require_perm(user, "manage_shops")
+    _tenant = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM public.shop WHERE shop_name = %s LIMIT 1;", (shop_name,))
+                cur.execute("SELECT id FROM public.shop WHERE shop_name = %s"
+                            " AND (%s::bigint IS NULL OR tenant_id = %s) LIMIT 1;",
+                            (shop_name, _tenant, _tenant))
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Shop not found")
@@ -7136,6 +7241,7 @@ def wipe_all_videos_from_device(mobile_id: str, user: Dict = Depends(get_current
     This does NOT delete videos from S3 or remove links from the database.
     It only tells the device to clear its local storage.
     """
+    require_perm(user, "manage_devices")
     with pg_conn() as conn:
         try:
             with conn.cursor() as ac:
