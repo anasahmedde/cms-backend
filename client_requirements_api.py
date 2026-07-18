@@ -22,7 +22,7 @@ from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 
 from database import pg_conn
-from tenant_context import get_current_user, require_permission, log_audit, active_sessions
+from tenant_context import get_current_user, require_permission, require_perm, log_audit, active_sessions
 from websocket_routes import notify_device_status, notify_pending_approvals
 from video_service import presign_get_object, _parse_s3_link
 
@@ -155,14 +155,16 @@ def set_storage_limit(
     user: Dict = Depends(get_current_user)
 ):
     """Set the storage limit percentage for a device."""
+    require_perm(user, "manage_devices")
+    _tenant = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 UPDATE public.device 
                 SET storage_limit_percent = %s, updated_at = NOW()
-                WHERE mobile_id = %s
+                WHERE mobile_id = %s AND (%s::bigint IS NULL OR tenant_id = %s)
                 RETURNING id;
-            """, (limit_percent, mobile_id))
+            """, (limit_percent, mobile_id, _tenant, _tenant))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Device not found")
@@ -502,6 +504,7 @@ def set_device_expiration(
     user: Dict = Depends(get_current_user)
 ):
     """Quick way to set expiration for a single device."""
+    require_perm(user, "manage_devices")
     tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
     
     with pg_conn() as conn:
@@ -541,6 +544,7 @@ def set_device_expiration(
 @router.delete("/device/{mobile_id}/expiration")
 def remove_device_expiration(mobile_id: str, user: Dict = Depends(get_current_user)):
     """Remove expiration from a device."""
+    require_perm(user, "manage_devices")
     tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
     
     with pg_conn() as conn:

@@ -428,6 +428,32 @@ def stop_impersonation(token: str):
 # AUDIT LOGGING
 # ══════════════════════════════════════════════════════════════
 
+def require_perm(user: Dict, *perms: str) -> None:
+    """Permission gate for dashboard mutations using the dict-style user from
+    get_current_user: the caller must hold at least ONE of the given permission
+    flags. Platform users with company.full_access bypass (same rule as
+    TenantContext.has_permission). Pair with tenant-scoped SQL — this checks
+    WHAT the user may do, that checks WHOSE data it touches. Never use on
+    device-facing routes (heartbeat etc.) — those have no user."""
+    user_perms = user.get("permissions") or []
+    if user.get("user_type") == "platform" and "company.full_access" in user_perms:
+        return
+    if not any(p in user_perms for p in perms):
+        raise HTTPException(status_code=403,
+                            detail=f"Permission denied: {' or '.join(perms)} required")
+
+
+def require_user_tenant(user: Dict) -> int:
+    """The tenant a dashboard mutation is scoped to. Unlike the legacy
+    `... or 1` fallback, a caller with NO tenant (platform user not
+    impersonating) gets a 400 instead of silently operating on tenant 1."""
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id")
+    if not tenant_id:
+        raise HTTPException(status_code=400,
+                            detail="No company context. Platform users must impersonate a company first.")
+    return int(tenant_id)
+
+
 def log_audit(conn, tenant_id, user_id, action, resource_type=None,
               resource_id=None, details=None, ip_address=None):
     """
