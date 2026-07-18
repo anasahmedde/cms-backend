@@ -1954,17 +1954,17 @@ def _submit_content_approval(conn, cur, ctx: TenantContext, *, action: str, scop
             "superseded_request_ids": superseded}
 
 
-def _notify_pending_approvals_count(background_tasks: BackgroundTasks, tenant_id: int) -> None:
-    """Push the tenant's fresh pending count to the dashboard WS badge. Call AFTER
-    the submitting transaction commits (uses its own connection, like the
-    /content-changes create endpoint does)."""
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT COUNT(*) FROM public.content_change_request
-                WHERE tenant_id = %s AND status = 'pending';
-            """, (tenant_id,))
-            count = cur.fetchone()[0]
+def _notify_pending_approvals_count(background_tasks: BackgroundTasks, cur, tenant_id: int) -> None:
+    """Queue the tenant's pending count for the dashboard WS badge. Counts on the
+    CALLER's cursor (pre-commit, so the just-inserted request is included) —
+    never opens a second pooled connection while the endpoint still holds one,
+    which could deadlock an exhausted pool. The WS send itself runs after the
+    response via BackgroundTasks."""
+    cur.execute("""
+        SELECT COUNT(*) FROM public.content_change_request
+        WHERE tenant_id = %s AND status = 'pending';
+    """, (tenant_id,))
+    count = cur.fetchone()[0]
     background_tasks.add_task(notify_pending_approvals, tenant_id, count)
 
 
@@ -2035,8 +2035,8 @@ def clear_company_zone_overrides(zone_key: str, background_tasks: BackgroundTask
                 pending = _submit_content_approval(conn, cur, ctx, action="clear_overrides",
                                                    scope="company", zone_key=zone_key,
                                                    zone_label=zone_key, payload=None)
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
                 conn.commit()
-                _notify_pending_approvals_count(background_tasks, ctx.active_tenant_id)
                 return pending
             cur.execute("""
                 DELETE FROM public.template_zone_content
@@ -2073,8 +2073,8 @@ def put_company_zone_content(zone_key: str, body: ZoneContentIn, background_task
                                                    zone_key=zone_key,
                                                    zone_label=zone.get("name") or zone_key,
                                                    payload=payload)
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
                 conn.commit()
-                _notify_pending_approvals_count(background_tasks, ctx.active_tenant_id)
                 return pending
             saved = _upsert_zone_content(conn, cur, ctx.active_tenant_id, zone, zone_key,
                                          "company", None, None, body.payload, ctx.user_id)
@@ -2101,8 +2101,8 @@ async def upload_company_zone_media(zone_key: str, background_tasks: BackgroundT
                                                    zone_key=zone_key,
                                                    zone_label=zone.get("name") or zone_key,
                                                    payload=payload)
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
                 conn.commit()
-                _notify_pending_approvals_count(background_tasks, ctx.active_tenant_id)
                 return pending
             saved = await _upload_zone_media(conn, cur, ctx.active_tenant_id, zone, zone_key,
                                              "company", None, None, file, ctx.user_id)
@@ -2142,8 +2142,8 @@ def put_shop_zone_content(shop_id: int, zone_key: str, body: ZoneContentIn,
                                                    zone_label=zone.get("name") or zone_key,
                                                    payload=payload, shop_id=shop_id,
                                                    target_name=shop[1])
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
                 conn.commit()
-                _notify_pending_approvals_count(background_tasks, ctx.active_tenant_id)
                 return pending
             saved = _upsert_zone_content(conn, cur, ctx.active_tenant_id, zone, zone_key,
                                          "shop", shop_id, None, body.payload, ctx.user_id)
@@ -2172,8 +2172,8 @@ async def upload_shop_zone_media(shop_id: int, zone_key: str, background_tasks: 
                                                    zone_label=zone.get("name") or zone_key,
                                                    payload=payload, shop_id=shop_id,
                                                    target_name=shop[1])
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
                 conn.commit()
-                _notify_pending_approvals_count(background_tasks, ctx.active_tenant_id)
                 return pending
             saved = await _upload_zone_media(conn, cur, ctx.active_tenant_id, zone, zone_key,
                                              "shop", shop_id, None, file, ctx.user_id)
@@ -2215,8 +2215,8 @@ def put_group_zone_content(group_id: int, zone_key: str, body: ZoneContentIn,
                                                    zone_label=zone.get("name") or zone_key,
                                                    payload=payload, group_id=group_id,
                                                    target_name=grp[1])
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
                 conn.commit()
-                _notify_pending_approvals_count(background_tasks, ctx.active_tenant_id)
                 return pending
             saved = _upsert_zone_content(conn, cur, ctx.active_tenant_id, zone, zone_key,
                                          "group", None, None, body.payload, ctx.user_id,
@@ -2238,8 +2238,8 @@ def delete_group_zone_content(group_id: int, zone_key: str, background_tasks: Ba
                                                    zone_key=zone_key, zone_label=zone_key,
                                                    payload=None, group_id=group_id,
                                                    target_name=grp[1])
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
                 conn.commit()
-                _notify_pending_approvals_count(background_tasks, ctx.active_tenant_id)
                 return pending
             cur.execute("""
                 DELETE FROM public.template_zone_group_content
@@ -2277,8 +2277,8 @@ async def upload_group_zone_media(group_id: int, zone_key: str, background_tasks
                                                    zone_label=zone.get("name") or zone_key,
                                                    payload=payload, group_id=group_id,
                                                    target_name=grp[1])
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
                 conn.commit()
-                _notify_pending_approvals_count(background_tasks, ctx.active_tenant_id)
                 return pending
             saved = await _upload_zone_media(conn, cur, ctx.active_tenant_id, zone, zone_key,
                                              "group", None, None, file, ctx.user_id,
@@ -2322,8 +2322,8 @@ def put_device_zone_content(device_id: int, zone_key: str, body: ZoneContentIn,
                                                    zone_label=zone.get("name") or zone_key,
                                                    payload=payload, device_id=device_id,
                                                    target_name=dev[1])
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
                 conn.commit()
-                _notify_pending_approvals_count(background_tasks, ctx.active_tenant_id)
                 return pending
             saved = _upsert_zone_content(conn, cur, ctx.active_tenant_id, zone, zone_key,
                                          "device", None, device_id, body.payload, ctx.user_id)
@@ -2344,8 +2344,8 @@ def delete_device_zone_content(device_id: int, zone_key: str, background_tasks: 
                                                    zone_key=zone_key, zone_label=zone_key,
                                                    payload=None, device_id=device_id,
                                                    target_name=dev[1])
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
                 conn.commit()
-                _notify_pending_approvals_count(background_tasks, ctx.active_tenant_id)
                 return pending
             cur.execute("""
                 DELETE FROM public.template_zone_content
@@ -2382,8 +2382,8 @@ async def upload_device_zone_media(device_id: int, zone_key: str, background_tas
                                                    zone_label=zone.get("name") or zone_key,
                                                    payload=payload, device_id=device_id,
                                                    target_name=dev[1])
+                _notify_pending_approvals_count(background_tasks, cur, ctx.active_tenant_id)
                 conn.commit()
-                _notify_pending_approvals_count(background_tasks, ctx.active_tenant_id)
                 return pending
             saved = await _upload_zone_media(conn, cur, ctx.active_tenant_id, zone, zone_key,
                                              "device", None, device_id, file, ctx.user_id)
