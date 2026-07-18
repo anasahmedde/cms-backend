@@ -18,8 +18,10 @@ Include in device_video_shop_group.py:
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+
+from tenant_context import get_current_user, require_perm
 
 from database import pg_conn
 
@@ -192,14 +194,18 @@ def gender_series(mobile_id: str, range: str = "24h"):
 
 
 @router.post("/device/{mobile_id}/gender-enabled")
-def set_gender_enabled(mobile_id: str, body: GenderEnabledIn):
+def set_gender_enabled(mobile_id: str, body: GenderEnabledIn,
+                       user: dict = Depends(get_current_user)):
     """Toggle the camera gender-counting feature for a device (from the dashboard)."""
+    require_perm(user, "manage_devices")
+    _tenant = user.get("active_tenant_id") or user.get("tenant_id")
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE public.device SET gender_counting_enabled = %s WHERE mobile_id = %s RETURNING id;",
-                    (body.enabled, mobile_id),
+                    "UPDATE public.device SET gender_counting_enabled = %s WHERE mobile_id = %s"
+                    " AND (%s::bigint IS NULL OR tenant_id = %s) RETURNING id;",
+                    (body.enabled, mobile_id, _tenant, _tenant),
                 )
                 if not cur.fetchone():
                     conn.rollback()
