@@ -157,3 +157,48 @@ class TestCanonicalizePayloadS3:
     def test_s3_and_empty_pass_through(self):
         p = _canonicalize_payload_s3({"media_s3": "s3://b/k.mp4", "bg_image_s3": None})
         assert p["media_s3"] == "s3://b/k.mp4" and p["bg_image_s3"] is None
+
+
+class TestRestrictPreviewToContent:
+    """Content-only bulk (editor role): non-content rows become errors."""
+
+    def _preview(self, rows):
+        return {
+            "rows": rows,
+            "errors": [],
+            "summary": {"total_rows": len(rows), "will_create": 1, "will_pending": 1,
+                        "will_update": 2, "will_unchanged": 0, "error_rows": 0,
+                        "new_shops": ["S"], "new_groups": ["G"], "valid": True},
+        }
+
+    def test_creates_and_noncontent_changes_error(self):
+        from bulk_enrollment_api import _restrict_preview_to_content
+        rows = [
+            {"row": 2, "action": "create", "changes": []},
+            {"row": 3, "action": "pending", "changes": []},
+            {"row": 4, "action": "update",
+             "changes": [{"field": "name"}, {"field": "content.headline"}]},
+            {"row": 5, "action": "update", "changes": [{"field": "content.promo"}]},
+            {"row": 6, "action": "unchanged", "changes": []},
+        ]
+        out = _restrict_preview_to_content(self._preview(rows))
+        actions = {r["row"]: r["action"] for r in out["rows"]}
+        assert actions == {2: "error", 3: "error", 4: "error", 5: "update", 6: "unchanged"}
+        assert out["summary"]["valid"] is False
+        assert out["summary"]["error_rows"] == 3
+        assert out["summary"]["will_create"] == 0 and out["summary"]["will_pending"] == 0
+        assert out["summary"]["new_shops"] == [] and out["summary"]["new_groups"] == []
+        assert out["summary"]["content_only"] is True
+        reasons = " ".join(e["reason"] for e in out["errors"])
+        assert "would add a screen" in reasons and "also changes: name" in reasons
+
+    def test_content_only_sheet_stays_valid(self):
+        from bulk_enrollment_api import _restrict_preview_to_content
+        rows = [
+            {"row": 2, "action": "update", "changes": [{"field": "content.headline"}]},
+            {"row": 3, "action": "unchanged", "changes": []},
+        ]
+        out = _restrict_preview_to_content(self._preview(rows))
+        assert out["summary"]["valid"] is True
+        assert out["summary"]["will_update"] == 1
+        assert all(r["action"] != "error" for r in out["rows"])
