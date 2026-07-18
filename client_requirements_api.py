@@ -1293,6 +1293,46 @@ def _execute_content_change(cur, request_id: int, request_type: str, target_type
                     shop_id, device_id, change_data.get("payload") or {},
                     change_data.get("requested_by"), group_id=group_id)
 
+        elif request_type == "template_content_bulk":
+            # A whole bulk-sheet content batch parked by an editor. Apply item by
+            # item so one screen deleted between submit and approval can't sink
+            # the other screens' changes; failures are collected into
+            # execution_error (surfaced by the review response).
+            import template_api as tpl_api
+
+            items = change_data.get("items") or []
+            requested_by = change_data.get("requested_by")
+            item_errors = []
+            applied = 0
+            for it in items:
+                try:
+                    did = it["device_id"]
+                    tpl = tpl_api._effective_template(cur, tenant_id, device_id=did)
+                    if not tpl:
+                        raise ValueError("no linked template")
+                    zone = tpl_api._content_zone_or_422(tpl, it["zone_key"])
+                    tpl_api._upsert_zone_content(
+                        cur.connection, cur, tenant_id, zone, it["zone_key"],
+                        "device", None, did, it.get("payload") or {}, requested_by)
+                    applied += 1
+                except Exception as ex:
+                    label = f"{it.get('device_name') or it.get('device_id')} / {it.get('zone_key')}"
+                    item_errors.append(f"{label}: {ex}")
+            job_id = change_data.get("job_id")
+            if job_id:
+                cur.execute("""
+                    UPDATE public.bulk_import_job
+                    SET status = 'committed',
+                        report = COALESCE(report, '{}'::jsonb)
+                                 || jsonb_build_object('applied', %s, 'failed', %s),
+                        finished_at = NOW()
+                    WHERE id = %s AND tenant_id = %s;
+                """, (applied, len(item_errors), job_id, tenant_id))
+            if item_errors:
+                raise ValueError(
+                    f"{len(item_errors)} of {len(items)} content writes failed "
+                    f"({applied} applied): " + "; ".join(item_errors[:5]))
+
         # Log success
         print(f"[APPROVAL] Executed content change request #{request_id}: {request_type} on {target_type}:{target_id}")
         
