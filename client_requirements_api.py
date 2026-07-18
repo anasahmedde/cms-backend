@@ -687,6 +687,41 @@ def get_media_preview_urls(
     return results
 
 
+@router.get("/content-changes/{request_id}/media-urls")
+def content_change_media_urls(request_id: int, user: Dict = Depends(get_current_user)):
+    """Presigned preview URLs for the S3 media a template-content request would
+    apply, so reviewers can SEE what they approve. Tenant-scoped by the request
+    row — only refs stored inside this tenant's own request are presigned."""
+    tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT change_data FROM public.content_change_request
+                WHERE id = %s AND tenant_id = %s;
+            """, (request_id, tenant_id))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Request not found")
+    change_data = row[0]
+    if isinstance(change_data, str):
+        import json
+        change_data = json.loads(change_data)
+    payload = (change_data or {}).get("payload") or {}
+    out = {"media_type": payload.get("media_type")}
+    for field, key in (("media_s3", "media_url"), ("bg_image_s3", "bg_image_url"),
+                       ("qr_generated_s3", "qr_url")):
+        uri = payload.get(field)
+        url = None
+        if isinstance(uri, str) and uri:
+            try:
+                bucket, k = _parse_s3_link(uri)
+                url = presign_get_object(bucket, k) if k else None
+            except Exception:
+                url = None
+        out[key] = url
+    return out
+
+
 @router.get("/company/approval-settings")
 def get_approval_settings(user: Dict = Depends(get_current_user)):
     """Get content approval settings for the company."""
@@ -887,17 +922,21 @@ def create_content_change_request(body: ContentChangeRequestIn, background_tasks
 def list_content_change_requests(
     user: Dict = Depends(get_current_user),
     status: str = Query("pending", description="Filter by status: pending, approved, rejected, all"),
+    request_type: Optional[str] = Query(None, description="Filter by request type, e.g. template_content"),
     limit: int = Query(50, le=200)
 ):
     """List content change requests."""
     tenant_id = user.get("active_tenant_id") or user.get("tenant_id") or 1
-    
+
     with pg_conn() as conn:
         with conn.cursor() as cur:
             status_filter = "" if status == "all" else "AND ccr.status = %s"
             params = [tenant_id]
             if status != "all":
                 params.append(status)
+            if request_type:
+                status_filter += " AND ccr.request_type = %s"
+                params.append(request_type)
             params.append(limit)
             
             cur.execute(f"""
@@ -1011,16 +1050,24 @@ def review_content_change_request(
             """, (new_status, user_id, body.review_note, request_id))
             
             # If approved, execute the change
+            execution_error = None
             if body.action == "approve":
                 import json
                 change_data_dict = json.loads(change_data) if isinstance(change_data, str) else change_data
-                _execute_content_change(cur, request_id, request_type, target_type, 
+                _execute_content_change(cur, request_id, request_type, target_type,
                                        target_id, change_data_dict, tenant_id)
                 cur.execute("""
-                    UPDATE public.content_change_request 
+                    UPDATE public.content_change_request
                     SET executed_at = NOW() WHERE id = %s;
                 """, (request_id,))
-            
+                # _execute_content_change swallows failures into execution_error —
+                # surface it so the reviewer never sees a clean "approved" while
+                # nothing was actually applied.
+                cur.execute("SELECT execution_error FROM public.content_change_request WHERE id = %s;",
+                            (request_id,))
+                erow = cur.fetchone()
+                execution_error = erow[0] if erow else None
+
         conn.commit()
 
         # Count remaining pending requests for this tenant to push via WS
@@ -1038,7 +1085,8 @@ def review_content_change_request(
         "request_id": request_id,
         "status": new_status,
         "reviewed_by": user_id,
-        "review_note": body.review_note
+        "review_note": body.review_note,
+        "execution_error": execution_error,
     }
 
 
@@ -1193,6 +1241,57 @@ def _execute_content_change(cur, request_id: int, request_type: str, target_type
                         UPDATE public.device SET download_status = FALSE, needs_refresh = TRUE, updated_at = NOW()
                         WHERE id IN (SELECT did FROM public.device_assignment WHERE gid = %s);
                     """, (gid,))
+
+        elif request_type == "template_content":
+            # Template zone content parked by template_api's approval diversion.
+            # Replay through the same helpers a direct approver write uses, so
+            # validation, QR generation and the content-stamp bump (live-table
+            # updated_at → devices refetch) behave identically.
+            import template_api as tpl_api
+
+            action = change_data.get("action") or "put"
+            scope = change_data.get("scope")
+            zone_key = change_data.get("zone_key")
+            shop_id = change_data.get("shop_id")
+            device_id = change_data.get("device_id")
+            group_id = change_data.get("group_id")
+
+            if action == "clear_overrides":
+                cur.execute("""
+                    DELETE FROM public.template_zone_content
+                    WHERE tenant_id = %s AND zone_key = %s AND scope IN ('shop', 'device');
+                """, (tenant_id, zone_key))
+                cur.execute("""
+                    DELETE FROM public.template_zone_group_content
+                    WHERE tenant_id = %s AND zone_key = %s;
+                """, (tenant_id, zone_key))
+            elif action == "delete":
+                if scope == "group":
+                    cur.execute("""
+                        DELETE FROM public.template_zone_group_content
+                        WHERE tenant_id = %s AND zone_key = %s AND group_id = %s;
+                    """, (tenant_id, zone_key, group_id))
+                else:
+                    cur.execute("""
+                        DELETE FROM public.template_zone_content
+                        WHERE tenant_id = %s AND zone_key = %s AND scope = 'device' AND device_id = %s;
+                    """, (tenant_id, zone_key, device_id))
+            else:
+                # Re-resolve the zone against the CURRENT effective template so a
+                # layout that changed since submission still validates correctly.
+                if scope == "group":
+                    tpl = tpl_api._effective_template(cur, tenant_id, group_id=group_id)
+                elif scope == "device":
+                    tpl = tpl_api._effective_template(cur, tenant_id, device_id=device_id)
+                else:
+                    tpl = tpl_api._tenant_template(cur, tenant_id)
+                if not tpl:
+                    raise ValueError("The company no longer has a linked template")
+                zone = tpl_api._content_zone_or_422(tpl, zone_key)
+                tpl_api._upsert_zone_content(
+                    cur.connection, cur, tenant_id, zone, zone_key, scope,
+                    shop_id, device_id, change_data.get("payload") or {},
+                    change_data.get("requested_by"), group_id=group_id)
 
         # Log success
         print(f"[APPROVAL] Executed content change request #{request_id}: {request_type} on {target_type}:{target_id}")
