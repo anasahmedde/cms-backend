@@ -994,9 +994,7 @@ def _commit_content_only(body: "CommitIn", ctx: TenantContext,
                     if not hit:
                         continue
                     did = hit[0]
-                    cur.execute("SELECT sid, gid FROM public.device_assignment WHERE did = %s LIMIT 1;", (did,))
-                    asg = cur.fetchone()
-                    sid, gid = (asg[0], asg[1]) if asg else (None, None)
+                    sid, gid = tpl_api._device_shop_group_ids(cur, did)
                     effective = tpl_api._collapse_content(cur, tenant_id, sid, did, gid)
                     for zone_key in sorted(changed_zones):
                         payload = (r.get("content") or {}).get(zone_key)
@@ -1006,6 +1004,12 @@ def _commit_content_only(body: "CommitIn", ctx: TenantContext,
                         merged = dict(effective.get(zone_key) or {})
                         merged.pop("qr_generated_s3", None)
                         merged.update(dict(payload))
+                        # A library/s3 pick from the sheet REPLACES the media — an
+                        # inherited external media_url must not survive the merge
+                        # (resolve_zone prefers media_url over media_s3, so the
+                        # screen would keep playing the old URL).
+                        if payload.get("media_s3") and not payload.get("media_url"):
+                            merged.pop("media_url", None)
                         items.append({"device_id": did, "device_name": r.get("device_name") or mid,
                                       "zone_key": zone_key,
                                       "zone_label": zone.get("name") or zone_key,
@@ -1141,9 +1145,7 @@ def bulk_commit(body: CommitIn, background_tasks: BackgroundTasks,
                     # and blanks the zone. Seeding from the effective content keeps the
                     # shown media and applies the edit on top (a per-screen override, which
                     # is exactly what bulk device content is).
-                    cur.execute("SELECT sid, gid FROM public.device_assignment WHERE did = %s LIMIT 1;", (did,))
-                    _asg = cur.fetchone()
-                    _sid, _gid = (_asg[0], _asg[1]) if _asg else (None, None)
+                    _sid, _gid = tpl_api._device_shop_group_ids(cur, did)
                     effective = tpl_api._collapse_content(cur, tenant_id, _sid, did, _gid)
                     for zone_key, payload in (row.get("content") or {}).items():
                         if only_zones is not None and zone_key not in only_zones:
@@ -1158,6 +1160,12 @@ def bulk_commit(body: CommitIn, background_tasks: BackgroundTasks,
                         merged = dict(effective.get(zone_key) or {})
                         merged.pop("qr_generated_s3", None)
                         merged.update(dict(payload))
+                        # A library/s3 pick from the sheet REPLACES the media — an
+                        # inherited external media_url must not survive the merge
+                        # (resolve_zone prefers media_url over media_s3, so the
+                        # screen would keep playing the old URL).
+                        if payload.get("media_s3") and not payload.get("media_url"):
+                            merged.pop("media_url", None)
                         tpl_api._upsert_zone_content(conn, cur, tenant_id, zone, zone_key,
                                                      "device", None, did, merged, ctx.user_id)
                         content_written += 1
