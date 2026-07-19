@@ -1004,6 +1004,12 @@ def _commit_content_only(body: "CommitIn", ctx: TenantContext,
                         merged = dict(effective.get(zone_key) or {})
                         merged.pop("qr_generated_s3", None)
                         merged.update(dict(payload))
+                        # A library/s3 pick from the sheet REPLACES the media — an
+                        # inherited external media_url must not survive the merge
+                        # (resolve_zone prefers media_url over media_s3, so the
+                        # screen would keep playing the old URL).
+                        if payload.get("media_s3") and not payload.get("media_url"):
+                            merged.pop("media_url", None)
                         items.append({"device_id": did, "device_name": r.get("device_name") or mid,
                                       "zone_key": zone_key,
                                       "zone_label": zone.get("name") or zone_key,
@@ -1154,6 +1160,12 @@ def bulk_commit(body: CommitIn, background_tasks: BackgroundTasks,
                         merged = dict(effective.get(zone_key) or {})
                         merged.pop("qr_generated_s3", None)
                         merged.update(dict(payload))
+                        # A library/s3 pick from the sheet REPLACES the media — an
+                        # inherited external media_url must not survive the merge
+                        # (resolve_zone prefers media_url over media_s3, so the
+                        # screen would keep playing the old URL).
+                        if payload.get("media_s3") and not payload.get("media_url"):
+                            merged.pop("media_url", None)
                         tpl_api._upsert_zone_content(conn, cur, tenant_id, zone, zone_key,
                                                      "device", None, did, merged, ctx.user_id)
                         content_written += 1
