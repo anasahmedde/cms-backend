@@ -710,20 +710,39 @@ def content_change_media_urls(request_id: int, user: Dict = Depends(get_current_
     if isinstance(change_data, str):
         import json
         change_data = json.loads(change_data)
+
+    def presign_payload(payload):
+        entry = {"media_type": payload.get("media_type")}
+        for field, key in (("media_s3", "media_url"), ("bg_image_s3", "bg_image_url"),
+                           ("qr_generated_s3", "qr_url")):
+            uri = payload.get(field)
+            url = None
+            if isinstance(uri, str) and uri:
+                try:
+                    bucket, k = _parse_s3_link(uri)
+                    url = presign_get_object(bucket, k) if k else None
+                except Exception:
+                    url = None
+            entry[key] = url
+        # External URLs render directly — the reviewer still gets a preview.
+        if not entry["media_url"] and payload.get("media_url"):
+            entry["media_url"] = payload["media_url"]
+        return entry
+
+    items = (change_data or {}).get("items")
+    if isinstance(items, list):
+        # Bulk batch: one preview per item (capped — huge sheets stay snappy;
+        # the modal says how many previews were skipped).
+        cap = 24
+        out_items = {}
+        for i, it in enumerate(items[:cap]):
+            entry = presign_payload(it.get("payload") or {})
+            if entry.get("media_url") or entry.get("qr_url"):
+                out_items[str(i)] = entry
+        return {"items": out_items, "preview_cap": cap, "total_items": len(items)}
+
     payload = (change_data or {}).get("payload") or {}
-    out = {"media_type": payload.get("media_type")}
-    for field, key in (("media_s3", "media_url"), ("bg_image_s3", "bg_image_url"),
-                       ("qr_generated_s3", "qr_url")):
-        uri = payload.get(field)
-        url = None
-        if isinstance(uri, str) and uri:
-            try:
-                bucket, k = _parse_s3_link(uri)
-                url = presign_get_object(bucket, k) if k else None
-            except Exception:
-                url = None
-        out[key] = url
-    return out
+    return presign_payload(payload)
 
 
 @router.get("/company/approval-settings")
