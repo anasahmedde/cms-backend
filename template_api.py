@@ -733,6 +733,33 @@ def _linked_companies(cur, tid: int) -> List[Dict]:
             for r in rows]
 
 
+def _device_shop_group_ids(cur, device_id: int):
+    """(sid, gid) a device resolves content through: device_assignment first,
+    then the legacy content-link table for whichever of the two is missing
+    (devices assigned via the Assign page may exist only there). The player
+    resolver, the per-device content STAMP and the bulk merge-seeding must all
+    use THIS — when the stamp derives membership more narrowly than the
+    resolver, a group/location edit renders on refetch but never changes the
+    stamp, so the screen never refetches ("approved but the phone doesn't
+    update")."""
+    cur.execute("SELECT sid, gid FROM public.device_assignment WHERE did = %s LIMIT 1;",
+                (device_id,))
+    asg = cur.fetchone() or (None, None)
+    sid, gid = asg[0], asg[1]
+    if sid is None or gid is None:
+        cur.execute("""
+            SELECT sid, gid FROM public.device_video_shop_group
+            WHERE did = %s ORDER BY id DESC LIMIT 1;
+        """, (device_id,))
+        lrow = cur.fetchone()
+        if lrow:
+            if sid is None:
+                sid = lrow[0]
+            if gid is None:
+                gid = lrow[1]
+    return sid, gid
+
+
 def _company_template_stamp(cur, tenant_id: int, device_id: Optional[int] = None):
     """(template_version, template_stamp) for a company — or, with device_id,
     for THAT device's effective template (screen > group > company default), so
@@ -764,10 +791,9 @@ def _company_template_stamp(cur, tenant_id: int, device_id: Optional[int] = None
         # tenant-wide epoch meant one single-screen edit re-stamped EVERY screen
         # in the company — a full-tenant refetch herd inside one heartbeat
         # period, and pointless template re-renders on unaffected screens.
-        cur.execute("SELECT sid, gid FROM public.device_assignment WHERE did = %s LIMIT 1;",
-                    (device_id,))
-        asg = cur.fetchone() or (None, None)
-        sid, gid = asg[0], asg[1]
+        # Membership MUST come from the same derivation the resolver uses
+        # (incl. the legacy-link fallback) — see _device_shop_group_ids.
+        sid, gid = _device_shop_group_ids(cur, device_id)
         cur.execute("""
             SELECT COALESCE((MAX(EXTRACT(EPOCH FROM updated_at)) * 1000)::bigint, 0) FROM (
                 SELECT updated_at FROM public.template_zone_content
@@ -2477,29 +2503,17 @@ def device_template(mobile_id: str):
             if not tpl:
                 raise HTTPException(status_code=404, detail="No template linked")
 
-            cur.execute("""
-                SELECT da.sid, s.shop_name, c.name, da.gid
-                FROM public.device d
-                LEFT JOIN public.device_assignment da ON da.did = d.id
-                LEFT JOIN public.shop s ON s.id = da.sid
-                LEFT JOIN public.company c ON c.id = d.tenant_id
-                WHERE d.id = %s;
-            """, (did,))
-            arow = cur.fetchone() or (None, None, None, None)
-            shop_id, shop_name, company_name, group_id = arow
-            if shop_id is None or group_id is None:
-                # Fallback: shop/group via the content-link table (device may predate device_assignment).
-                cur.execute("""
-                    SELECT l.sid, s.shop_name, l.gid FROM public.device_video_shop_group l
-                    LEFT JOIN public.shop s ON s.id = l.sid
-                    WHERE l.did = %s ORDER BY l.id DESC LIMIT 1;
-                """, (did,))
-                lrow = cur.fetchone()
-                if lrow:
-                    if shop_id is None:
-                        shop_id, shop_name = lrow[0], lrow[1]
-                    if group_id is None:
-                        group_id = lrow[2]
+            # ONE membership derivation shared with the stamp (assignment +
+            # legacy-link fallback) — see _device_shop_group_ids.
+            shop_id, group_id = _device_shop_group_ids(cur, did)
+            cur.execute("SELECT name FROM public.company WHERE id = %s;", (tenant_id,))
+            crow = cur.fetchone()
+            company_name = crow[0] if crow else None
+            shop_name = None
+            if shop_id is not None:
+                cur.execute("SELECT shop_name FROM public.shop WHERE id = %s;", (shop_id,))
+                srow = cur.fetchone()
+                shop_name = srow[0] if srow else None
 
             entity = {"company.name": company_name, "shop.name": shop_name, "device.name": device_name}
             content = _collapse_content(cur, tenant_id, shop_id, did, group_id)
