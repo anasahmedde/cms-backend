@@ -994,9 +994,7 @@ def _commit_content_only(body: "CommitIn", ctx: TenantContext,
                     if not hit:
                         continue
                     did = hit[0]
-                    cur.execute("SELECT sid, gid FROM public.device_assignment WHERE did = %s LIMIT 1;", (did,))
-                    asg = cur.fetchone()
-                    sid, gid = (asg[0], asg[1]) if asg else (None, None)
+                    sid, gid = tpl_api._device_shop_group_ids(cur, did)
                     effective = tpl_api._collapse_content(cur, tenant_id, sid, did, gid)
                     for zone_key in sorted(changed_zones):
                         payload = (r.get("content") or {}).get(zone_key)
@@ -1141,9 +1139,7 @@ def bulk_commit(body: CommitIn, background_tasks: BackgroundTasks,
                     # and blanks the zone. Seeding from the effective content keeps the
                     # shown media and applies the edit on top (a per-screen override, which
                     # is exactly what bulk device content is).
-                    cur.execute("SELECT sid, gid FROM public.device_assignment WHERE did = %s LIMIT 1;", (did,))
-                    _asg = cur.fetchone()
-                    _sid, _gid = (_asg[0], _asg[1]) if _asg else (None, None)
+                    _sid, _gid = tpl_api._device_shop_group_ids(cur, did)
                     effective = tpl_api._collapse_content(cur, tenant_id, _sid, did, _gid)
                     for zone_key, payload in (row.get("content") or {}).items():
                         if only_zones is not None and zone_key not in only_zones:
