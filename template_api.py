@@ -235,10 +235,10 @@ def validate_content_payload(zone_type: str, payload: Any) -> List[str]:
     bg_keys = {"bg_color", "bg_gradient", "bg_image_url", "bg_image_s3"}
     media_keys = {"media_s3", "media_url", "media_type", "fit_mode"}
     allowed = {
-        "text": {"text", "text_color", "run_texts"} | bg_keys,
+        "text": {"text", "text_color", "run_texts", "text_fit"} | bg_keys,
         "media": media_keys,
         "qr": {"qr_mode", "qr_link", "qr_generated_s3"} | media_keys,
-        "ticker": {"text", "text_color", "run_texts"} | bg_keys,
+        "ticker": {"text", "text_color", "run_texts", "text_fit"} | bg_keys,
         "clock": {"text_color", "format"} | bg_keys,
         "playlist": set(),
     }.get(zone_type)
@@ -281,6 +281,9 @@ def validate_content_payload(zone_type: str, payload: Any) -> List[str]:
     fm = payload.get("fit_mode")
     if fm is not None and fm not in ("cover", "contain", "fill", "none"):
         errors.append("fit_mode must be cover, contain, fill, or none")
+    tf = payload.get("text_fit")
+    if tf is not None and tf not in ("fill", "none"):
+        errors.append("text fit must be auto (fill the box) or none")
     if zone_type == "qr":
         mode = payload.get("qr_mode")
         if mode is not None and mode not in QR_MODES:
@@ -515,6 +518,11 @@ def resolve_zone(zone: Dict, entity: Dict[str, Optional[str]],
         t_payload = content.get(zone.get("key")) or {}
         t_text = t_payload.get("text")
         run_texts = t_payload.get("run_texts") if isinstance(t_payload.get("run_texts"), dict) else {}
+        # Sheet fit column ('auto'/'none') / dashboard Text-size select: the
+        # tenant may switch auto-fit per scope; it overrides the designer's
+        # checkbox (style.text_fit) like media fit_mode overrides its default.
+        if t_payload.get("text_fit") in ("fill", "none"):
+            out["style"]["text_fit"] = t_payload["text_fit"]
         runs = zc.get("runs") if isinstance(zc.get("runs"), list) and zc.get("runs") else None
         if runs:
             runs = [dict(r) for r in runs]
@@ -529,7 +537,25 @@ def resolve_zone(zone: Dict, entity: Dict[str, Optional[str]],
                     idx = int(k) - 1
                     if 0 <= idx < len(runs):
                         runs[idx] = dict(runs[idx], text=words)
-            out["content"]["runs"] = runs
+            if t_text and not run_texts and len(runs) > 1:
+                # A PLAIN text (sheet .text / dashboard Text with no per-item
+                # values) TAKES OVER the box (user decision 2026-07-21): the
+                # designer's items are the template — style and position — not
+                # extra lines, so only item 1 renders, carrying the tenant's
+                # words. The per-item columns keep the composition instead.
+                runs = runs[:1]
+            if out["style"].get("text_fit") == "fill" and t_text and not run_texts:
+                # Auto-fit + a single tenant text: render through the plain-
+                # text path so the words can grow and center across the box
+                # (the runs path draws items at their designed size/position).
+                # Item 1's designed color/weight still applies.
+                out["content"]["text"] = t_text
+                if runs[0].get("text_color") is not None:
+                    out["content"]["text_color"] = runs[0]["text_color"]
+                if runs[0].get("bold"):
+                    out["style"]["bold"] = True
+            else:
+                out["content"]["runs"] = runs
         elif t_text:
             out["content"]["text"] = t_text
 

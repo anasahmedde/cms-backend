@@ -378,14 +378,47 @@ class TestTextZoneTenantOverride:
         out = resolve_zone(self.NAME_ZONE, ENTITY, content, FAKE_PRESIGN)
         assert [r["text"] for r in out["content"]["runs"]] == ["Easypaisa", "tagline"]
 
-    def test_tenant_text_replaces_words_keeps_designed_look(self):
+    def test_plain_text_takes_over_the_box(self):
+        # User decision 2026-07-21: a plain text (sheet .text / dashboard Text
+        # with NO per-item values) is THE text of the box — the designer's
+        # items are the template (style/position), not extra lines. Only item
+        # 1 renders, in its designed look, carrying the tenant's words.
         out = resolve_zone(self.NAME_ZONE, ENTITY, {"hdr": {"text": "EID SALE"}}, FAKE_PRESIGN)
         runs = out["content"]["runs"]
+        assert len(runs) == 1                              # other items dropped
         assert runs[0]["text"] == "EID SALE"               # new words…
         assert runs[0]["text_color"] == "#22a06b"          # …designed color
         assert runs[0]["bold"] is True                     # …designed weight
         assert runs[0]["font_size_vh"] == 60               # …designed size
-        assert runs[1] == self.NAME_ZONE["content"]["runs"][1]  # other items intact
+
+    def test_plain_text_with_per_item_values_keeps_composition(self):
+        # Any per-item value signals composition editing: all items stay,
+        # the named ones get new words.
+        content = {"hdr": {"text": "EID SALE", "run_texts": {"2": "3 days"}}}
+        out = resolve_zone(self.NAME_ZONE, ENTITY, content, FAKE_PRESIGN)
+        assert [r["text"] for r in out["content"]["runs"]] == ["EID SALE", "3 days"]
+
+    def test_text_fit_auto_with_plain_text_renders_plain_path(self):
+        # Auto-fit + a single tenant text: emit content.text (no runs) so the
+        # players' auto-fit plain-text path can grow and center the words.
+        zone = dict(self.NAME_ZONE, style={"text_fit": "fill"})
+        out = resolve_zone(zone, ENTITY, {"hdr": {"text": "EID SALE"}}, FAKE_PRESIGN)
+        assert out["content"].get("runs") is None
+        assert out["content"]["text"] == "EID SALE"
+        assert out["style"]["text_fit"] == "fill"
+        # item 1's designed look carries over to the plain path
+        assert out["content"]["text_color"] == "#22a06b"
+        assert out["style"]["bold"] is True
+
+    def test_tenant_text_fit_overrides_designer(self):
+        # Sheet fit column 'auto'/'none' beats the designer checkbox per scope.
+        zone = {"key": "s", "type": "text", "x": 0, "y": 0, "w": 10, "h": 10,
+                "binding": {"source": "static"}, "content": {"text": "Fixed"}}
+        out = resolve_zone(zone, ENTITY, {"s": {"text": "Big", "text_fit": "fill"}}, FAKE_PRESIGN)
+        assert out["style"]["text_fit"] == "fill"
+        zone_on = dict(zone, style={"text_fit": "fill"})
+        out = resolve_zone(zone_on, ENTITY, {"s": {"text_fit": "none"}}, FAKE_PRESIGN)
+        assert out["style"]["text_fit"] == "none"
 
     def test_tenant_text_overrides_static_zone_without_runs(self):
         zone = {"key": "s", "type": "text", "x": 0, "y": 0, "w": 10, "h": 10,

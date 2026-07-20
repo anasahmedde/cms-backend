@@ -51,6 +51,28 @@ class TestFitCells:
         from bulk_enrollment_api import _cell_of
         assert _cell_of("fit", {"fit_mode": "fill"}, {}) == "fill"
 
+    def test_text_fit_cell_parses_to_text_fit(self):
+        # 'auto' on a TEXT zone's fit column = grow to fill + center (text_fit).
+        from bulk_enrollment_api import _parse_row_content
+        cols = [("content.hdr.fit", "hdr", "fit", "text")]
+        payloads, errors = _parse_row_content(None, 1, cols, {"content.hdr.fit": "Auto"})
+        assert errors == []
+        assert payloads == {"hdr": {"text_fit": "fill"}}
+        payloads, errors = _parse_row_content(None, 1, cols, {"content.hdr.fit": "none"})
+        assert errors == []
+        assert payloads == {"hdr": {"text_fit": "none"}}
+
+    def test_text_fit_bad_value_errors(self):
+        from bulk_enrollment_api import _parse_row_content
+        cols = [("content.hdr.fit", "hdr", "fit", "text")]
+        _, errors = _parse_row_content(None, 1, cols, {"content.hdr.fit": "cover"})
+        assert any("text fit must be auto" in e for e in errors)
+
+    def test_text_fit_round_trips_through_export(self):
+        from bulk_enrollment_api import _cell_of
+        assert _cell_of("fit", {"text_fit": "fill"}, {}) == "auto"
+        assert _cell_of("fit", {"text_fit": "none"}, {}) == "none"
+
     def test_qr_fit_cell_parses_and_validates(self):
         # The qr-typed fit column takes the same vocabulary (fit_mode is an
         # allowed qr payload key), so 'stretch' works on QR boxes too.
@@ -76,13 +98,13 @@ class TestContentColumns:
                   "content": {"runs": [{"text": "Big"}, {"text": "small"}, {"text": "tiny"}]}}]
         cols = content_columns_for(zones)
         headers = [c[0] for c in cols]
-        assert headers == ["content.hdr.text", "content.hdr.text2", "content.hdr.text3"]
+        assert headers == ["content.hdr.text", "content.hdr.text2", "content.hdr.text3", "content.hdr.fit"]
         assert ("content.hdr.text2", "hdr", "text2", "text") in cols
 
     def test_single_item_text_zone_stays_one_column(self):
         zones = [{"key": "hdr", "type": "text", "binding": {"source": "static"},
                   "content": {"runs": [{"text": "only"}]}}]
-        assert [c[0] for c in content_columns_for(zones)] == ["content.hdr.text"]
+        assert [c[0] for c in content_columns_for(zones)] == ["content.hdr.text", "content.hdr.fit"]
 
     def test_textn_cells_parse_into_run_texts(self):
         from bulk_enrollment_api import _parse_row_content
@@ -111,20 +133,21 @@ class TestContentColumns:
         assert ("content.menu_qr.fit", "menu_qr", "fit", "qr") in cols
 
     def test_text_zone_is_text_only(self):
-        # Styling (bg/colors) is designer-owned — the sheet carries content only.
+        # Styling is designer-owned; the sheet carries the words + the
+        # auto-fit switch (fit column: auto/none).
         zones = [{"key": "hdr", "type": "text", "binding": {"source": "content"}}]
         headers = [c[0] for c in content_columns_for(zones)]
-        assert headers == ["content.hdr.text"]
+        assert headers == ["content.hdr.text", "content.hdr.fit"]
 
     def test_name_bound_text_zone_gets_a_column(self):
         # EVERY text box is sheet-fillable (2026-07-18): a name binding is only
         # the default, a sheet value overrides it on that screen.
         zones = [{"key": "hdr", "type": "text", "binding": {"source": "company.name"}}]
-        assert [c[0] for c in content_columns_for(zones)] == ["content.hdr.text"]
+        assert [c[0] for c in content_columns_for(zones)] == ["content.hdr.text", "content.hdr.fit"]
 
     def test_static_text_zone_gets_a_column(self):
         zones = [{"key": "note", "type": "text", "binding": {"source": "static"}}]
-        assert [c[0] for c in content_columns_for(zones)] == ["content.note.text"]
+        assert [c[0] for c in content_columns_for(zones)] == ["content.note.text", "content.note.fit"]
 
     def test_clock_zone_has_no_columns(self):
         zones = [{"key": "clk", "type": "clock", "binding": {"source": "content"}}]
