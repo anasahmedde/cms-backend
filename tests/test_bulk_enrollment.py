@@ -19,6 +19,39 @@ class TestContentSummary:
         assert _content_summary({}) == ""
 
 
+class TestFitCells:
+    """The sheet's content.<zone>.fit column: 'stretch' is the user-facing
+    alias for fill (stretch to the WHOLE box — no crop, no bars, may distort).
+    The stored value stays CSS-canonical so exports and players share one
+    vocabulary."""
+
+    COLS = [("content.promo.fit", "promo", "fit", "media")]
+
+    def _parse(self, cell):
+        from bulk_enrollment_api import _parse_row_content
+        return _parse_row_content(None, 1, self.COLS, {"content.promo.fit": cell})
+
+    def test_stretch_alias_normalizes_to_fill(self):
+        payloads, errors = self._parse("Stretch")
+        assert errors == []
+        assert payloads == {"promo": {"fit_mode": "fill"}}
+
+    def test_canonical_values_pass_through(self):
+        for v in ("cover", "contain", "fill", "none"):
+            payloads, errors = self._parse(v)
+            assert errors == []
+            assert payloads["promo"]["fit_mode"] == v
+
+    def test_unknown_fit_errors(self):
+        _, errors = self._parse("zoom")
+        assert any("fit_mode must be cover, contain, fill, or none" in e for e in errors)
+
+    def test_fill_round_trips_through_export(self):
+        # The export cell re-parses to the same payload → re-upload is a no-op.
+        from bulk_enrollment_api import _cell_of
+        assert _cell_of("fit", {"fit_mode": "fill"}, {}) == "fill"
+
+
 class TestContentColumns:
     def test_media_zone_gets_media_and_fit_columns(self):
         zones = [{"key": "promo", "type": "media", "binding": {"source": "content"}}]
