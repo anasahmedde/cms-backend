@@ -190,6 +190,10 @@ def validate_zones(zones: Any) -> List[str]:
                 errors.append(f"{where}: style.bold must be a boolean")
             if style.get("fit_mode") is not None and style["fit_mode"] not in ("cover", "contain", "fill", "none"):
                 errors.append(f"{where}: style.fit_mode must be cover|contain|fill|none")
+            # Auto-fit & center for text zones (designer checkbox): the text
+            # twin of media fit=fill — words scale to fill the box, centered.
+            if style.get("text_fit") is not None and style["text_fit"] not in ("fill", "none"):
+                errors.append(f"{where}: style.text_fit must be fill|none")
             ts = style.get("ticker_speed")
             if ts is not None and (isinstance(ts, bool) or not isinstance(ts, (int, float)) or not (1 <= ts <= 100)):
                 errors.append(f"{where}: style.ticker_speed must be a number 1-100")
@@ -231,10 +235,10 @@ def validate_content_payload(zone_type: str, payload: Any) -> List[str]:
     bg_keys = {"bg_color", "bg_gradient", "bg_image_url", "bg_image_s3"}
     media_keys = {"media_s3", "media_url", "media_type", "fit_mode"}
     allowed = {
-        "text": {"text", "text_color"} | bg_keys,
+        "text": {"text", "text_color", "run_texts"} | bg_keys,
         "media": media_keys,
         "qr": {"qr_mode", "qr_link", "qr_generated_s3"} | media_keys,
-        "ticker": {"text", "text_color"} | bg_keys,
+        "ticker": {"text", "text_color", "run_texts"} | bg_keys,
         "clock": {"text_color", "format"} | bg_keys,
         "playlist": set(),
     }.get(zone_type)
@@ -246,6 +250,19 @@ def validate_content_payload(zone_type: str, payload: Any) -> List[str]:
     text = payload.get("text")
     if text is not None and (not isinstance(text, str) or len(text) > 5000):
         errors.append("text must be a string of at most 5000 characters")
+    # Per-item words for a multi-item designer composition: {"2": words, ...}
+    # (item 1 is the plain 'text' field, sheet column .text — kept for
+    # backward compatibility with stored payloads and old sheets).
+    rt = payload.get("run_texts")
+    if rt is not None:
+        if not isinstance(rt, dict):
+            errors.append("run_texts must be an object of {item number: words}")
+        else:
+            for k, v in rt.items():
+                if not (isinstance(k, str) and k.isdigit() and 2 <= int(k) <= 40):
+                    errors.append("run_texts keys must be item numbers \"2\"-\"40\" (item 1 is 'text')")
+                elif not isinstance(v, str) or len(v) > 2000:
+                    errors.append(f"run_texts[{k}] must be a string of at most 2000 characters")
     for color_field in ("bg_color", "text_color"):
         cv = payload.get(color_field)
         if cv is not None and (not isinstance(cv, str) or not HEX_COLOR_RE.match(cv)):
@@ -495,11 +512,23 @@ def resolve_zone(zone: Dict, entity: Dict[str, Optional[str]],
     # style. Percentages in runs are zone-relative, so players render them at
     # any resolution.
     if ztype in ("text", "ticker"):
-        t_text = (content.get(zone.get("key")) or {}).get("text")
+        t_payload = content.get(zone.get("key")) or {}
+        t_text = t_payload.get("text")
+        run_texts = t_payload.get("run_texts") if isinstance(t_payload.get("run_texts"), dict) else {}
         runs = zc.get("runs") if isinstance(zc.get("runs"), list) and zc.get("runs") else None
         if runs:
+            runs = [dict(r) for r in runs]
             if t_text:
-                runs = [dict(runs[0], text=t_text)] + [dict(r) for r in runs[1:]]
+                runs[0] = dict(runs[0], text=t_text)
+            # Sheet .text2..textN / dashboard "Text N" fields: replace item N's
+            # WORDS, keep its designed position/style. Indexes beyond the
+            # current composition are ignored (a redesign may have removed
+            # items) — rewritten server-side, so players need no changes.
+            for k, words in run_texts.items():
+                if isinstance(k, str) and k.isdigit() and words:
+                    idx = int(k) - 1
+                    if 0 <= idx < len(runs):
+                        runs[idx] = dict(runs[idx], text=words)
             out["content"]["runs"] = runs
         elif t_text:
             out["content"]["text"] = t_text

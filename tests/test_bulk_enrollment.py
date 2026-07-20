@@ -70,6 +70,38 @@ class TestContentColumns:
         # the fit column is tagged so the parser routes it to fit_mode
         assert ("content.promo.fit", "promo", "fit", "media") in cols
 
+    def test_multi_item_text_zone_gets_a_column_per_item(self):
+        # A designer composition with 3 text items → .text (item 1) + .text2 + .text3.
+        zones = [{"key": "hdr", "type": "text", "binding": {"source": "static"},
+                  "content": {"runs": [{"text": "Big"}, {"text": "small"}, {"text": "tiny"}]}}]
+        cols = content_columns_for(zones)
+        headers = [c[0] for c in cols]
+        assert headers == ["content.hdr.text", "content.hdr.text2", "content.hdr.text3"]
+        assert ("content.hdr.text2", "hdr", "text2", "text") in cols
+
+    def test_single_item_text_zone_stays_one_column(self):
+        zones = [{"key": "hdr", "type": "text", "binding": {"source": "static"},
+                  "content": {"runs": [{"text": "only"}]}}]
+        assert [c[0] for c in content_columns_for(zones)] == ["content.hdr.text"]
+
+    def test_textn_cells_parse_into_run_texts(self):
+        from bulk_enrollment_api import _parse_row_content
+        cols = [("content.hdr.text", "hdr", "text", "text"),
+                ("content.hdr.text2", "hdr", "text2", "text"),
+                ("content.hdr.text3", "hdr", "text3", "text")]
+        payloads, errors = _parse_row_content(None, 1, cols, {
+            "content.hdr.text": "EID SALE", "content.hdr.text3": "3 days only"})
+        assert errors == []
+        # blank text2 leaves item 2 alone (inherit the designed words)
+        assert payloads == {"hdr": {"text": "EID SALE", "run_texts": {"3": "3 days only"}}}
+
+    def test_textn_cell_round_trips_through_export(self):
+        from bulk_enrollment_api import _cell_of
+        pl = {"text": "EID SALE", "run_texts": {"3": "3 days only"}}
+        assert _cell_of("text", pl, {}) == "EID SALE"
+        assert _cell_of("text2", pl, {}) == ""
+        assert _cell_of("text3", pl, {}) == "3 days only"
+
     def test_qr_zone_gets_qr_and_fit_columns(self):
         # QR boxes take a fit too (blank = the square scannable card).
         zones = [{"key": "menu_qr", "type": "qr", "binding": {"source": "content"}}]
