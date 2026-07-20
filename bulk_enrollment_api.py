@@ -104,7 +104,8 @@ _ZONE_HELP = {
     "fit": ("stretch",
             "how the image/video fits its box: cover (fill & crop), contain (show the whole thing, bars if the shapes differ), "
             "stretch (fill the WHOLE box — no crop, no bars; distorts if the file's shape differs; 'fill' works too), or none. Blank = leave as-is. "
-            "If contain makes a video look tiny, the FILE itself has black bars baked in — use stretch or cover, or re-export the file at the box's size."),
+            "If contain makes a video look tiny, the FILE itself has black bars baked in — use stretch or cover, or re-export the file at the box's size. "
+            "On QR boxes: blank keeps the square white QR card (scans best); setting a fit drops the card and fills the box like a media box."),
 }
 
 
@@ -132,6 +133,9 @@ def content_columns_for(zones) -> list:
             cols.append((f"content.{key}.fit", key, "fit", zt))
         elif zt == "qr":
             cols.append((f"content.{key}.qr", key, "qr", zt))
+            # QR boxes take a fit too: blank keeps the square scannable QR
+            # card; an explicit fit renders the box like a media box.
+            cols.append((f"content.{key}.fit", key, "fit", zt))
     return cols
 
 

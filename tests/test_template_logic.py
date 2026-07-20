@@ -291,6 +291,23 @@ class TestResolveZone:
         assert out["style"]["fit_mode"] == "fill"
         assert out["content"]["media_url"] == "https://signed.example/wide.jpg"
 
+    def test_qr_fit_fill_folds_into_style(self):
+        # QR boxes take a fit too: the players read style.fit_mode and render
+        # the box media-style (no quiet-zone card) when it is set.
+        content = {"qr": {"qr_mode": "image", "media_s3": "s3://bucket/art.png",
+                          "media_type": "image", "fit_mode": "fill"}}
+        out = resolve_zone(WHITEBOARD_ZONES[2], ENTITY, content, FAKE_PRESIGN)
+        assert out["style"]["fit_mode"] == "fill"
+        assert out["content"]["media_url"] == "https://signed.example/art.png"
+
+    def test_qr_without_fit_keeps_style_unset(self):
+        # No fit on the payload → style.fit_mode stays absent → players keep
+        # the square scannable QR card default.
+        content = {"qr": {"qr_mode": "image", "media_s3": "s3://bucket/code.png",
+                          "media_type": "image"}}
+        out = resolve_zone(WHITEBOARD_ZONES[2], ENTITY, content, FAKE_PRESIGN)
+        assert "fit_mode" not in (out.get("style") or {})
+
     def test_text_zone_words_only_tenant_styling_ignored(self):
         # Theme is designer-owned ALWAYS (user decision 2026-07-18): a stored
         # payload color must not restyle the box — only the words apply.
