@@ -101,10 +101,24 @@ _ZONE_HELP = {
     "text": ("50% OFF this week", "the text to show on this screen"),
     "bg": ("#111827  (or  #0a1628 -> #f59e0b @135  for a gradient, or an image URL)",
            "a #hex color, a gradient like '#0a1628 -> #f59e0b @135', or an image URL/name"),
-    "fit": ("contain",
-            "how the image/video fits its box: cover (fill & crop), contain (show the whole thing), fill (stretch), or none. Blank = leave as-is. "
-            "If contain makes a video look tiny, the FILE itself has black bars baked in — use cover, or re-export the file at the box's size."),
+    "fit": ("stretch",
+            "how the image/video fits its box: cover (fill & crop), contain (show the whole thing, bars if the shapes differ), "
+            "stretch (fill the WHOLE box — no crop, no bars; distorts if the file's shape differs; 'fill' works too), or none. Blank = leave as-is. "
+            "If contain makes a video look tiny, the FILE itself has black bars baked in — use stretch or cover, or re-export the file at the box's size. "
+            "On QR boxes: blank keeps the square white QR card (scans best); setting a fit drops the card and fills the box like a media box."),
 }
+
+
+def _help_of(field: str):
+    """(example, help) for a content column. textN columns (a text box whose
+    designer composition holds several text items) get derived guidance."""
+    if field in _ZONE_HELP:
+        return _ZONE_HELP[field]
+    if field.startswith("text") and field[4:].isdigit():
+        n = field[4:]
+        return ("", f"the words for text item {n} in this box — the designer composed several items; "
+                    f"position/colors/size stay as designed, this sets only item {n}'s words. Blank = keep the designed words")
+    return ("", "content")
 
 
 def content_columns_for(zones) -> list:
@@ -126,11 +140,21 @@ def content_columns_for(zones) -> list:
         key, zt = z.get("key"), z.get("type")
         if zt in ("text", "ticker"):
             cols.append((f"content.{key}.text", key, "text", zt))
+            # A designer composition with several text items gets one column
+            # per item: .text = item 1 (backward-compatible), .text2..textN =
+            # the rest. Each sets only that item's WORDS (styling designer-owned).
+            runs = (z.get("content") or {}).get("runs")
+            n = len(runs) if isinstance(runs, list) else 0
+            for i in range(2, min(n, 40) + 1):
+                cols.append((f"content.{key}.text{i}", key, f"text{i}", zt))
         elif zt == "media":
             cols.append((f"content.{key}.media", key, "media", zt))
             cols.append((f"content.{key}.fit", key, "fit", zt))
         elif zt == "qr":
             cols.append((f"content.{key}.qr", key, "qr", zt))
+            # QR boxes take a fit too: blank keeps the square scannable QR
+            # card; an explicit fit renders the box like a media box.
+            cols.append((f"content.{key}.fit", key, "fit", zt))
     return cols
 
 
@@ -194,6 +218,8 @@ def _cell_of(field: str, pl: Dict, lib_names: Dict[str, str]) -> str:
         return ""
     if field == "text":
         return pl.get("text") or ""
+    if field.startswith("text") and field[4:].isdigit():
+        return (pl.get("run_texts") or {}).get(field[4:]) or ""
     if field == "fit":
         return pl.get("fit_mode") or ""
     if field == "bg":
@@ -333,7 +359,7 @@ def _template_bundle(tenant_id: int):
         rows = [list(r) + ["" for _ in ccols] for r in BASE_EXAMPLE]
         if ccols and rows:
             for i, (_h, _k, field, _zt) in enumerate(ccols):
-                rows[0][len(BASE_COLUMNS) + i] = _ZONE_HELP.get(field, ("", ""))[0]
+                rows[0][len(BASE_COLUMNS) + i] = _help_of(field)[0]
     instructions = list(BASE_INSTRUCTIONS)
     if fleet:
         instructions.insert(1, f"This file lists your CURRENT {len(fleet)} screen(s) — one row each. "
@@ -353,7 +379,7 @@ def _template_bundle(tenant_id: int):
                             + ") — applies to THAT screen only and OVERRIDES its group/location/company content; "
                               "blank = keep inheriting:")
         for (h, _k, field, _zt) in ccols:
-            instructions.append(f"{h}: {_ZONE_HELP.get(field, ('', 'content'))[1]}")
+            instructions.append(f"{h}: {_help_of(field)[1]}")
     else:
         instructions.append("")
         instructions.append("(No screen template is linked to this company yet, so there are no content columns.)")
@@ -583,6 +609,10 @@ def _parse_row_content(cur, tenant_id, content_cols, raw_content):
         try:
             if field == "text":
                 pl["text"] = val
+            elif field.startswith("text") and field[4:].isdigit():
+                # text2..textN — words for the Nth designed item in this box
+                # (resolve_zone rewrites that run's text server-side).
+                pl.setdefault("run_texts", {})[field[4:]] = val
             elif field == "bg":
                 pl.update(tpl_api.parse_bg_value(cur, tenant_id, val))
             elif field == "media":
@@ -591,7 +621,10 @@ def _parse_row_content(cur, tenant_id, content_cols, raw_content):
                 # Sets only the media Fit; validate_content_payload rejects a bad
                 # value. Written into fit_mode, which the players read (style.fit_mode)
                 # — the same field the "Screen content" Fit dropdown controls.
-                pl["fit_mode"] = val.lower()
+                # 'stretch' is the sheet-friendly alias for fill (stored value
+                # stays CSS-canonical so exports/players share one vocabulary).
+                fit = val.lower()
+                pl["fit_mode"] = "fill" if fit == "stretch" else fit
             elif field == "qr":
                 pl.update(tpl_api.parse_qr_value(cur, tenant_id, val))
         except ValueError as e:

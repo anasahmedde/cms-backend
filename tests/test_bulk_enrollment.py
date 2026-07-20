@@ -19,6 +19,48 @@ class TestContentSummary:
         assert _content_summary({}) == ""
 
 
+class TestFitCells:
+    """The sheet's content.<zone>.fit column: 'stretch' is the user-facing
+    alias for fill (stretch to the WHOLE box — no crop, no bars, may distort).
+    The stored value stays CSS-canonical so exports and players share one
+    vocabulary."""
+
+    COLS = [("content.promo.fit", "promo", "fit", "media")]
+
+    def _parse(self, cell):
+        from bulk_enrollment_api import _parse_row_content
+        return _parse_row_content(None, 1, self.COLS, {"content.promo.fit": cell})
+
+    def test_stretch_alias_normalizes_to_fill(self):
+        payloads, errors = self._parse("Stretch")
+        assert errors == []
+        assert payloads == {"promo": {"fit_mode": "fill"}}
+
+    def test_canonical_values_pass_through(self):
+        for v in ("cover", "contain", "fill", "none"):
+            payloads, errors = self._parse(v)
+            assert errors == []
+            assert payloads["promo"]["fit_mode"] == v
+
+    def test_unknown_fit_errors(self):
+        _, errors = self._parse("zoom")
+        assert any("fit_mode must be cover, contain, fill, or none" in e for e in errors)
+
+    def test_fill_round_trips_through_export(self):
+        # The export cell re-parses to the same payload → re-upload is a no-op.
+        from bulk_enrollment_api import _cell_of
+        assert _cell_of("fit", {"fit_mode": "fill"}, {}) == "fill"
+
+    def test_qr_fit_cell_parses_and_validates(self):
+        # The qr-typed fit column takes the same vocabulary (fit_mode is an
+        # allowed qr payload key), so 'stretch' works on QR boxes too.
+        from bulk_enrollment_api import _parse_row_content
+        cols = [("content.menu_qr.fit", "menu_qr", "fit", "qr")]
+        payloads, errors = _parse_row_content(None, 1, cols, {"content.menu_qr.fit": "stretch"})
+        assert errors == []
+        assert payloads == {"menu_qr": {"fit_mode": "fill"}}
+
+
 class TestContentColumns:
     def test_media_zone_gets_media_and_fit_columns(self):
         zones = [{"key": "promo", "type": "media", "binding": {"source": "content"}}]
@@ -27,6 +69,46 @@ class TestContentColumns:
         assert headers == ["content.promo.media", "content.promo.fit"]
         # the fit column is tagged so the parser routes it to fit_mode
         assert ("content.promo.fit", "promo", "fit", "media") in cols
+
+    def test_multi_item_text_zone_gets_a_column_per_item(self):
+        # A designer composition with 3 text items → .text (item 1) + .text2 + .text3.
+        zones = [{"key": "hdr", "type": "text", "binding": {"source": "static"},
+                  "content": {"runs": [{"text": "Big"}, {"text": "small"}, {"text": "tiny"}]}}]
+        cols = content_columns_for(zones)
+        headers = [c[0] for c in cols]
+        assert headers == ["content.hdr.text", "content.hdr.text2", "content.hdr.text3"]
+        assert ("content.hdr.text2", "hdr", "text2", "text") in cols
+
+    def test_single_item_text_zone_stays_one_column(self):
+        zones = [{"key": "hdr", "type": "text", "binding": {"source": "static"},
+                  "content": {"runs": [{"text": "only"}]}}]
+        assert [c[0] for c in content_columns_for(zones)] == ["content.hdr.text"]
+
+    def test_textn_cells_parse_into_run_texts(self):
+        from bulk_enrollment_api import _parse_row_content
+        cols = [("content.hdr.text", "hdr", "text", "text"),
+                ("content.hdr.text2", "hdr", "text2", "text"),
+                ("content.hdr.text3", "hdr", "text3", "text")]
+        payloads, errors = _parse_row_content(None, 1, cols, {
+            "content.hdr.text": "EID SALE", "content.hdr.text3": "3 days only"})
+        assert errors == []
+        # blank text2 leaves item 2 alone (inherit the designed words)
+        assert payloads == {"hdr": {"text": "EID SALE", "run_texts": {"3": "3 days only"}}}
+
+    def test_textn_cell_round_trips_through_export(self):
+        from bulk_enrollment_api import _cell_of
+        pl = {"text": "EID SALE", "run_texts": {"3": "3 days only"}}
+        assert _cell_of("text", pl, {}) == "EID SALE"
+        assert _cell_of("text2", pl, {}) == ""
+        assert _cell_of("text3", pl, {}) == "3 days only"
+
+    def test_qr_zone_gets_qr_and_fit_columns(self):
+        # QR boxes take a fit too (blank = the square scannable card).
+        zones = [{"key": "menu_qr", "type": "qr", "binding": {"source": "content"}}]
+        cols = content_columns_for(zones)
+        headers = [c[0] for c in cols]
+        assert headers == ["content.menu_qr.qr", "content.menu_qr.fit"]
+        assert ("content.menu_qr.fit", "menu_qr", "fit", "qr") in cols
 
     def test_text_zone_is_text_only(self):
         # Styling (bg/colors) is designer-owned — the sheet carries content only.
