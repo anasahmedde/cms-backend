@@ -162,6 +162,14 @@ class TestValidateZones:
             zone = dict(WHITEBOARD_ZONES[3], style={"fit_mode": fit})
             assert validate_zones([zone]) == [], fit
 
+    def test_style_text_fit_fill_is_valid(self):
+        zone = dict(WHITEBOARD_ZONES[0], style={"text_fit": "fill"})
+        assert validate_zones([zone]) == []
+
+    def test_style_text_fit_rejects_unknown(self):
+        zone = dict(WHITEBOARD_ZONES[0], style={"text_fit": "grow"})
+        assert any("style.text_fit must be fill|none" in e for e in validate_zones([zone]))
+
     def test_style_fit_mode_rejects_unknown(self):
         zone = dict(WHITEBOARD_ZONES[3], style={"fit_mode": "zoom"})
         assert any("style.fit_mode must be cover|contain|fill|none" in e
@@ -221,6 +229,17 @@ class TestValidateContentPayload:
 
     def test_payload_must_be_object(self):
         assert validate_content_payload("text", ["nope"]) == ["payload must be an object"]
+
+    def test_run_texts_valid(self):
+        assert validate_content_payload("text", {"text": "One", "run_texts": {"2": "Two", "3": "Three"}}) == []
+
+    def test_run_texts_bad_key_and_value(self):
+        errs = validate_content_payload("text", {"run_texts": {"1": "nope"}})
+        assert any("item numbers" in e for e in errs)
+        errs = validate_content_payload("text", {"run_texts": {"2": 42}})
+        assert any("run_texts[2] must be a string" in e for e in errs)
+        errs = validate_content_payload("text", {"run_texts": ["a", "b"]})
+        assert any("run_texts must be an object" in e for e in errs)
 
     def test_media_fit_accepts_full_vocabulary(self):
         for fit in ("cover", "contain", "fill", "none"):
@@ -343,6 +362,21 @@ class TestTextZoneTenantOverride:
         out = resolve_zone(self.NAME_ZONE, ENTITY, {}, FAKE_PRESIGN)
         assert out["content"]["text"] == "MoltyFoam"
         assert out["content"]["runs"] == self.NAME_ZONE["content"]["runs"]
+
+    def test_run_texts_override_each_item_keep_designed_look(self):
+        # Sheet .text2 / dashboard "Text 2" replaces item 2's WORDS only.
+        content = {"hdr": {"text": "EID SALE", "run_texts": {"2": "3 days only"}}}
+        out = resolve_zone(self.NAME_ZONE, ENTITY, content, FAKE_PRESIGN)
+        runs = out["content"]["runs"]
+        assert runs[0]["text"] == "EID SALE"
+        assert runs[0]["text_color"] == "#22a06b" and runs[0]["bold"] is True
+        assert runs[1]["text"] == "3 days only"
+        assert runs[1]["font_size_vh"] == 15  # designed style kept
+
+    def test_run_texts_out_of_range_ignored(self):
+        content = {"hdr": {"run_texts": {"9": "ghost"}}}
+        out = resolve_zone(self.NAME_ZONE, ENTITY, content, FAKE_PRESIGN)
+        assert [r["text"] for r in out["content"]["runs"]] == ["Easypaisa", "tagline"]
 
     def test_tenant_text_replaces_words_keeps_designed_look(self):
         out = resolve_zone(self.NAME_ZONE, ENTITY, {"hdr": {"text": "EID SALE"}}, FAKE_PRESIGN)

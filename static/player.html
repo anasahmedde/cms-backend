@@ -219,8 +219,11 @@
   function textStyle(el, st, c) {
     var t = document.createElement("div");
     t.className = "txt";
-    var textColor = (c && c.text_color) || st.text_color;
-    if (textColor) t.style.color = textColor;
+    // Default to WHITE like the Android renderer and the dashboard preview —
+    // without it an uncolored text zone inherits the UA's black and vanishes
+    // on the black board.
+    var textColor = (c && c.text_color) || st.text_color || "#ffffff";
+    t.style.color = textColor;
     // font_size_vh is a % of the ZONE height; convert against the zone element.
     var vh = typeof st.font_size_vh === "number" ? st.font_size_vh : 45;
     t.style.fontSize = "min(" + (vh) + "cqh, 40vw)";
@@ -236,6 +239,40 @@
     var t = textStyle(el, st, c);
     t.textContent = text;
     el.appendChild(t);
+    if (st.text_fit === "fill" && text) fitTextFill(el, t);
+  }
+
+  // Auto-fit & center (designer checkbox → style.text_fit = "fill"): the text
+  // twin of media fit=fill — the words wrap and scale to the LARGEST size that
+  // still fits the box, centered both ways. Runs after layout so the zone has
+  // real dimensions to measure against.
+  function fitTextFill(el, t) {
+    t.style.justifyContent = "center";
+    t.style.alignItems = "center";
+    t.style.textAlign = "center";
+    var inner = document.createElement("span");
+    inner.textContent = t.textContent;
+    t.textContent = "";
+    inner.style.display = "block";
+    inner.style.maxWidth = "100%";
+    inner.style.whiteSpace = "pre-wrap";
+    inner.style.wordBreak = "break-word";
+    inner.style.lineHeight = "1.1";
+    t.appendChild(inner);
+    requestAnimationFrame(function () {
+      var boxW = el.clientWidth, boxH = el.clientHeight;
+      if (!boxW || !boxH) return; // zone not laid out — keep the styled size
+      function fits(px) {
+        inner.style.fontSize = px + "px";
+        return inner.scrollWidth <= boxW + 1 && inner.scrollHeight <= boxH + 1;
+      }
+      var lo = 4, hi = Math.max(12, boxH);
+      while (lo < hi) { // binary search the largest fitting size
+        var mid = Math.ceil((lo + hi) / 2);
+        if (fits(mid)) lo = mid; else hi = mid - 1;
+      }
+      inner.style.fontSize = lo + "px";
+    });
   }
 
   function fillTicker(el, text, st, c) {
@@ -244,8 +281,7 @@
     var mv = document.createElement("span");
     mv.className = "ticker-move";
     mv.textContent = text;
-    var tc = (c && c.text_color) || st.text_color;
-    if (tc) mv.style.color = tc;
+    mv.style.color = (c && c.text_color) || st.text_color || "#ffffff";
     var speed = typeof st.ticker_speed === "number" ? st.ticker_speed : 18;
     mv.style.animationDuration = speed + "s";
     mv.style.fontSize = "min(" + (st.font_size_vh || 60) + "cqh, 12vw)";
