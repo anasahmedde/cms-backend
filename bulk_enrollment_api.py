@@ -83,31 +83,33 @@ BASE_EXAMPLE = [
     ["Checkout Screen", "Shop Karachi 12", "North Region", "", "", "", "device id unknown - will be claimed on site"],
 ]
 BASE_INSTRUCTIONS = [
-    "DIGIX bulk device import — fill one row per screen, then upload this file.",
-    "device_name (required): a friendly name for the screen.",
-    "shop_name (required): the shop this screen belongs to; created automatically if new.",
-    "group_name (optional): a group for the screen; created automatically if new.",
-    "template (optional): the screen template THIS screen should render, by exact name. Blank = inherit from its group / the company default. Templates are never created from this sheet — the name must match one linked to your company.",
-    "device_id (optional): the device's ANDROID_ID. If you know it, the screen auto-enrolls when it powers on. Leave blank to create a 'pending' screen you claim on site.",
-    "resolution (optional): e.g. 1080x1920. Auto-detected from the device if blank.",
-    "notes (optional): free text, not shown on screens.",
+    "DIGIX screens sheet — one row = one screen. Fill it in, save, then upload it back on the dashboard.",
+    "GOLDEN RULE: a BLANK cell means 'no change'. Only fill the cells you want to change.",
+    "device_name (required): the screen's name, e.g. 'Counter screen'.",
+    "shop_name (required): the location it belongs to. A new name creates that location.",
+    "group_name (optional): a group for the screen. A new name creates that group.",
+    "template (optional): which layout this screen uses, by exact name. Blank = the company default layout.",
+    "device_id (optional): the device's ID if you know it — the screen then connects by itself. Blank = you claim it on site.",
+    "resolution (optional): like 1080x1920. Detected automatically if blank.",
+    "notes (optional): anything for yourself — never shown on screens.",
 ]
 # Per-zone example + guidance shown for the content columns (device-level content).
 _ZONE_HELP = {
     "media": ("https://example.com/promo.jpg",
-              "an image/video URL, an s3:// path, or the NAME of a video/advertisement already uploaded"),
+              "what plays in this box: paste an image/video link, or type the NAME of a file already in your Media library"),
     "qr": ("https://menu.example.com/shop12",
-           "a LINK to turn into a QR code, OR an image URL / s3:// path / library name to show as-is"),
-    "text": ("50% OFF this week", "the text to show on this screen"),
+           "paste a LINK and we turn it into a QR code — or paste an image link / a Media library file name to show as-is"),
+    "text": ("50% OFF this week",
+             "the words this box shows on this screen. Your text replaces ALL the designed words in the box "
+             "(colors/size/position still come from the layout). Blank = keep what the layout shows"),
     "bg": ("#111827  (or  #0a1628 -> #f59e0b @135  for a gradient, or an image URL)",
            "a #hex color, a gradient like '#0a1628 -> #f59e0b @135', or an image URL/name"),
     "fit": ("stretch",
-            "how the image/video fits its box: cover (fill & crop), contain (show the whole thing, bars if the shapes differ), "
-            "stretch (fill the WHOLE box — no crop, no bars; distorts if the file's shape differs; 'fill' works too), or none. Blank = leave as-is. "
-            "If contain makes a video look tiny, the FILE itself has black bars baked in — use stretch or cover, or re-export the file at the box's size. "
-            "On QR boxes: blank keeps the square white QR card (scans best); setting a fit drops the card and fills the box like a media box."),
+            "how the box is filled. Pictures/videos: stretch = fill the WHOLE box, no borders (may squash the shape) | "
+            "cover = fill and crop the edges | contain = show everything, dark bars if shapes differ | blank = no change. "
+            "QR boxes: blank = the white QR card (scans best) | stretch = the image fills the whole box, no card. "
+            "TEXT boxes: auto = the words grow to fill the box and center | none = fixed designed size | blank = the designer's setting."),
 }
-
 
 def _help_of(field: str):
     """(example, help) for a content column. textN columns (a text box whose
@@ -116,8 +118,8 @@ def _help_of(field: str):
         return _ZONE_HELP[field]
     if field.startswith("text") and field[4:].isdigit():
         n = field[4:]
-        return ("", f"the words for text item {n} in this box — the designer composed several items; "
-                    f"position/colors/size stay as designed, this sets only item {n}'s words. Blank = keep the designed words")
+        return ("", f"this box has several text items — this sets item {n}'s words only "
+                    f"(look stays as designed). Blank = keep item {n} as designed")
     return ("", "content")
 
 
@@ -147,6 +149,9 @@ def content_columns_for(zones) -> list:
             n = len(runs) if isinstance(runs, list) else 0
             for i in range(2, min(n, 40) + 1):
                 cols.append((f"content.{key}.text{i}", key, f"text{i}", zt))
+            # Auto-fit per screen: 'auto' grows the words to fill the box and
+            # centers them; 'none' keeps the fixed designed size.
+            cols.append((f"content.{key}.fit", key, "fit", zt))
         elif zt == "media":
             cols.append((f"content.{key}.media", key, "media", zt))
             cols.append((f"content.{key}.fit", key, "fit", zt))
@@ -221,6 +226,8 @@ def _cell_of(field: str, pl: Dict, lib_names: Dict[str, str]) -> str:
     if field.startswith("text") and field[4:].isdigit():
         return (pl.get("run_texts") or {}).get(field[4:]) or ""
     if field == "fit":
+        if pl.get("text_fit"):
+            return "auto" if pl["text_fit"] == "fill" else pl["text_fit"]
         return pl.get("fit_mode") or ""
     if field == "bg":
         g = pl.get("bg_gradient") or {}
@@ -373,11 +380,11 @@ def _template_bundle(tenant_id: int):
                             f"Default (used when blank): '{tpl['name']}'.")
     if ccols:
         instructions.append("")
-        instructions.append(f"Screen content (from the linked template '{tpl['name']}' v{tpl.get('version', 1)}"
-                            + (f" plus {len(templates) - 1} more linked template(s); a column fills the box with "
-                               f"that name on WHICHEVER template a screen renders" if len(templates) > 1 else "")
-                            + ") — applies to THAT screen only and OVERRIDES its group/location/company content; "
-                              "blank = keep inheriting:")
+        instructions.append(f"SCREEN CONTENT — the content.* columns fill the boxes of layout '{tpl['name']}'"
+                            + (f" (and {len(templates) - 1} more linked layout(s) — a column fills the box with "
+                               f"that name on whichever layout a screen shows)" if len(templates) > 1 else "")
+                            + ". A value changes THAT screen only, and wins over company/location/group content. "
+                              "Blank = no change:")
         for (h, _k, field, _zt) in ccols:
             instructions.append(f"{h}: {_help_of(field)[1]}")
     else:
@@ -618,13 +625,16 @@ def _parse_row_content(cur, tenant_id, content_cols, raw_content):
             elif field == "media":
                 pl.update(tpl_api.resolve_media_value(cur, tenant_id, val))
             elif field == "fit":
-                # Sets only the media Fit; validate_content_payload rejects a bad
-                # value. Written into fit_mode, which the players read (style.fit_mode)
-                # — the same field the "Screen content" Fit dropdown controls.
-                # 'stretch' is the sheet-friendly alias for fill (stored value
-                # stays CSS-canonical so exports/players share one vocabulary).
+                # validate_content_payload rejects bad values. Media/QR boxes:
+                # written into fit_mode (players read style.fit_mode); 'stretch'
+                # is the sheet-friendly alias for the CSS-canonical 'fill'.
+                # Text boxes: written into text_fit ('auto' = grow to fill the
+                # box and center — the sheet twin of the designer checkbox).
                 fit = val.lower()
-                pl["fit_mode"] = "fill" if fit == "stretch" else fit
+                if zt in ("text", "ticker"):
+                    pl["text_fit"] = "fill" if fit in ("auto", "fill", "stretch", "on") else fit
+                else:
+                    pl["fit_mode"] = "fill" if fit == "stretch" else fit
             elif field == "qr":
                 pl.update(tpl_api.parse_qr_value(cur, tenant_id, val))
         except ValueError as e:
