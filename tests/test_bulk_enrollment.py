@@ -51,6 +51,15 @@ class TestFitCells:
         from bulk_enrollment_api import _cell_of
         assert _cell_of("fit", {"fit_mode": "fill"}, {}) == "fill"
 
+    def test_qr_fit_cell_parses_and_validates(self):
+        # The qr-typed fit column takes the same vocabulary (fit_mode is an
+        # allowed qr payload key), so 'stretch' works on QR boxes too.
+        from bulk_enrollment_api import _parse_row_content
+        cols = [("content.menu_qr.fit", "menu_qr", "fit", "qr")]
+        payloads, errors = _parse_row_content(None, 1, cols, {"content.menu_qr.fit": "stretch"})
+        assert errors == []
+        assert payloads == {"menu_qr": {"fit_mode": "fill"}}
+
 
 class TestContentColumns:
     def test_media_zone_gets_media_and_fit_columns(self):
@@ -60,6 +69,14 @@ class TestContentColumns:
         assert headers == ["content.promo.media", "content.promo.fit"]
         # the fit column is tagged so the parser routes it to fit_mode
         assert ("content.promo.fit", "promo", "fit", "media") in cols
+
+    def test_qr_zone_gets_qr_and_fit_columns(self):
+        # QR boxes take a fit too (blank = the square scannable card).
+        zones = [{"key": "menu_qr", "type": "qr", "binding": {"source": "content"}}]
+        cols = content_columns_for(zones)
+        headers = [c[0] for c in cols]
+        assert headers == ["content.menu_qr.qr", "content.menu_qr.fit"]
+        assert ("content.menu_qr.fit", "menu_qr", "fit", "qr") in cols
 
     def test_text_zone_is_text_only(self):
         # Styling (bg/colors) is designer-owned — the sheet carries content only.

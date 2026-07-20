@@ -300,6 +300,10 @@
     // turned every non-square QR box into a white slab (the "white border").
     // The rest of the zone stays transparent unless the designer set a bg.
     if (!c.media_url) { placeholder(el, "QR"); return; }
+    // An explicit fit (sheet fit column / dashboard Fit dropdown) renders the
+    // box like a media zone — stretch/cover/contain across the WHOLE box, no
+    // quiet-zone card. Blank keeps the square card a scannable code needs.
+    if (st.fit_mode) { fillMedia(el, c, st); return; }
     if (c.media_type === "video") {
       var v = document.createElement("video");
       v.src = c.media_url; v.autoplay = true; v.loop = true; v.muted = true; v.playsInline = true;
