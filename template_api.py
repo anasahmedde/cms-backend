@@ -188,8 +188,8 @@ def validate_zones(zones: Any) -> List[str]:
                 errors.append(f"{where}: style.direction must be ltr|rtl")
             if style.get("bold") is not None and not isinstance(style["bold"], bool):
                 errors.append(f"{where}: style.bold must be a boolean")
-            if style.get("fit_mode") is not None and style["fit_mode"] not in ("cover", "contain"):
-                errors.append(f"{where}: style.fit_mode must be cover|contain")
+            if style.get("fit_mode") is not None and style["fit_mode"] not in ("cover", "contain", "fill", "none"):
+                errors.append(f"{where}: style.fit_mode must be cover|contain|fill|none")
             ts = style.get("ticker_speed")
             if ts is not None and (isinstance(ts, bool) or not isinstance(ts, (int, float)) or not (1 <= ts <= 100)):
                 errors.append(f"{where}: style.ticker_speed must be a number 1-100")
@@ -477,9 +477,11 @@ def resolve_zone(zone: Dict, entity: Dict[str, Optional[str]],
             bg_img = media_url_of(payload.get("bg_image_s3"), payload.get("bg_image_url"))
             if bg_img:
                 resolved["bg_image"] = bg_img
-        # Per-content fit (cover = fill+crop, contain = show whole). Folded into
-        # style, which every player already reads (style.fit_mode), so a per-image
-        # fit works with no player change and overrides the zone's designer default.
+        # Per-content fit (cover = fill+crop, contain = show whole, fill =
+        # stretch to the whole box with no crop/bars, none = original size).
+        # Folded into style, which every player already reads (style.fit_mode),
+        # so a per-image fit works with no player change and overrides the
+        # zone's designer default.
         if payload.get("fit_mode") in ("cover", "contain", "fill", "none"):
             out["style"]["fit_mode"] = payload["fit_mode"]
         out["content"] = resolved

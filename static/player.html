@@ -270,9 +270,17 @@
     setInterval(tick, 1000);
   }
 
+  // style.fit_mode → CSS object-fit. "fill" stretches to the whole box (no
+  // crop, no bars — may distort); unknown/unset falls back to cover, matching
+  // the Android renderer.
+  function fitCss(st) {
+    var f = st && st.fit_mode;
+    return (f === "contain" || f === "fill" || f === "none") ? f : "cover";
+  }
+
   function fillMedia(el, c, st) {
     if (!c.media_url) { placeholder(el, ""); return; }
-    var fit = st.fit_mode === "contain" ? "contain" : "cover";
+    var fit = fitCss(st);
     if (c.media_type === "video") {
       var v = document.createElement("video");
       v.src = c.media_url; v.autoplay = true; v.loop = true; v.muted = true;
@@ -320,7 +328,7 @@
     var host = document.createElement("div");
     host.style.cssText = "position:relative;width:100%;height:100%;background:#000;";
     el.appendChild(host);
-    var fit = st.fit_mode === "contain" ? "contain" : "cover";
+    var fit = fitCss(st);
     var media = { items: [], idx: 0 };
 
     function loadItems() {

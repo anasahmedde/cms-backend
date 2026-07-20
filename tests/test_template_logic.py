@@ -155,6 +155,18 @@ class TestValidateZones:
         zone = dict(WHITEBOARD_ZONES[0], style={"bg_color": "blue"})
         assert any("must be a hex color" in e for e in validate_zones([zone]))
 
+    def test_style_fit_mode_full_vocabulary(self):
+        # cover|contain|fill|none — fill is the "stretch to the whole box"
+        # mode the Fit dropdowns and the sheet's 'stretch' alias write.
+        for fit in ("cover", "contain", "fill", "none"):
+            zone = dict(WHITEBOARD_ZONES[3], style={"fit_mode": fit})
+            assert validate_zones([zone]) == [], fit
+
+    def test_style_fit_mode_rejects_unknown(self):
+        zone = dict(WHITEBOARD_ZONES[3], style={"fit_mode": "zoom"})
+        assert any("style.fit_mode must be cover|contain|fill|none" in e
+                   for e in validate_zones([zone]))
+
     def test_playlist_zone_requires_playlist_binding(self):
         zone = dict(WHITEBOARD_ZONES[1], binding={"source": "static"})
         assert any("must bind to 'device.playlist'" in e for e in validate_zones([zone]))
@@ -210,6 +222,16 @@ class TestValidateContentPayload:
     def test_payload_must_be_object(self):
         assert validate_content_payload("text", ["nope"]) == ["payload must be an object"]
 
+    def test_media_fit_accepts_full_vocabulary(self):
+        for fit in ("cover", "contain", "fill", "none"):
+            assert validate_content_payload("media", {"fit_mode": fit}) == [], fit
+
+    def test_media_fit_rejects_raw_stretch(self):
+        # 'stretch' is a SHEET alias normalized to fill by the bulk parser
+        # before validation — the stored vocabulary stays CSS-canonical.
+        errs = validate_content_payload("media", {"fit_mode": "stretch"})
+        assert any("fit_mode must be cover, contain, fill, or none" in e for e in errs)
+
     def test_bad_color(self):
         errs = validate_content_payload("ticker", {"bg_color": "red"})
         assert any("hex color" in e for e in errs)
@@ -259,6 +281,15 @@ class TestResolveZone:
     def test_media_zone_with_no_content_is_empty(self):
         out = resolve_zone(WHITEBOARD_ZONES[3], ENTITY, {}, FAKE_PRESIGN)
         assert out["content"] == {}
+
+    def test_media_fit_fill_folds_into_style(self):
+        # Excel 'stretch' / dropdown Stretch stores fit_mode=fill; the resolver
+        # folds it into style.fit_mode — the field every player reads.
+        content = {"promo": {"media_s3": "s3://bucket/wide.jpg", "media_type": "image",
+                             "fit_mode": "fill"}}
+        out = resolve_zone(WHITEBOARD_ZONES[3], ENTITY, content, FAKE_PRESIGN)
+        assert out["style"]["fit_mode"] == "fill"
+        assert out["content"]["media_url"] == "https://signed.example/wide.jpg"
 
     def test_text_zone_words_only_tenant_styling_ignored(self):
         # Theme is designer-owned ALWAYS (user decision 2026-07-18): a stored
