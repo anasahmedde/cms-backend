@@ -3757,6 +3757,27 @@ def get_detected_resolution(mobile_id: str):
 
 
 # ---------- Device creation with group/shop linking ----------
+def enrollment_link_plan(group_name: Optional[str], shop_name: Optional[str]) -> Dict[str, bool]:
+    """What an enrolment should link, given what the admin picked in the wizard.
+
+    Membership (device_assignment) is recorded whenever EITHER a group or a
+    location is chosen: both columns are nullable, so a screen can belong to a
+    group before it has a location. The group's PLAYLIST additionally needs a
+    location, because device_video_shop_group.sid is NOT NULL.
+
+    These were once a single `group_name and shop_name` condition, so picking
+    only a group enrolled the screen with no group at all while the wizard
+    reported success. Keep the two decisions separate.
+    """
+    has_group = bool(group_name)
+    has_shop = bool(shop_name)
+    return {
+        "write_assignment": has_group or has_shop,
+        "link_playlist": has_group and has_shop,
+        "playlist_pending_location": has_group and not has_shop,
+    }
+
+
 @app.post("/device/create")
 def create_device_with_linking(body: DeviceCreateIn, user: Dict = Depends(get_current_user)):
     """Create a new device and optionally link to group and shop."""
@@ -3824,31 +3845,62 @@ def create_device_with_linking(body: DeviceCreateIn, user: Dict = Depends(get_cu
                     "shop_name": None,
                     "resolution": body.resolution,
                     "videos_linked": 0,
+                    # True when the screen joined a group but has no location yet, so
+                    # the group's playlist could not be linked (dvsg.sid is NOT NULL).
+                    # The caller must say so instead of reporting a clean success.
+                    "playlist_pending_location": False,
                 }
                 
-                # If group and shop provided, create links for ALL videos in the group
-                if body.group_name and body.shop_name:
-                    cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (body.group_name,))
+                # Resolve whichever of group/shop the caller chose — INDEPENDENTLY.
+                # Both lookups are scoped to the caller's tenant: resolving a bare
+                # name across all companies would attach another tenant's group
+                # whenever two companies use the same name (the newest id won).
+                gid = sid = None
+                if body.group_name:
+                    cur.execute('SELECT id FROM public."group" WHERE gname = %s AND tenant_id = %s'
+                                ' ORDER BY id DESC LIMIT 1;', (body.group_name, tenant_id))
                     grow = cur.fetchone()
                     if not grow:
                         conn.rollback()
                         raise HTTPException(status_code=404, detail=f"Group not found: {body.group_name}")
                     gid = grow[0]
-                    
-                    cur.execute("SELECT id FROM public.shop WHERE shop_name = %s ORDER BY id DESC LIMIT 1;", (body.shop_name,))
+
+                if body.shop_name:
+                    cur.execute("SELECT id FROM public.shop WHERE shop_name = %s AND tenant_id = %s"
+                                " ORDER BY id DESC LIMIT 1;", (body.shop_name, tenant_id))
                     srow = cur.fetchone()
                     if not srow:
                         conn.rollback()
                         raise HTTPException(status_code=404, detail=f"Shop not found: {body.shop_name}")
                     sid = srow[0]
-                    
-                    # Create device_assignment record
+
+                # Membership is recorded whenever EITHER was chosen. device_assignment.sid
+                # and .gid are both nullable, so a screen can be grouped before it has a
+                # location — previously this whole block was gated on group AND shop, so
+                # picking only a group enrolled the screen ungrouped while the wizard
+                # reported success.
+                plan = enrollment_link_plan(body.group_name, body.shop_name)
+                if plan["write_assignment"]:
                     cur.execute("""
                         INSERT INTO public.device_assignment (did, gid, sid)
                         VALUES (%s, %s, %s)
-                        ON CONFLICT (did) DO UPDATE SET gid = %s, sid = %s, updated_at = NOW();
-                    """, (did, gid, sid, gid, sid))
-                    
+                        ON CONFLICT (did) DO UPDATE SET
+                            gid = COALESCE(EXCLUDED.gid, public.device_assignment.gid),
+                            sid = COALESCE(EXCLUDED.sid, public.device_assignment.sid),
+                            updated_at = NOW();
+                    """, (did, gid, sid))
+                    result["linked_to_group"] = gid is not None
+                    result["linked_to_shop"] = sid is not None
+                    result["gname"] = body.group_name if gid is not None else None
+                    result["shop_name"] = body.shop_name if sid is not None else None
+
+                # Playlist links additionally need a shop: device_video_shop_group.sid
+                # is NOT NULL, so the group's videos can only be linked once the screen
+                # has a location. A grouped-but-location-less screen is still a real
+                # member of the group and picks the playlist up when a location is set.
+                result["playlist_pending_location"] = plan["playlist_pending_location"]
+
+                if plan["link_playlist"]:
                     # Get ALL videos from group_video table (primary source)
                     cur.execute("""
                         SELECT v.id, v.video_name
@@ -3894,11 +3946,7 @@ def create_device_with_linking(body: DeviceCreateIn, user: Dict = Depends(get_cu
                     
                     # Mark device for download
                     cur.execute("UPDATE public.device SET download_status = FALSE, updated_at = NOW() WHERE id = %s;", (did,))
-                    
-                    result["linked_to_group"] = True
-                    result["linked_to_shop"] = True
-                    result["gname"] = body.group_name
-                    result["shop_name"] = body.shop_name
+
                     result["videos_linked"] = videos_linked
             
             conn.commit()
