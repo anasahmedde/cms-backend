@@ -68,10 +68,17 @@ def _bulk_mode(ctx: TenantContext) -> str:
         return "content"
     raise HTTPException(status_code=403, detail="Permission denied: manage_devices required")
 
-BASE_COLUMNS = ["device_name", "shop_name", "group_name", "template", "device_id", "resolution", "notes"]
-BASE_WIDTHS = [26, 22, 18, 22, 22, 12, 30]
+BASE_COLUMNS = ["device_name", "shop_name", "group_name", "template", "template_set_at",
+                "device_id", "resolution", "notes"]
+BASE_WIDTHS = [26, 22, 18, 22, 20, 22, 12, 30]
 COLUMNS = BASE_COLUMNS  # back-compat alias
 REQUIRED = ["device_name", "shop_name"]
+# Read-only: exported so the sheet can SHOW where a layout comes from, never read
+# back. Listing it here keeps _rows_from from mistaking it for an editable field.
+READONLY_COLUMNS = {"template_set_at"}
+# Typing this in the template cell removes the screen's own override and lets it
+# follow its group / the company default again (the dashboard's "Inherited").
+INHERIT_WORDS = {"inherit", "inherited", "default", "company default"}
 RESOLUTION_RE = re.compile(r"^\d{2,5}x\d{2,5}$")
 MOBILE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 PENDING_PREFIX = "pending:"
@@ -79,8 +86,8 @@ MAX_ROWS = 20000
 COMMIT_BATCH = 500
 
 BASE_EXAMPLE = [
-    ["Main Entrance Screen", "Shop Karachi 12", "North Region", "", "a1b2c3d4e5f6a7b8", "1080x1920", "landscape TV at door"],
-    ["Checkout Screen", "Shop Karachi 12", "North Region", "", "", "", "device id unknown - will be claimed on site"],
+    ["Main Entrance Screen", "Shop Karachi 12", "North Region", "", "", "a1b2c3d4e5f6a7b8", "1080x1920", "landscape TV at door"],
+    ["Checkout Screen", "Shop Karachi 12", "North Region", "", "", "", "", "device id unknown - will be claimed on site"],
 ]
 BASE_INSTRUCTIONS = [
     "DIGIX screens sheet — one row = one screen. Fill it in, save, then upload it back on the dashboard.",
@@ -88,7 +95,11 @@ BASE_INSTRUCTIONS = [
     "device_name (required): the screen's name, e.g. 'Counter screen'.",
     "shop_name (required): the location it belongs to. A new name creates that location.",
     "group_name (optional): a group for the screen. A new name creates that group.",
-    "template (optional): which layout this screen uses, by exact name. Blank = the company default layout.",
+    "template (optional): the layout this screen shows. It is filled in for you with what the screen "
+    "is showing RIGHT NOW — leave it alone and nothing changes. Type another layout's exact name to move "
+    "just this screen onto it, or type 'inherited' to let it follow its group / the company default again.",
+    "template_set_at (read-only): where that layout comes from — 'this screen', 'group <name>' or "
+    "'company default'. Anything you type here is ignored.",
     "device_id (optional): the device's ID if you know it — the screen then connects by itself. Blank = you claim it on site.",
     "resolution (optional): like 1080x1920. Detected automatically if blank.",
     "notes (optional): anything for yourself — never shown on screens.",
@@ -243,7 +254,42 @@ def _cell_of(field: str, pl: Dict, lib_names: Dict[str, str]) -> str:
     return ""
 
 
-def _fleet_rows(cur, tenant_id: int, ccols) -> Tuple[list, list]:
+def _effective_template_map(cur, tenant_id: int, device_ids, templates):
+    """{device_id: (template_name, set_at)} — the layout each screen ACTUALLY
+    renders, with the level that decided it. Mirrors template_api._effective_
+    template (screen > group > company default) in bulk: a name only counts
+    when it is still one of the company's usable templates, which is what
+    _template_if_usable enforces one device at a time.
+
+    The sheet shows this, not the screen's raw override, so a layout assigned
+    on a GROUP (or left on the company default) is visible when you download —
+    the dashboard and the sheet can no longer disagree about what is on air."""
+    out: Dict[int, Tuple[str, str]] = {}
+    ids = [d for d in (device_ids or []) if d]
+    if not ids:
+        return out
+    usable = {t["id"]: t["name"] for t in (templates or [])}
+    default_name = next((t["name"] for t in (templates or []) if t.get("is_default")), "")
+    cur.execute("""
+        SELECT d.id, d.template_id, g.template_id, COALESCE(g.gname, '')
+        FROM public.device d
+        LEFT JOIN public.device_assignment da ON da.did = d.id
+        LEFT JOIN public."group" g ON g.id = da.gid
+        WHERE d.tenant_id = %s AND d.id = ANY(%s);
+    """, (tenant_id, ids))
+    for did, dev_tpl, grp_tpl, gname in cur.fetchall():
+        if dev_tpl in usable:
+            out[did] = (usable[dev_tpl], "this screen")
+        elif grp_tpl in usable:
+            out[did] = (usable[grp_tpl], f"group {gname}" if gname else "its group")
+        elif default_name:
+            out[did] = (default_name, "company default")
+        else:
+            out[did] = ("", "")
+    return out
+
+
+def _fleet_rows(cur, tenant_id: int, ccols, templates=None) -> Tuple[list, list]:
     """(sheet_rows, devices) — one row per existing screen (newest row per
     mobile_id, the row the player resolves). Content cells carry the screen's
     OWN device-scope values; blank = inherits group/location/company."""
@@ -273,13 +319,18 @@ def _fleet_rows(cur, tenant_id: int, ccols) -> Tuple[list, list]:
         """, (tenant_id, [d[0] for d in devs]))
         for did, zk, pl in cur.fetchall():
             own.setdefault(did, {})[zk] = json.loads(pl) if isinstance(pl, str) else pl
+    eff_tpl = _effective_template_map(cur, tenant_id, [d[0] for d in devs], templates)
     rows = []
-    for did, mid, name, res, shop, grp, activation, tpl_override, _grp_tpl in devs:
+    for did, mid, name, res, shop, grp, activation, _tpl_override, _grp_tpl in devs:
         pending = mid.startswith(PENDING_PREFIX)
         note = f"pending — claim on site (code {activation})" if pending and activation else ""
-        # template cell = the screen's OWN override only; blank = inherits
-        # (group/company) — mirrors the blank-means-leave-as-is grammar.
-        base = [name or "", shop, grp, tpl_override, mid or "", res, note]
+        # template cell = what this screen ACTUALLY renders (screen override,
+        # else its group's, else the company default) and template_set_at names
+        # the level that decided it. Re-uploading untouched is still a no-op:
+        # _row_changes diffs against this same effective value, so only a name
+        # the user actually changed becomes a per-screen override.
+        tname, set_at = eff_tpl.get(did, ("", ""))
+        base = [name or "", shop, grp, tname, set_at, mid or "", res, note]
         rows.append(base + [_cell_of(f, (own.get(did) or {}).get(k) or {}, lib_names)
                             for (_h, k, f, _zt) in ccols])
     return rows, devs
@@ -301,8 +352,8 @@ def _effective_playback(cur, tenant_id: int, devs, ccols, templates=None,
     zone_keys = list(dict.fromkeys(k for (_h, k, _f, _zt) in ccols))
     if not zone_keys or not devs:
         return []
-    tpl_names = {t["id"]: t["name"] for t in (templates or [])}
-    default_tpl = next((t["name"] for t in (templates or []) if t.get("is_default")), "")
+    # Same resolution the Devices sheet and the player use — one source of truth.
+    eff_map = _effective_template_map(cur, tenant_id, [d[0] for d in devs], templates)
     cur.execute("SELECT did, sid, gid FROM public.device_assignment WHERE did = ANY(%s);",
                 ([d[0] for d in devs],))
     asg = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
@@ -325,10 +376,9 @@ def _effective_playback(cur, tenant_id: int, devs, ccols, templates=None,
     for zk, gid, pl in cur.fetchall():
         by_grp.setdefault(gid, {})[zk] = json.loads(pl) if isinstance(pl, str) else pl
     out = []
-    for did, mid, name, _res, shop, grp, _act, tpl_override, grp_tpl_id in devs:
+    for did, mid, name, _res, shop, grp, _act, _tpl_override, _grp_tpl_id in devs:
         sid, gid = asg.get(did, (None, None))
-        # Effective template: screen override > group override > company default.
-        eff_tpl = tpl_override or tpl_names.get(grp_tpl_id, "") or default_tpl
+        eff_tpl = eff_map.get(did, ("", ""))[0]
         for zk in zone_keys:
             for level, store in (("this screen", by_dev.get(did)),
                                  ("its group", by_grp.get(gid) if gid else None),
@@ -356,7 +406,7 @@ def _template_bundle(tenant_id: int):
             ccols = content_columns_for(content_cols)
             zone_sources = {z.get("key"): (z.get("binding") or {}).get("source", "static")
                             for z in content_cols}
-            fleet, devs = _fleet_rows(cur, tenant_id, ccols)
+            fleet, devs = _fleet_rows(cur, tenant_id, ccols, templates)
             playback = _effective_playback(cur, tenant_id, devs, ccols, templates,
                                            zone_sources=zone_sources)
     headers = BASE_COLUMNS + [h for (h, _, _, _) in ccols]
@@ -442,13 +492,23 @@ def template_xlsx(ctx: TenantContext = Depends(require_tenant_context)):
     ws.title = "Devices"
     header_fill = PatternFill("solid", fgColor="0A1628")
     content_fill = PatternFill("solid", fgColor="1E3A5F")
+    readonly_fill = PatternFill("solid", fgColor="6B7280")   # grey = look, don't type
     header_font = Font(color="FFFFFF", bold=True)
     ws.append(headers)
     for i, cell in enumerate(ws[1]):
-        cell.fill = content_fill if i >= len(BASE_COLUMNS) else header_fill
+        if i < len(BASE_COLUMNS) and BASE_COLUMNS[i] in READONLY_COLUMNS:
+            cell.fill = readonly_fill
+        else:
+            cell.fill = content_fill if i >= len(BASE_COLUMNS) else header_fill
         cell.font = header_font
     for row in rows:
         ws.append(row)
+    # Grey the read-only body cells too, so nobody edits a column we ignore.
+    ro_cols = [i + 1 for i, h in enumerate(headers) if h in READONLY_COLUMNS]
+    ro_font = Font(color="6B7280", italic=True)
+    for ri in range(2, len(rows) + 2):
+        for ci in ro_cols:
+            ws.cell(row=ri, column=ci).font = ro_font
     for i in range(len(headers)):
         ws.column_dimensions[_col_letter(i + 1)].width = 30 if i >= len(BASE_COLUMNS) else BASE_WIDTHS[i]
 
@@ -459,18 +519,22 @@ def template_xlsx(ctx: TenantContext = Depends(require_tenant_context)):
     if is_fleet and playback:
         from openpyxl.comments import Comment
         inherited = {}   # (screen, zone_key) -> (level, showing)
-        eff_tpl = {}     # screen -> effective template name
-        for scr, _loc, _grp, tpl_name, zone, set_at, showing in playback:
-            eff_tpl[scr] = tpl_name
+        for scr, _loc, _grp, _tpl_name, zone, set_at, showing in playback:
             if set_at and set_at != "this screen":
                 inherited[(scr, zone)] = (set_at, showing)
         tpl_col = BASE_COLUMNS.index("template") + 1
+        src_col = BASE_COLUMNS.index("template_set_at") + 1
         for ri, r in enumerate(rows, start=2):  # row 1 = headers
             screen = r[0] or r[BASE_COLUMNS.index("device_id")]
-            if not r[tpl_col - 1] and eff_tpl.get(screen):
+            # The template cell now carries the EFFECTIVE layout; say so, so an
+            # inherited value is never mistaken for a per-screen pin.
+            set_at = r[src_col - 1] if src_col - 1 < len(r) else ""
+            if r[tpl_col - 1]:
                 ws.cell(row=ri, column=tpl_col).comment = Comment(
-                    f"Inherited — this screen renders '{eff_tpl[screen]}'.\n"
-                    "Type a linked template's name to override just this screen.", "DIGIX")
+                    f"Showing '{r[tpl_col - 1]}' — set at: {set_at or 'unknown'}.\n"
+                    "Leave it as-is to change nothing. Type another linked layout's exact "
+                    "name to move THIS screen onto it, or 'inherited' to follow its group "
+                    "/ the company default again.", "DIGIX")
             for ci, h in enumerate(headers):
                 if not h.startswith("content.") or (ci < len(r) and r[ci]):
                     continue
@@ -542,7 +606,8 @@ def _rows_from(header: List[str], data_rows: List[List[str]]) -> List[Dict[str, 
         def cell(i):
             return str(cells[i]).strip() if (i is not None and i < len(cells) and cells[i] is not None) else ""
 
-        rec = {col: cell(base_idx.get(col)) for col in BASE_COLUMNS}
+        rec = {col: ("" if col in READONLY_COLUMNS else cell(base_idx.get(col)))
+               for col in BASE_COLUMNS}
         rec["_content"] = {h: cell(i) for h, i in content_idx.items() if cell(i)}
         out.append(rec)
     return out
@@ -663,9 +728,14 @@ def _content_summary(payload) -> str:
     return "set"
 
 
-def _current_states(cur, tenant_id: int, mobile_ids) -> Dict[str, Dict[str, Any]]:
-    """{mobile_id: {id, name, shop, group, content:{zone_key: payload}}} for existing
-    devices in this tenant — the baseline a re-upload is diffed against."""
+def _current_states(cur, tenant_id: int, mobile_ids, templates=None) -> Dict[str, Dict[str, Any]]:
+    """{mobile_id: {id, name, shop, group, template, template_own, content:{...}}} for
+    existing devices in this tenant — the baseline a re-upload is diffed against.
+
+    'template' is the EFFECTIVE layout (what the sheet exports), so a downloaded
+    file that nobody edited reports no template change. 'template_own' is the
+    screen's raw override, needed to tell a real "go back to inherited" from a
+    screen that already inherits."""
     out: Dict[str, Dict[str, Any]] = {}
     ids = [m for m in (mobile_ids or set()) if m]
     if not ids:
@@ -688,9 +758,13 @@ def _current_states(cur, tenant_id: int, mobile_ids) -> Dict[str, Dict[str, Any]
         if stale:  # older duplicate loses its reverse mapping too
             did_to_mid.pop(stale["id"], None)
         out[mid] = {"id": did, "name": name or "", "shop": shop or "", "group": grp or "",
-                    "template": tpl_name or "", "content": {}}
+                    "template": tpl_name or "", "template_own": tpl_name or "", "content": {}}
         did_to_mid[did] = mid
     if did_to_mid:
+        # Same effective view the download shows, so "unedited sheet" == "no change".
+        eff = _effective_template_map(cur, tenant_id, list(did_to_mid.keys()), templates)
+        for did, mid in did_to_mid.items():
+            out[mid]["template"] = eff.get(did, ("", ""))[0]
         cur.execute("""
             SELECT device_id, zone_key, payload FROM public.template_zone_content
             WHERE tenant_id = %s AND scope = 'device' AND device_id = ANY(%s);
@@ -717,7 +791,13 @@ def _row_changes(device_name: str, shop_name: str, group_name: str,
     diff("name", device_name, current.get("name"))
     diff("location", shop_name, current.get("shop"))
     diff("group", group_name, current.get("group"))
-    diff("template", template_name, current.get("template"))
+    if template_name.strip().casefold() in INHERIT_WORDS:
+        # Only a change when the screen actually HAS an override to drop.
+        if current.get("template_own"):
+            changes.append({"field": "template", "from": current["template_own"],
+                            "to": "inherited"})
+    else:
+        diff("template", template_name, current.get("template"))
     cur_content = current.get("content") or {}
     for zk, payload in (row_content or {}).items():
         cur_p = cur_content.get(zk) or {}
@@ -752,7 +832,8 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
                   content_cols=None, cur=None, tenant_id=None,
                   existing_shops: Optional[Dict[str, str]] = None,
                   existing_groups: Optional[Dict[str, str]] = None,
-                  template_names: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+                  template_names: Optional[Dict[str, str]] = None,
+                  templates: Optional[list] = None) -> Dict[str, Any]:
     """Pure validation. Returns preview {rows, errors, summary}. Writes nothing."""
     errors: List[Dict[str, Any]] = []
     seen_ids: Dict[str, int] = {}
@@ -764,7 +845,7 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
     updated = 0          # existing devices with field/content changes
     unchanged = 0        # existing devices the sheet leaves as-is
     # Baseline for the change preview (existing devices only).
-    current_states = (_current_states(cur, tenant_id, mobile_ids_this_tenant)
+    current_states = (_current_states(cur, tenant_id, mobile_ids_this_tenant, templates)
                       if (cur is not None and tenant_id is not None) else {})
 
     normalized: List[Dict[str, Any]] = []
@@ -788,6 +869,8 @@ def validate_rows(rows: List[Dict[str, str]], existing_device_count: int, max_de
         # Templates are NEVER created from the sheet — the cell must name one
         # of the company's linked templates exactly (blank = inherit).
         tpl_cell = rec.get("template", "").strip()
+        if tpl_cell.casefold() in INHERIT_WORDS:
+            tpl_cell = ""   # a keyword, not a layout name — never name-checked
         if tpl_cell and template_names is not None and tpl_cell not in template_names.values():
             canonical = template_names.get(_normalize_name(tpl_cell))
             if canonical:
@@ -971,7 +1054,7 @@ async def bulk_validate(file: UploadFile = File(...), ctx: TenantContext = Depen
             preview = validate_rows(rows, existing, max_devices, mine, other,
                                     content_cols=content_cols, cur=cur, tenant_id=tenant_id,
                                     existing_shops=existing_shops, existing_groups=existing_groups,
-                                    template_names=template_names)
+                                    template_names=template_names, templates=_templates)
             if mode == "content":
                 preview = _restrict_preview_to_content(preview)
 
@@ -1243,9 +1326,15 @@ def bulk_commit(body: CommitIn, background_tasks: BackgroundTasks,
                         if "name" in chg and r.get("device_name"):
                             cur.execute("UPDATE public.device SET device_name = %s WHERE id = %s;",
                                         (r["device_name"], did))
-                        if "template" in chg and r.get("template") in template_ids_by_name:
-                            cur.execute("UPDATE public.device SET template_id = %s WHERE id = %s;",
-                                        (template_ids_by_name[r["template"]], did))
+                        if "template" in chg:
+                            tpl_cell = (r.get("template") or "").strip()
+                            if tpl_cell.casefold() in INHERIT_WORDS:
+                                # Drop the per-screen pin → follows group / company default.
+                                cur.execute("UPDATE public.device SET template_id = NULL WHERE id = %s;",
+                                            (did,))
+                            elif tpl_cell in template_ids_by_name:
+                                cur.execute("UPDATE public.device SET template_id = %s WHERE id = %s;",
+                                            (template_ids_by_name[tpl_cell], did))
                         loc_c, grp_c = ("location" in chg), ("group" in chg)
                         if loc_c or grp_c:
                             gid = group_ids.get(r["group_name"]) if r.get("group_name") else None
