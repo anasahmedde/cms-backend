@@ -268,13 +268,22 @@ def ensure_dvsg_schema(conn):
         ALTER TABLE public.shop RENAME COLUMN name TO shop_name;
       END IF;
 
-      -- Add UNIQUE constraint on shop_name if not exists
+      -- Add the legacy GLOBAL UNIQUE on shop_name only while this database is
+      -- still single-tenant. Once shop.tenant_id exists, names are unique PER
+      -- TENANT (idx_shop_tenant_name, created by multitenant_schema, which also
+      -- drops this constraint). Re-adding it on every boot used to abort startup
+      -- with unique_violation the moment two companies used the same location
+      -- name — the whole API then failed to start. unique_violation is caught as
+      -- well, so a duplicate can never brick the boot again.
       IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='shop' AND column_name='tenant_id'
+      ) AND NOT EXISTS (
         SELECT 1 FROM pg_constraint WHERE conname = 'shop_shop_name_key'
       ) THEN
         BEGIN
           ALTER TABLE public.shop ADD CONSTRAINT shop_shop_name_key UNIQUE (shop_name);
-        EXCEPTION WHEN duplicate_table THEN NULL;
+        EXCEPTION WHEN duplicate_table OR unique_violation THEN NULL;
         END;
       END IF;
 
@@ -285,13 +294,18 @@ def ensure_dvsg_schema(conn):
         ALTER TABLE public."group" RENAME COLUMN name TO gname;
       END IF;
 
-      -- Add UNIQUE constraint on gname if not exists
+      -- Same for group names: global UNIQUE only while single-tenant; after
+      -- multitenant_schema adds group.tenant_id the uniqueness is per tenant
+      -- (idx_group_tenant_gname). See the shop comment above.
       IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='group' AND column_name='tenant_id'
+      ) AND NOT EXISTS (
         SELECT 1 FROM pg_constraint WHERE conname = 'group_gname_key'
       ) THEN
         BEGIN
           ALTER TABLE public."group" ADD CONSTRAINT group_gname_key UNIQUE (gname);
-        EXCEPTION WHEN duplicate_table THEN NULL;
+        EXCEPTION WHEN duplicate_table OR unique_violation THEN NULL;
         END;
       END IF;
     END $$;
